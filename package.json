@@ -1,22 +1,21 @@
 {
-  "name": "deathbot",
-  "version": "2.0.0",
-  "description": "Discord Death Pool Bot",
-  "main": "death-bot.js",
+  "name": "deathbot-2000",
+  "version": "1.0.0",
+  "description": "Gregg the Grim Reaper — Discord celebrity death pool bot",
+  "main": "src/index.js",
   "scripts": {
-    "start": "node death-bot.js",
-    "dev": "nodemon death-bot.js"
-  },
-  "dependencies": {
-    "axios": "^1.6.0",
-    "cheerio": "^1.0.0-rc.12",
-    "discord.js": "^13.17.1", 
-    "dotenv": "^16.3.1",
-    "get-aging": "^1.2.0",
-    "node-cron": "^3.0.3",
-    "openai": "^4.20.1"
+    "start": "node src/index.js",
+    "generate-phrases": "node scripts/generate-phrases.js"
   },
   "engines": {
-    "node": ">=16.6.0"
+    "node": ">=20"
+  },
+  "dependencies": {
+    "adm-zip": "^0.5.16",
+    "axios": "^1.7.9",
+    "better-sqlite3": "^11.7.0",
+    "cheerio": "^1.0.0",
+    "discord.js": "^14.16.3",
+    "node-cron": "^3.0.3"
   }
 }

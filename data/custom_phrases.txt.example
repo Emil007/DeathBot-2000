@@ -1,0 +1,7 @@
+# Custom phrases for Gregg (one per line). Lines starting with # are ignored.
+# Enable in docker-compose via CUSTOM_PHRASES=mix or only
+#
+# Placeholders: {name} {age} {score} {winners} {losers}
+#
+# Example:
+# Ich bin der Tod. {name} ({age}) ist fällig. {winners} kassieren {score}.

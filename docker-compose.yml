@@ -1,0 +1,26 @@
+services:
+  deathbot:
+    image: ghcr.io/emil007/deathbot-2000:latest
+    container_name: deathbot-2000
+    restart: unless-stopped
+    volumes:
+      - ./data:/app/data
+    environment:
+      TOKEN: "PUT_DISCORD_BOT_TOKEN_HERE"
+      PREFIX: "!"
+      ADMIN_ID: "PUT_YOUR_DISCORD_USER_ID_HERE"
+      CHANNEL_DEATHPOOL: "PUT_DEATHPOOL_CHANNEL_ID_HERE"
+      # Optional all-deaths channel (never pings). Comment in and set an id to enable:
+      # CHANNEL_ALL_DEATHS: "PUT_ALL_DEATHS_CHANNEL_ID_HERE"
+      CHANNEL_ALL_DEATHS: ""
+      WIKI_POLLER_MINUTES: "30"
+      DAILY_SUMMARY_HOUR: "9"
+      DATA_DIR: "/app/data"
+      TZ: "Europe/Berlin"
+      ALERT_EMOJI: "⚰️"
+      ALERT_EMOJI_REPEAT: "3"
+      # Custom phrases file: /app/data/custom_phrases.txt (one phrase per line)
+      # Placeholders: {name} {age} {score} {winners} {losers}
+      CUSTOM_PHRASES: "no"
+      # CUSTOM_PHRASES: "mix"
+      # CUSTOM_PHRASES: "only"

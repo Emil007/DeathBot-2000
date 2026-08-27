@@ -1,6 +1,0 @@
-{
-    "Example Privileged Username": {
-        "discriminator": "1234",
-        "restrictionLevel": 1
-    }
-}

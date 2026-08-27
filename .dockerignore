@@ -1,0 +1,10 @@
+node_modules
+npm-debug.log
+.git
+data/deathbot.sqlite
+data/backups
+data/restore
+data/custom_phrases.txt
+*.md
+.env
+.env.*
