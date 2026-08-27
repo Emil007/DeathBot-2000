@@ -2,11 +2,12 @@ const db = require("../../db");
 
 const cmd = {
   name: "players",
-  admin: true,
-  group: "points",
-  description: "Listet alle Spieler mit aktuellem Punktestand",
+  admin: false,
+  group: "everyone",
+  description: "Listet alle Spieler mit Punktestand",
   usage: "/players\n{prefix}players",
   examples: ["/players", "{prefix}players"],
+  details: "Für `/liste user:@…` oder `/liste name:…`.",
   parseSlash() {
     return [];
   },

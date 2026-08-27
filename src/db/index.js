@@ -751,6 +751,41 @@ function getPlayerPicks(discordUserId) {
   return { player, picks, total: playerTotal(player.id) };
 }
 
+function findPlayerByQuery(query) {
+  if (!query) return null;
+  const q = String(query).trim();
+  if (/^\d{16,20}$/.test(q)) {
+    return db.prepare("SELECT * FROM players WHERE discord_user_id = ?").get(q) || null;
+  }
+  return (
+    db
+      .prepare(
+        `SELECT * FROM players WHERE display_name = ? COLLATE NOCASE LIMIT 1`
+      )
+      .get(q) ||
+    db
+      .prepare(
+        `SELECT * FROM players WHERE display_name LIKE ? COLLATE NOCASE LIMIT 1`
+      )
+      .get(`%${q}%`) ||
+    null
+  );
+}
+
+/** All celebs in DB with how many active-season picks. */
+function listAllCelebs() {
+  const season = getActiveSeason();
+  return db
+    .prepare(
+      `SELECT c.*,
+         (SELECT COUNT(*) FROM picks pk
+          WHERE pk.celeb_id = c.id AND pk.season_id = ?) AS pick_count
+       FROM celebs c
+       ORDER BY c.is_alive ASC, c.name COLLATE NOCASE`
+    )
+    .all(season.id);
+}
+
 function findCelebByName(query) {
   const key = nameKey(query);
   const exact = db.prepare("SELECT * FROM celebs WHERE name_key = ?").all(key);
@@ -886,6 +921,8 @@ module.exports = {
   playerTotal,
   listScores,
   getPlayerPicks,
+  findPlayerByQuery,
+  listAllCelebs,
   findCelebByName,
   listBonuses,
   upsertBonus,

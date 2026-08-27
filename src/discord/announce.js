@@ -231,8 +231,63 @@ function formatReconcileSummary(hits, season) {
     lines.push("", "⚠️ Large pool-age vs wiki-age gaps:");
     mismatches.slice(0, 15).forEach((m) => lines.push(`• ${m}`));
   }
-  lines.push("", "Next: `!scores`, then `!go` if not already live.");
+  lines.push("", "Next: `/scores`, then `/go` if not already live.");
   return lines.join("\n").slice(0, 1900);
+}
+
+async function announceSimulatedDeath(
+  client,
+  config,
+  { name, age, url, inPool = false, alreadyDead = false } = {}
+) {
+  const channel = await client.channels.fetch(config.channelDeathpool).catch(() => null);
+  if (!channel?.isTextBased()) {
+    console.error("[announce] deathpool channel missing");
+    return;
+  }
+
+  const score = age != null ? db.scoreForAge(age) : 0;
+  const roast = pickPhrase(config, db, {
+    name,
+    age,
+    score: score || "—",
+    winners: "niemand",
+  });
+
+  const embed = new EmbedBuilder()
+    .setColor(0x4a0000)
+    .setTitle(`${name} ist tot`)
+    .setDescription(roast)
+    .addFields(
+      {
+        name: "Details",
+        value: [
+          age != null ? `Alter (Pool-Start): **${age}**` : "Alter unbekannt",
+          url ? `[Wikipedia](${url})` : null,
+          alreadyDead ? "_War schon als tot markiert._" : null,
+          inPool ? null : "_Simulation — Person nicht im Deathpool (keine Punkte)._",
+        ]
+          .filter(Boolean)
+          .join("\n"),
+      },
+      {
+        name: "Deathpool",
+        value:
+          inPool && !alreadyDead
+            ? "_siehe Punkte-Buchung_"
+            : "_Keine Punkte (Simulation / schon tot)._",
+      }
+    )
+    .setTimestamp(new Date());
+
+  const image = url ? await fetchBestImage(url, null, config.userAgent) : null;
+  if (image) embed.setImage(image);
+
+  await channel.send({
+    content: `${emojiBanner(config)} **${inPool ? "Deathpool" : "Simulation"}**`,
+    embeds: [embed],
+    allowedMentions: { parse: [] },
+  });
 }
 
 module.exports = {
@@ -240,6 +295,7 @@ module.exports = {
   announceRetraction,
   announceAllDeath,
   announceDailySummary,
+  announceSimulatedDeath,
   formatReconcileSummary,
   // back-compat alias
   announceDeathpool: (client, config, m) =>

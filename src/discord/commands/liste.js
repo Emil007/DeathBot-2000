@@ -1,37 +1,98 @@
 const db = require("../../db");
+const { usageReply } = require("../usage");
+
+async function sendChunks(msg, chunks) {
+  for (let i = 0; i < chunks.length; i++) {
+    if (i === 0) await msg.reply({ content: chunks[i], allowedMentions: { parse: [] } });
+    else await msg.channel.send({ content: chunks[i], allowedMentions: { parse: [] } });
+  }
+}
+
+function chunkLines(header, lines) {
+  const chunks = [];
+  let body = header;
+  for (const line of lines) {
+    if ((body + line + "\n").length > 1800) {
+      chunks.push(body);
+      body = "";
+    }
+    body += line + "\n";
+  }
+  if (body) chunks.push(body);
+  return chunks;
+}
 
 const cmd = {
   name: "liste",
-  aliases: ["mylist", "mypicks"],
+  aliases: ["mylist", "mypicks", "list"],
   admin: false,
   group: "everyone",
-  description: "Zeigt deine Picks (per DM wenn möglich; Admin: fremde Liste)",
-  usage: "/liste [user:@Spieler]\n{prefix}liste [@User]",
-  examples: ["/liste", "{prefix}liste", "/liste user:@Spieler"],
+  description: "Zeigt Picks — eigene oder von jedem anderen Spieler",
+  usage: "/liste [user:@Spieler]\n{prefix}liste [@User|Name]",
+  examples: [
+    "/liste",
+    "/liste user:@Spieler",
+    "{prefix}liste Emil",
+  ],
   options: [
     {
       name: "user",
-      description: "Spieler (nur Admin sieht fremde Listen)",
+      description: "Spieler dessen Liste du sehen willst",
       type: "USER",
       required: false,
     },
+    {
+      name: "user_id",
+      description: "Discord-ID (Fallback in DMs)",
+      type: "STRING",
+      required: false,
+    },
+    {
+      name: "name",
+      description: "Anzeigename des Spielers",
+      type: "STRING",
+      required: false,
+    },
   ],
-  parseSlash() {
+  parseSlash(interaction) {
+    const user = interaction.options.getUser("user");
+    const id = interaction.options.getString("user_id");
+    const name = interaction.options.getString("name");
+    if (user) return [];
+    if (id) return [id];
+    if (name) return name.split(/\s+/);
     return [];
   },
   async run(ctx, args, msg) {
-    const target =
-      msg.mentions.users.first() && msg.author.id === ctx.config.adminId
-        ? msg.mentions.users.first()
-        : msg.author;
+    let discordId = msg.author.id;
+    let label = null;
 
-    const data = db.getPlayerPicks(target.id);
+    const mention = msg.mentions.users.first();
+    if (mention) {
+      discordId = mention.id;
+    } else if (args.length) {
+      const q = args.join(" ").trim();
+      if (/^\d{16,20}$/.test(q)) {
+        discordId = q;
+      } else {
+        const player = db.findPlayerByQuery(q);
+        if (!player) {
+          await msg.reply(
+            `Kein Spieler „${q}“. Namen siehe \`/players\` (Admin) oder \`/scores\`.`
+          );
+          return;
+        }
+        discordId = player.discord_user_id;
+        label = player.display_name;
+      }
+    }
+
+    const data = db.getPlayerPicks(discordId);
     if (!data) {
       await msg.reply(
-        "Keine Picks gefunden. Admin muss dich per `/import` bzw. `{prefix}import @User` anlegen.".replace(
-          "{prefix}",
-          ctx.config.prefix
-        )
+        discordId === msg.author.id
+          ? "Keine Picks gefunden. Admin muss dich per `/import` anlegen."
+          : `Keine Picks für ${label || `<@${discordId}>`}.`
       );
       return;
     }
@@ -43,27 +104,10 @@ const cmd = {
       return `${flag} **${c.name}**${age}${desc}`;
     });
 
-    const header = `**${data.player.display_name}** — ${data.picks.length} Picks | Punkte **${data.total}**\n`;
-    let body = header;
-    const chunks = [];
-    for (const line of lines) {
-      if ((body + line + "\n").length > 1800) {
-        chunks.push(body);
-        body = "";
-      }
-      body += line + "\n";
-    }
-    if (body) chunks.push(body);
-
-    try {
-      for (const chunk of chunks) await msg.author.send(chunk);
-      await msg.reply("Liste per DM geschickt.");
-    } catch {
-      for (let i = 0; i < chunks.length; i++) {
-        if (i === 0) await msg.reply(chunks[i]);
-        else await msg.channel.send(chunks[i]);
-      }
-    }
+    const whose =
+      discordId === msg.author.id ? "Deine Liste" : `Liste **${data.player.display_name}**`;
+    const header = `${whose} — ${data.picks.length} Picks | Punkte **${data.total}**\n`;
+    await sendChunks(msg, chunkLines(header, lines));
   },
 };
 
