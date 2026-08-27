@@ -99,6 +99,14 @@ const cmd = {
       `• Guild-ID: ${cfg.discordGuildId ? `\`${cfg.discordGuildId}\`` : "_fehlt (slash lag)_"}`
     );
 
+    try {
+      const { readDayCount, statusText } = require("../../discord/presence");
+      const day = readDayCount(db, cfg.tz);
+      lines.push(`• Status: _${statusText(day.count)}_ (${day.date}, TZ ${cfg.tz || "UTC"})`);
+    } catch {
+      /* ignore */
+    }
+
     if (snap.recentPoolDeaths.length) {
       lines.push("", "**Letzte Pool-Tode**");
       for (const c of snap.recentPoolDeaths.slice(0, 5)) {

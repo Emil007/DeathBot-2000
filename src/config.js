@@ -55,6 +55,7 @@ function loadConfig() {
       "USER_AGENT",
       "DeathBot-2000/1.0 (Discord death pool bot; +https://github.com/Emil007/DeathBot-2000)"
     ),
+    tz: optional("TZ", "UTC"),
   };
 }
 

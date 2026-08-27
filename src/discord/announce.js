@@ -193,6 +193,13 @@ async function announceAllDeath(client, config, entry, { isDeOnly = false } = {}
     embeds: [embed],
     allowedMentions: { parse: [] },
   });
+
+  try {
+    const { recordAllDeathAnnounce } = require("./presence");
+    await recordAllDeathAnnounce(client, config, db);
+  } catch (e) {
+    console.warn("[presence] update failed", e.message);
+  }
 }
 
 async function announceDailySummary(client, config) {

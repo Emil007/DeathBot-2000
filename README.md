@@ -117,7 +117,9 @@ Non-admins may **see** admin slash commands in Discord’s picker (Discord limit
 | `CHANNEL_ALL_DEATHS` | Optional factual feed |
 | `CHANNEL_ADMIN` | Optional ops channel; empty = DM-first |
 | `CUSTOM_PHRASES` | `no` / `mix` / `only` (+ `data/custom_phrases.txt`) |
-| `TZ` | Cron timezone |
+| `TZ` | Cron + “killed today” status day boundary |
+
+Bot presence: **Already N People killed today!** — counts all-deaths posts since local midnight (`TZ`), resets at 00:00.
 
 ---
 

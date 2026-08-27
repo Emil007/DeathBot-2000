@@ -19,6 +19,7 @@ const { suggestCommands } = require("./discord/usage");
 const { startWikiPoller } = require("./jobs/wiki-poll");
 const { startDailySummary } = require("./jobs/daily-summary");
 const { startAutoBackup } = require("./backup");
+const { startPresence } = require("./discord/presence");
 
 const EPHEMERAL = { flags: MessageFlags.Ephemeral };
 
@@ -58,6 +59,7 @@ async function main() {
     setTimeout(() => startWikiPoller(client, config), 1500);
     startDailySummary(client, config);
     startAutoBackup(config);
+    startPresence(client, config, db);
   });
 
   client.on("interactionCreate", async (interaction) => {
