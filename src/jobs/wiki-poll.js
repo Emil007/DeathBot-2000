@@ -11,6 +11,7 @@ const {
   announceAllDeath,
   announceRetraction,
 } = require("../discord/announce");
+const ops = require("../ops/status");
 
 async function scrapeAll(config, scope = "full") {
   const [enEntries, deData] = await Promise.all([
@@ -70,7 +71,28 @@ function mergeHits(categoryHits, listHits) {
  * @param {'seed'|'reconcile'|'live'|'nightly'} mode
  */
 async function runWikiPoll(client, config, { mode = "live" } = {}) {
+  const t0 = Date.now();
+  ops.markPollStart(mode);
   console.log(new Date().toISOString(), `[poll] mode=${mode}`);
+  try {
+    const result = await runWikiPollInner(client, config, { mode });
+    ops.markPollEnd(mode, {
+      ok: true,
+      durationMs: Date.now() - t0,
+      stats: result.stats || null,
+    });
+    return result;
+  } catch (e) {
+    ops.markPollEnd(mode, {
+      ok: false,
+      durationMs: Date.now() - t0,
+      error: e.message,
+    });
+    throw e;
+  }
+}
+
+async function runWikiPollInner(client, config, { mode = "live" } = {}) {
   const scope = mode === "live" ? "recent" : "full";
   const { enEntries, deData, poolEntries } = await scrapeAll(config, scope);
 
@@ -153,7 +175,17 @@ async function runWikiPoll(client, config, { mode = "live" } = {}) {
 
   if (mode === "seed") {
     db.seedAllWikiSeen([...enEntries, ...deData.entries, ...newEn]);
-    return { hits: [], seeded: true };
+    return {
+      hits: [],
+      seeded: true,
+      stats: {
+        scrapedEn: enEntries.length,
+        scrapedDe: deData.entries.length,
+        newEn: 0,
+        newDe: 0,
+        hits: 0,
+      },
+    };
   }
 
   if ((mode === "live" || mode === "nightly") && config.channelAllDeaths) {
@@ -211,6 +243,7 @@ async function runWikiPoll(client, config, { mode = "live" } = {}) {
       hits.push({ celeb: m.celeb, entry: m.entry, wikiAge: m.age, result });
     } catch (err) {
       console.error("[poll] deathpool", err.message);
+      ops.noteError(`deathpool ${m.celeb.name}: ${err.message}`);
     }
   }
 
@@ -218,7 +251,19 @@ async function runWikiPoll(client, config, { mode = "live" } = {}) {
     await processRetractions(client, config, poolEntries);
   }
 
-  return { hits, seeded: false };
+  return {
+    hits,
+    seeded: false,
+    stats: {
+      scrapedEn: enEntries.length,
+      scrapedDe: deData.entries.length,
+      newEn: newEn.length,
+      newDe: newDeOnly.length,
+      categoryHits: categoryHits.length,
+      listHits: listHits.length,
+      hits: hits.length,
+    },
+  };
 }
 
 function startWikiPoller(client, config) {
@@ -229,6 +274,7 @@ function startWikiPoller(client, config) {
     if (busy) {
       if (forcedMode === "nightly") {
         nightlyPending = true;
+        ops.setNightlyPending(true);
         console.log("[nightly] deferred — poller busy, will retry after current job");
       }
       return;
@@ -246,10 +292,12 @@ function startWikiPoller(client, config) {
       await runWikiPoll(client, config, { mode: "live" });
     } catch (e) {
       console.error("[poll] failed", e);
+      ops.noteError(`poller: ${e.message}`);
     } finally {
       busy = false;
       if (nightlyPending) {
         nightlyPending = false;
+        ops.setNightlyPending(false);
         setImmediate(() => {
           console.log(new Date().toISOString(), "[nightly] running deferred full-year scrape");
           tick("nightly");

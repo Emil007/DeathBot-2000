@@ -907,6 +907,92 @@ function statsSnapshot() {
   };
 }
 
+function setMeta(key, value) {
+  db.prepare(
+    `INSERT INTO meta (key, value) VALUES (?, ?)
+     ON CONFLICT(key) DO UPDATE SET value = excluded.value`
+  ).run(String(key), value == null ? "" : String(value));
+}
+
+function getMeta(key) {
+  const row = db.prepare(`SELECT value FROM meta WHERE key = ?`).get(String(key));
+  return row ? row.value : null;
+}
+
+/** Extra counts for /status */
+function statusSnapshot() {
+  const season = getActiveSeason();
+  const celebsAlive = db
+    .prepare(`SELECT COUNT(*) AS c FROM celebs WHERE is_alive = 1`)
+    .get().c;
+  const celebsDead = db
+    .prepare(`SELECT COUNT(*) AS c FROM celebs WHERE is_alive = 0`)
+    .get().c;
+  const autoWatch = db
+    .prepare(
+      `SELECT COUNT(*) AS c FROM celebs
+       WHERE is_alive = 1 AND exclude_from_auto = 0 AND manual_only = 0 AND wiki_confirmed = 1`
+    )
+    .get().c;
+  const excluded = db
+    .prepare(`SELECT COUNT(*) AS c FROM celebs WHERE exclude_from_auto = 1`)
+    .get().c;
+  const unconfirmedDead = db
+    .prepare(
+      `SELECT COUNT(*) AS c FROM celebs
+       WHERE is_alive = 0 AND death_confirmed = 0`
+    )
+    .get().c;
+  const recentPoolDeaths = db
+    .prepare(
+      `SELECT name, died_at, death_source, death_detected_at FROM celebs
+       WHERE is_alive = 0
+       ORDER BY COALESCE(death_detected_at, died_at) DESC
+       LIMIT 8`
+    )
+    .all();
+  const recentAnnounced = db
+    .prepare(
+      `SELECT name, url, lang, announced_at FROM announced_deaths
+       ORDER BY announced_at DESC LIMIT 8`
+    )
+    .all();
+  const wikiSeenEn = db
+    .prepare(`SELECT COUNT(*) AS c FROM wiki_seen WHERE lang = 'en'`)
+    .get().c;
+  const wikiSeenDe = db
+    .prepare(`SELECT COUNT(*) AS c FROM wiki_seen WHERE lang = 'de'`)
+    .get().c;
+  let lastPoll = null;
+  try {
+    const raw = getMeta("last_poll");
+    if (raw) lastPoll = JSON.parse(raw);
+  } catch {
+    lastPoll = null;
+  }
+  return {
+    season,
+    players: db.prepare("SELECT COUNT(*) AS c FROM players").get().c,
+    picks: db
+      .prepare(`SELECT COUNT(*) AS c FROM picks WHERE season_id = ?`)
+      .get(season.id).c,
+    celebsAlive,
+    celebsDead,
+    autoWatch,
+    excluded,
+    unconfirmedDead,
+    pendingReviews: countPendingReviews(),
+    unconfirmedCelebs: countUnconfirmedSeasonCelebs(),
+    wikiSeen: db.prepare("SELECT COUNT(*) AS c FROM wiki_seen").get().c,
+    wikiSeenEn,
+    wikiSeenDe,
+    announcedTotal: db.prepare("SELECT COUNT(*) AS c FROM announced_deaths").get().c,
+    recentPoolDeaths,
+    recentAnnounced,
+    lastPoll,
+  };
+}
+
 module.exports = {
   openDb,
   getDb,
@@ -974,4 +1060,7 @@ module.exports = {
   recentPhraseHashes,
   clearSeasonForNewYear,
   statsSnapshot,
+  statusSnapshot,
+  setMeta,
+  getMeta,
 };
