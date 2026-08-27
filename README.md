@@ -1,29 +1,101 @@
 # DeathBot-2000
 
-A Discord bot for celebrity death-pool games. It watches Wikipedia death lists, keeps score for your group’s picks, and posts updates when someone on the list dies.
+A Discord bot for a **celebrity death pool**: players submit a list of people; the bot watches Wikipedia; when someone on a list dies, it announces it, awards points, and keeps the scoreboard.
 
-**In Discord:** start with **`/help`** (slash is the main UX). Prefix (`!`, configurable) stays as fallback — especially for multi-message paste and “send the wiki URL next”.
+Talk to the bot with **slash commands** (`/help`). The prefix (`!` by default) still works as a fallback — useful for pasting multi-line lists.
 
-## What you need
+---
 
-1. A Discord bot token with **Message Content Intent** enabled  
-2. A Discord server where the bot can read and send messages  
-3. Channel IDs:
-   - **Deathpool channel** — when a picked celebrity dies (pings winners only)
-   - **All-deaths channel** (optional) — every newly listed Wikipedia death (never pings)
-   - **Admin channel** (optional `CHANNEL_ADMIN`) — wiki/age review cards + long admin summaries; empty = DM-first
-4. Your Discord user ID as admin  
-5. Your **server (guild) ID** as `DISCORD_GUILD_ID` (fast slash sync; commands also register globally for **DMs with the bot**)  
-6. Docker (published image) or Node 20+ from source  
+## What you get in Discord
 
-### Discord Developer Portal checklist
+| Channel | What happens there |
+|---------|-------------------|
+| **Deathpool** | Someone on a player list died → sarcastic announce, **@winners**, points |
+| **All-deaths** (optional) | Every new Wikipedia death list entry → short **factual** bio card, no pings |
+| **DM / admin channel** | Import, wiki/age review, long summaries, ops (`/status`) |
 
-- **Message Content Intent** on  
-- Bot invited with scopes **`bot`** + **`applications.commands`**  
-- For slash in DMs: enable **User Install** / DM contexts if you use user-installable apps (guild install + Bot DM contexts are set in code)  
-- Bot member of the guild; set `DISCORD_GUILD_ID` for instant command updates  
+Admin work is fine in a **DM with the bot**. Public channels are only for announcements.
 
-Copy `docker-compose.yml`, fill in the `environment:` values (no `.env` file), mount `./data`, then:
+---
+
+## For players
+
+You don’t need to run the wiki poller. Day to day:
+
+| Command | What it does |
+|---------|----------------|
+| `/scores` | Current standings |
+| `/liste` | Anyone’s pick list (`user` / name) |
+| `/celebs` | All celebs in the pool (alive / dead) |
+| `/players` | Who’s in the game |
+| `/help` | Command help |
+
+When a pick dies, winners are pinged in the deathpool channel. Points = **`max(1, 100 − age at season start)`** (younger = more points).
+
+---
+
+## For admins — start a season
+
+1. **`/new-year confirm:true`**  
+   Optional `start_date` (`YYYY-MM-DD`). Bot goes into setup (not live yet).
+
+2. **`/import user:@Player`**  
+   Paste the sheet (or attach a file), then send **`done`**.  
+   Details: `/help command:import`.
+
+3. **Review each celeb** (DM or admin channel)  
+   Confirm the Wikipedia person, pick another candidate, fix the URL, set age, mark “no wiki”, or skip.  
+   Same display name can be **two different people** — review keeps them separate.
+
+4. **`/go`**  
+   Blocked while reviews are open (override: `/go force:true`).  
+   Then: silent reconcile of already-dead picks → seed wiki cache → **live**.
+
+After go, the bot polls Wikipedia on a timer and does a full-year scrape at night.
+
+---
+
+## For admins — while the season runs
+
+### Check that everything’s healthy
+- **`/status`** — last poll, counts, recent hits, errors, channel config  
+- **`/check`** — run a wiki check now (setup = quiet reconcile; live = full poll)  
+- **`/season`** — season start / live flag
+
+### Fix bad hits (no full restart)
+| Situation | Command |
+|-----------|---------|
+| False death / undo points | `/resurrect` or **`/invalidate`** (also turns off auto-match) |
+| Cheat / void the pick entirely | `/invalidate … remove_picks:true` |
+| Stop auto-matching someone | `/exclude` → later `/include` |
+| Manually mark dead | `/kill` |
+| Test announce only (no DB) | `/simulate url:…` (names + points, **no @pings**) |
+| Pause live + reseed quietly | `/ungo confirm:true` |
+
+### Lists, wiki, points
+- Celeb tools: `/celeb`, `/age`, `/wiki`, `/aka`, `/blacklist`, …  
+- Points: `/add-points`, `/set-points`, `/bonus`  
+- Backup/restore: `/restore` (see `/help`)
+
+---
+
+## How the bot decides someone died
+
+1. **Primary:** each confirmed celeb’s Wikipedia page gets `Category:YYYY deaths` / `Kategorie:Gestorben YYYY`  
+2. **Pre-season filter:** death category year before the season (or already on the page before start) → ignored + auto-excluded  
+3. **Backup:** Wikipedia “deaths in …” list matching (confirmed wiki celebs match by article, not fuzzy name mentions)  
+4. **Retract window:** for a few days (`DEATH_CONFIRM_DAYS`) a hit can be undone if the signal disappears; then it locks
+
+Deathpool messages use the roast phrase bank. **All-deaths** stays informative (age, lifespan, known-for, short summary).
+
+---
+
+## Run it (Docker)
+
+1. Discord app with **Message Content Intent**  
+2. Invite with scopes **`bot`** + **`applications.commands`**  
+3. Copy `docker-compose.yml`, fill `environment:` (no `.env` file), mount `./data`  
+4. Set at least: `TOKEN`, `ADMIN_ID`, `CHANNEL_DEATHPOOL`, **`DISCORD_GUILD_ID`** (instant slash updates)
 
 ```bash
 docker compose pull
@@ -32,56 +104,23 @@ docker compose up -d
 
 Image: `ghcr.io/emil007/deathbot-2000:latest`
 
-Admin season flow works in a **DM with the bot** (`/…` or `!…`). Announcement channels are only for public posts; `CHANNEL_ADMIN` is optional ops.
+Non-admins may **see** admin slash commands in Discord’s picker (Discord limitation) but get denied at runtime. Only `ADMIN_ID` is enforced.
 
-**Slash visibility:** Discord cannot hide commands by `ADMIN_ID`. Non-admins may see admin commands in the picker but get an ephemeral deny. Runtime checks `ADMIN_ID` only (`ADMIN_ROLE_ID` is documented, not a hard filter).
+### Useful settings
 
----
-
-## What it does
-
-- One **celeb row per person** — identity = **Wikidata QID** when available, else confirmed Wikipedia URL (`wiki_url_norm`); EN preferred, DE secondary  
-- Same display name can be **two people** (homonyms): import creates a new provisional for review instead of silently reusing a confirmed row  
-- After import: **wiki/age review** with top search candidates + buttons before auto-matching  
-- Scores hits as **100 − age at season start**  
-- `/go` **blocks** while reviews/unconfirmed picks remain (override: `/go force:true`)  
-- Frequent polls = recent months; **nightly full-year scrape** (retries if a live poll was busy)  
-- Pool deaths: primarily check each confirmed wiki page for `Category:YYYY deaths` / `Kategorie:Gestorben YYYY` (same approach as the old link watcher); death-list scrape is backup + all-deaths channel  
-- All-deaths channel: factual bio cards (age, lifespan, known-for / short summary) — no sarcastic phrases  
-- Retract window (`DEATH_CONFIRM_DAYS`) on nightly only  
-
----
-
-## Season workflow
-
-1. `/new-year confirm:true` (optional `start_date`) — setup  
-2. `/import user:@Player` — paste until **`done`**, or attach a file  
-3. Review (DM or `CHANNEL_ADMIN`): Confirm · pick other candidate · Wrong link (modal) · Set age · No wiki · Skip  
-4. `/go` — blocked until reviews done (or `force:true`) → silent reconcile → seed → live  
-
-Details: `/help command:import`.
-
----
-
-## Settings
-
-| Setting | Purpose |
-|---------|---------|
-| `TOKEN` / `ADMIN_ID` / `CHANNEL_DEATHPOOL` | Required |
-| `DISCORD_GUILD_ID` | Instant slash sync (recommended) |
-| `CHANNEL_ALL_DEATHS` | Optional all-deaths |
-| `CHANNEL_ADMIN` | Optional review/ops channel (else DM-first) |
-| `PREFIX` | Prefix fallback (default `!`) |
-| `WIKI_POLLER_MINUTES` | Recent-month poll (default `30`) |
-| `NIGHTLY_FULL_SCRAPE_HOUR` | Full-year scrape hour (default `3`) |
-| `DAILY_SUMMARY_HOUR` | Daily digest (default `9`) |
-| `DEATH_CONFIRM_DAYS` | Retract window (default `7`) |
-| `CUSTOM_PHRASES` | `no` / `mix` / `only` |
+| Setting | Default idea |
+|---------|----------------|
+| `WIKI_POLLER_MINUTES` | How often to poll recent deaths (`30`) |
+| `NIGHTLY_FULL_SCRAPE_HOUR` | Full-year scrape (`3`) |
+| `DAILY_SUMMARY_HOUR` | Daily digest (`9`) |
+| `DEATH_CONFIRM_DAYS` | Days before a hit is locked (`7`) |
+| `CHANNEL_ALL_DEATHS` | Optional factual feed |
+| `CHANNEL_ADMIN` | Optional ops channel; empty = DM-first |
+| `CUSTOM_PHRASES` | `no` / `mix` / `only` (+ `data/custom_phrases.txt`) |
 | `TZ` | Cron timezone |
 
 ---
 
-## Scoring
+## Quick mental model
 
-`max(1, 100 − age_at_pick)`.  
-Manual-only celebs never auto-kill — use `/kill` or sheet death dates.
+**Players** pick people → **Admin** imports & confirms wiki links → **`/go`** → bot watches Wikipedia → deathpool scores the pool, all-deaths (optional) shows the wider list → use **`/status`** / **`/invalidate`** when something looks wrong.
