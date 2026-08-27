@@ -44,23 +44,32 @@ const cmd = {
       return;
     }
 
-    // Optional hint if this URL matches a pool celeb — still no DB write
-    const inPool = Boolean(
+    const celeb =
       (meta.qid && db.findCelebByWikidataId(meta.qid)) ||
-        (meta.wikiNorm && db.findCelebByWikiNorm(meta.wikiNorm))
-    );
+      (meta.wikiNorm && db.findCelebByWikiNorm(meta.wikiNorm)) ||
+      null;
+
+    const age = celeb?.age_at_pick ?? meta.proposedAge ?? null;
+    const winners = celeb
+      ? db.getWinnersForCeleb(celeb.id, season.id).map((p) => ({
+          displayName: p.display_name,
+          // Plain names only — simulation must not ping
+        }))
+      : [];
 
     await announceSimulatedDeath(ctx.client, ctx.config, {
-      name: meta.title || "Unbekannt",
-      age: meta.proposedAge,
+      name: celeb?.name || meta.title || "Unbekannt",
+      age,
       url: meta.wikiUrl || urlArg,
-      inPool,
-      alreadyDead: false,
+      urlDe: meta.wikiUrlDe || null,
+      inPool: Boolean(celeb),
+      alreadyDead: celeb ? !celeb.is_alive : false,
+      winners,
     });
     await msg.reply(
-      `Simulation gesendet: **${meta.title}**` +
-        (inPool ? " _(wäre im Pool — DB unverändert)_" : " _(nicht im Pool)_") +
-        " · keine Punkte, kein DB-Write."
+      `Simulation gesendet: **${celeb?.name || meta.title}**` +
+        (celeb ? " _(wäre im Pool — DB unverändert, keine Pings)_" : " _(nicht im Pool)_") +
+        " · kein DB-Write."
     );
   },
 };

@@ -238,7 +238,15 @@ function formatReconcileSummary(hits, season) {
 async function announceSimulatedDeath(
   client,
   config,
-  { name, age, url, inPool = false, alreadyDead = false } = {}
+  {
+    name,
+    age,
+    url,
+    urlDe = null,
+    inPool = false,
+    alreadyDead = false,
+    winners = [],
+  } = {}
 ) {
   const channel = await client.channels.fetch(config.channelDeathpool).catch(() => null);
   if (!channel?.isTextBased()) {
@@ -247,12 +255,30 @@ async function announceSimulatedDeath(
   }
 
   const score = age != null ? db.scoreForAge(age) : 0;
+  const winnerNames = (winners || []).map((w) => w.displayName).filter(Boolean);
   const roast = pickPhrase(config, db, {
     name,
     age,
     score: score || "—",
-    winners: "niemand",
+    winners: winnerNames.length ? winnerNames.join(", ") : "niemand",
   });
+
+  const ageLine =
+    age != null
+      ? `Alter (Pool-Start): **${age}** → Punkte **${score}** (=100−Alter)`
+      : "Alter unbekannt → 0 Punkte";
+
+  // Names only — never <@id> (no pings in simulation)
+  let deathpoolValue;
+  if (!inPool) {
+    deathpoolValue = "_Simulation — nicht im Deathpool (keine Punkte)._";
+  } else if (alreadyDead) {
+    deathpoolValue = "_Schon tot markiert — Simulation vergibt nichts._";
+  } else if (winnerNames.length) {
+    deathpoolValue = winnerNames.map((n) => `**${n}** +${score} _(Simulation)_`).join("\n");
+  } else {
+    deathpoolValue = "_Niemand hatte diesen Pick._";
+  }
 
   const embed = new EmbedBuilder()
     .setColor(0x4a0000)
@@ -261,32 +287,26 @@ async function announceSimulatedDeath(
     .addFields(
       {
         name: "Details",
-        value: [
-          age != null ? `Alter (Pool-Start): **${age}**` : "Alter unbekannt",
-          url ? `[Wikipedia](${url})` : null,
-          alreadyDead ? "_War schon als tot markiert._" : null,
-          inPool ? null : "_Simulation — Person nicht im Deathpool (keine Punkte)._",
-        ]
-          .filter(Boolean)
-          .join("\n"),
+        value: [ageLine, url ? `[Wikipedia](${url})` : null].filter(Boolean).join("\n"),
       },
       {
         name: "Deathpool",
-        value:
-          inPool && !alreadyDead
-            ? "_siehe Punkte-Buchung_"
-            : "_Keine Punkte (Simulation / schon tot)._",
+        value: deathpoolValue,
       }
     )
     .setTimestamp(new Date());
 
-  const image = url ? await fetchBestImage(url, null, config.userAgent) : null;
+  const enUrl = url && /en\.wikipedia/i.test(url) ? url : null;
+  const deUrl =
+    urlDe || (url && /de\.wikipedia/i.test(url) ? url : null) || (!enUrl ? url : null);
+  const image = await fetchBestImage(enUrl, deUrl, config.userAgent);
   if (image) embed.setImage(image);
 
   await channel.send({
-    content: `${emojiBanner(config)} **Simulation** (kein DB-Write)`,
+    content: `${emojiBanner(config)} **Simulation** (kein DB-Write · keine Pings)`,
     embeds: [embed],
-    allowedMentions: { parse: [] },
+    // Explicitly empty — do not ping even if a phrase somehow contains an id
+    allowedMentions: { parse: [], users: [], roles: [] },
   });
 }
 
