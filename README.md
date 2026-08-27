@@ -119,7 +119,9 @@ Non-admins may **see** admin slash commands in Discord’s picker (Discord limit
 | `CUSTOM_PHRASES` | `no` / `mix` / `only` (+ `data/custom_phrases.txt`) |
 | `TZ` | Cron + “killed today” status day boundary |
 
-Bot presence: **Already N People killed today!** — counts all-deaths posts since local midnight (`TZ`), resets at 00:00.
+Bot presence: **Already N People killed today!** after the first all-deaths post; at **0** → `lurking.... bloody cats!`. Resets at local midnight (`TZ`).
+
+Nightly DB zip backup at **02:00** under `data/backups/` — keeps the **last 14** files.
 
 ---
 

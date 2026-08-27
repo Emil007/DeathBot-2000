@@ -104,15 +104,51 @@ function restorePackage(config, fileName) {
   return { manifest, safety: safety.name, restored: fileName };
 }
 
-function startAutoBackup(config) {
-  cron.schedule("0 */6 * * *", () => {
+function pruneBackups(config, { keep = 14 } = {}) {
+  fs.mkdirSync(config.backupsDir, { recursive: true });
+  const files = fs
+    .readdirSync(config.backupsDir)
+    .filter((f) => f.endsWith(".zip"))
+    .map((f) => {
+      const p = path.join(config.backupsDir, f);
+      let mtimeMs = 0;
+      try {
+        mtimeMs = fs.statSync(p).mtimeMs;
+      } catch {
+        /* ignore */
+      }
+      return { name: f, path: p, mtimeMs };
+    })
+    .sort((a, b) => b.mtimeMs - a.mtimeMs);
+
+  const removed = [];
+  for (const f of files.slice(Math.max(0, keep))) {
     try {
-      const pkg = createPackage(config, { reason: "auto" });
-      console.log("[backup] auto package", pkg.name);
+      fs.unlinkSync(f.path);
+      removed.push(f.name);
     } catch (e) {
-      console.error("[backup] auto failed", e.message);
+      console.warn("[backup] prune failed", f.name, e.message);
+    }
+  }
+  return { kept: files.slice(0, keep).map((f) => f.name), removed };
+}
+
+function startAutoBackup(config) {
+  // Nightly backup (local TZ from process / compose TZ)
+  cron.schedule("0 2 * * *", () => {
+    try {
+      const pkg = createPackage(config, { reason: "nightly" });
+      const prune = pruneBackups(config, { keep: 14 });
+      console.log(
+        "[backup] nightly",
+        pkg.name,
+        `kept=${prune.kept.length} removed=${prune.removed.length}`
+      );
+    } catch (e) {
+      console.error("[backup] nightly failed", e.message);
     }
   });
+  console.log("[backup] nightly scheduled at 02:00 (keep last 14)");
 }
 
 module.exports = {
@@ -120,5 +156,6 @@ module.exports = {
   listRestoreCandidates,
   findPackage,
   restorePackage,
+  pruneBackups,
   startAutoBackup,
 };

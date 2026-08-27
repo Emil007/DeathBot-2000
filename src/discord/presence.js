@@ -50,6 +50,7 @@ function writeDayCount(db, timeZone, count) {
 
 function statusText(count) {
   const n = Math.max(0, Math.floor(Number(count) || 0));
+  if (n === 0) return "lurking.... bloody cats!";
   const people = n === 1 ? "Person" : "People";
   return `Already ${n} ${people} killed today!`;
 }
