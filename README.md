@@ -46,6 +46,7 @@ Admin season flow works in a **DM with the bot** (`/…` or `!…`). Announcemen
 - Scores hits as **100 − age at season start**  
 - `/go` **blocks** while reviews/unconfirmed picks remain (override: `/go force:true`)  
 - Frequent polls = recent months; **nightly full-year scrape** (retries if a live poll was busy)  
+- Pool deaths: primarily check each confirmed wiki page for `Category:YYYY deaths` / `Kategorie:Gestorben YYYY` (same approach as the old link watcher); death-list scrape is backup + all-deaths channel  
 - Retract window (`DEATH_CONFIRM_DAYS`) on nightly only  
 
 ---

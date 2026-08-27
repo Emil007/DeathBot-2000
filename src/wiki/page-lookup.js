@@ -214,6 +214,7 @@ async function proposeWikiForName(userAgent, name, seasonStartDate, sheetAge) {
     const enHits = await searchWikipedia(client, "en", name);
     for (const hit of enHits.slice(0, 3)) {
       try {
+        await new Promise((r) => setTimeout(r, 400));
         const meta = await getPageMeta(client, "en", hit.title);
         if (!meta) continue;
         const wikiAge = meta.birthDate ? ageAtDate(meta.birthDate, seasonStartDate) : null;
@@ -238,9 +239,11 @@ async function proposeWikiForName(userAgent, name, seasonStartDate, sheetAge) {
 
   if (!primaryMeta) {
     try {
+      await new Promise((r) => setTimeout(r, 400));
       const deHits = await searchWikipedia(client, "de", name);
       for (const hit of deHits.slice(0, 3)) {
         try {
+          await new Promise((r) => setTimeout(r, 400));
           const meta = await getPageMeta(client, "de", hit.title);
           if (!meta) continue;
           const wikiAge = meta.birthDate ? ageAtDate(meta.birthDate, seasonStartDate) : null;

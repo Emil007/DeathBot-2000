@@ -1,6 +1,10 @@
 const { scrapeEn } = require("../wiki/scraper-en");
 const { scrapeDe } = require("../wiki/scraper-de");
 const { findPoolMatches, entryMatchesCeleb } = require("../wiki/match");
+const {
+  findPoolDeathsByCategory,
+  celebStillMarkedDead,
+} = require("../wiki/category-death");
 const db = require("../db");
 const {
   processDeathpoolHit,
@@ -25,13 +29,18 @@ async function processRetractions(client, config, poolEntries) {
 
   for (const celeb of pending) {
     const detected = celeb.death_detected_at ? Date.parse(celeb.death_detected_at) : now;
-    const stillOnList = poolEntries.some((entry) => {
-      const akas = db.getAkas(celeb.id);
-      const blacklist = db.getBlacklist(celeb.id);
-      return entryMatchesCeleb(entry, celeb, akas, blacklist);
-    });
 
-    if (!stillOnList) {
+    // Prefer category check (same signal as detection); fall back to death-list match
+    let stillDead = await celebStillMarkedDead(config.userAgent, celeb);
+    if (!stillDead && poolEntries?.length) {
+      stillDead = poolEntries.some((entry) => {
+        const akas = db.getAkas(celeb.id);
+        const blacklist = db.getBlacklist(celeb.id);
+        return entryMatchesCeleb(entry, celeb, akas, blacklist);
+      });
+    }
+
+    if (!stillDead) {
       console.log(new Date().toISOString(), "[retract]", celeb.name);
       const result = db.retractDeath(celeb.id);
       if (result && db.isLive()) {
@@ -49,12 +58,19 @@ async function processRetractions(client, config, poolEntries) {
   }
 }
 
+function mergeHits(categoryHits, listHits) {
+  const byId = new Map();
+  for (const h of [...categoryHits, ...listHits]) {
+    if (!byId.has(h.celeb.id)) byId.set(h.celeb.id, h);
+  }
+  return [...byId.values()];
+}
+
 /**
  * @param {'seed'|'reconcile'|'live'|'nightly'} mode
  */
 async function runWikiPoll(client, config, { mode = "live" } = {}) {
   console.log(new Date().toISOString(), `[poll] mode=${mode}`);
-  // live: recent months; everything else (incl. nightly): full year
   const scope = mode === "live" ? "recent" : "full";
   const { enEntries, deData, poolEntries } = await scrapeAll(config, scope);
 
@@ -90,7 +106,15 @@ async function runWikiPoll(client, config, { mode = "live" } = {}) {
         const pathPart = enUrl.includes("wikipedia.org")
           ? "/" + enUrl.split("wikipedia.org")[1].replace(/^\/+/, "")
           : null;
-        const wikiPath = pathPart?.startsWith("/wiki/") ? pathPart : null;
+        let wikiPath = pathPart?.startsWith("/wiki/") ? pathPart.split("?")[0] : null;
+        // absolute interwiki sometimes
+        if (!wikiPath && enUrl.includes("/wiki/")) {
+          try {
+            wikiPath = new URL(enUrl.startsWith("http") ? enUrl : `https:${enUrl}`).pathname;
+          } catch {
+            wikiPath = null;
+          }
+        }
         if (wikiPath && enIds.has(wikiPath)) {
           db.markWikiAnnounced(d.id);
           continue;
@@ -124,7 +148,7 @@ async function runWikiPoll(client, config, { mode = "live" } = {}) {
 
   console.log(
     new Date().toISOString(),
-    `[poll] new EN=${newEn.length} DE-only=${newDeOnly.length}`
+    `[poll] new EN=${newEn.length} DE-only=${newDeOnly.length} scraped EN=${enEntries.length} DE=${deData.entries.length}`
   );
 
   if (mode === "seed") {
@@ -153,14 +177,28 @@ async function runWikiPoll(client, config, { mode = "live" } = {}) {
     for (const e of [...newEn, ...newDeOnly]) db.markWikiAnnounced(e.id);
   }
 
-  const matches = findPoolMatches(poolEntries);
+  // Primary: per-celeb death-category check (proven approach from deathlist_checker.py)
+  // Secondary: death-list name/URL matching
+  let categoryHits = [];
+  try {
+    categoryHits = await findPoolDeathsByCategory(config.userAgent, { delayMs: 300 });
+  } catch (e) {
+    console.error("[poll] category check failed", e.message);
+  }
+  const listHits = findPoolMatches(poolEntries);
+  const matches = mergeHits(categoryHits, listHits);
+  console.log(
+    new Date().toISOString(),
+    `[poll] pool hits: category=${categoryHits.length} list=${listHits.length} merged=${matches.length}`
+  );
+
   const hits = [];
   const announce = mode === "live" || mode === "nightly";
   const confirmed = mode === "reconcile";
 
   for (const m of matches) {
     try {
-      console.log(new Date().toISOString(), `[poll] DEATHPOOL HIT (${mode})`, m.celeb.name);
+      console.log(new Date().toISOString(), `[poll] DEATHPOOL HIT (${mode})`, m.celeb.name, m.via || "list");
       const result = await processDeathpoolHit(
         client,
         config,
@@ -173,7 +211,6 @@ async function runWikiPoll(client, config, { mode = "live" } = {}) {
     }
   }
 
-  // Retractions only on full-year scrapes (nightly) — never on recent-only live polls
   if (mode === "nightly") {
     await processRetractions(client, config, poolEntries);
   }
@@ -223,7 +260,6 @@ function startWikiPoller(client, config) {
     setInterval(() => tick(), ms);
   });
 
-  // Nightly full-year scrape: matching + all-deaths + safe retractions
   const cron = require("node-cron");
   const hour = Math.min(23, Math.max(0, config.nightlyFullScrapeHour));
   cron.schedule(`0 ${hour} * * *`, () => {
