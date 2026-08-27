@@ -8,10 +8,10 @@ const {
   announceRetraction,
 } = require("../discord/announce");
 
-async function scrapeAll(config) {
+async function scrapeAll(config, scope = "full") {
   const [enEntries, deData] = await Promise.all([
-    scrapeEn(config.userAgent),
-    scrapeDe(config.userAgent),
+    scrapeEn(config.userAgent, { scope }),
+    scrapeDe(config.userAgent, { scope }),
   ]);
   return { enEntries, deData, poolEntries: [...enEntries, ...deData.entries] };
 }
@@ -54,7 +54,9 @@ async function processRetractions(client, config, poolEntries) {
  */
 async function runWikiPoll(client, config, { mode = "live" } = {}) {
   console.log(new Date().toISOString(), `[poll] mode=${mode}`);
-  const { enEntries, deData, poolEntries } = await scrapeAll(config);
+  // live polls: recent months only; reconcile/seed/check: full year
+  const scope = mode === "live" ? "recent" : "full";
+  const { enEntries, deData, poolEntries } = await scrapeAll(config, scope);
 
   const enIds = new Set(enEntries.map((e) => e.wikiPath));
   const newEn = [];

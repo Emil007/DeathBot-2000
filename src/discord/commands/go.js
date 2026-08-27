@@ -1,33 +1,47 @@
 const db = require("../../db");
 const { runWikiPoll } = require("../../jobs/wiki-poll");
+const { formatReconcileSummary } = require("../announce");
 
 module.exports = {
   name: "go",
   aliases: ["start-run", "live"],
   admin: true,
-  description: "Beendet Setup und startet Live-Ankündigungen",
+  description: "Silent reconcile, then go live (no Channel A spam for history)",
   async run(ctx, args, msg) {
     const season = db.getActiveSeason();
     if (season.live) {
-      await msg.reply("Läuft bereits live.");
+      await msg.reply("Already live.");
       return;
     }
     if (!season.start_date) {
-      await msg.reply("Kein Startdatum. Setze mit `!season 2026-01-01` oder `!new-year confirm …`.");
+      await msg.reply("No start date. Set with `!season YYYY-MM-DD` or `!new-year confirm …`.");
       return;
     }
 
-    await msg.reply("Seed All-Deaths-Cache (nur Tode ab jetzt) und schalte Live…");
+    await msg.reply(
+      `Running silent reconcile (full-year wiki) for start **${season.start_date}** — no channel announcements…`
+    );
+
+    const { hits } = await runWikiPoll(ctx.client, ctx.config, { mode: "reconcile" });
+    const summary = formatReconcileSummary(hits, db.getActiveSeason());
+    try {
+      await msg.author.send(summary);
+    } catch {
+      await msg.reply(summary.slice(0, 1900));
+    }
+
+    await msg.reply("Seeding all-deaths cache (announce only from now on)…");
     await runWikiPoll(ctx.client, ctx.config, { mode: "seed" });
     db.setSeasonLive(true);
 
     await msg.reply(
       [
         "▶️ **Live**",
-        `• Saison-Start: **${season.start_date}**`,
-        "• Deathpool-Ankündigungen: an (mit Pings)",
-        "• All-Deaths: nur neue Einträge ab jetzt",
-        `• Falsch-Positive: Rücknahme wenn innerhalb von **${ctx.config.deathConfirmDays}** Tagen nicht mehr auf Wiki-Listen`,
+        `• Season start: **${season.start_date}**`,
+        `• Catch-up deaths applied silently: **${hits.length}** (see DM summary)`,
+        "• Deathpool announcements: on (winner pings)",
+        "• All-deaths: only new entries from now",
+        `• False positives: retract if off wiki lists within **${ctx.config.deathConfirmDays}** days (not auto-unkill while still listed)`,
       ].join("\n")
     );
   },

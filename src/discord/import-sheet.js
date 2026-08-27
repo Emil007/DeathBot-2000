@@ -1,3 +1,23 @@
+function parseDeathDate(raw) {
+  if (!raw) return null;
+  const s = String(raw).trim();
+  if (!s) return null;
+  if (/^\d{4}-\d{2}-\d{2}$/.test(s)) return s;
+  const de = s.match(/^(\d{1,2})\.(\d{1,2})\.(\d{4})$/);
+  if (de) {
+    const d = de[1].padStart(2, "0");
+    const m = de[2].padStart(2, "0");
+    return `${de[3]}-${m}-${d}`;
+  }
+  const us = s.match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})$/);
+  if (us) {
+    const m = us[1].padStart(2, "0");
+    const d = us[2].padStart(2, "0");
+    return `${us[3]}-${m}-${d}`;
+  }
+  return s;
+}
+
 function parseSheetTable(text) {
   const lines = String(text)
     .replace(/\r\n/g, "\n")
@@ -5,11 +25,11 @@ function parseSheetTable(text) {
     .map((l) => l.trim())
     .filter(Boolean);
 
-  if (!lines.length) return { error: "Leere Liste." };
+  if (!lines.length) return { error: "Empty list." };
 
   const splitLine = (line) => {
     if (line.includes("\t")) return line.split("\t").map((c) => c.trim());
-    // fallback: multiple spaces
+    if (line.includes(";")) return line.split(";").map((c) => c.trim());
     return line.split(/\s{2,}/).map((c) => c.trim());
   };
 
@@ -28,10 +48,11 @@ function parseSheetTable(text) {
     idxName = cols.findIndex((c) => c === "name" || c.includes("name"));
     idxAge = cols.findIndex((c) => c === "alter" || c === "age");
     idxDesc = cols.findIndex((c) => c.includes("beschreib") || c.includes("desc"));
-    idxDied = cols.findIndex((c) => c.includes("gestorben") || c.includes("died") || c.includes("dead"));
+    idxDied = cols.findIndex(
+      (c) => c.includes("gestorben") || c.includes("died") || c.includes("dead")
+    );
     start = 1;
   } else {
-    // Assume: #, Name, Alter, Punkte, Beschreibung, gestorben
     const sample = splitLine(lines[0]);
     if (sample.length >= 3 && /^\d+$/.test(sample[0])) {
       idxName = 1;
@@ -47,7 +68,7 @@ function parseSheetTable(text) {
   }
 
   if (idxName < 0 || idxAge < 0) {
-    return { error: "Konnte Name/Alter-Spalten nicht finden." };
+    return { error: "Could not find Name/Alter columns." };
   }
 
   const rows = [];
@@ -56,18 +77,21 @@ function parseSheetTable(text) {
     const name = cells[idxName];
     if (!name) continue;
     const ageRaw = cells[idxAge];
-    const age = ageRaw != null && ageRaw !== "" ? parseInt(String(ageRaw).replace(/\D/g, ""), 10) : null;
+    const age =
+      ageRaw != null && ageRaw !== ""
+        ? parseInt(String(ageRaw).replace(/\D/g, ""), 10)
+        : null;
     const description = idxDesc >= 0 ? cells[idxDesc] || "" : "";
     const died = idxDied >= 0 ? cells[idxDied] || "" : "";
     rows.push({
       name: name.trim(),
       age: Number.isFinite(age) ? age : null,
       description: description.trim(),
-      diedAt: died.trim() || null,
+      diedAt: parseDeathDate(died),
     });
   }
 
   return { rows };
 }
 
-module.exports = { parseSheetTable };
+module.exports = { parseSheetTable, parseDeathDate };

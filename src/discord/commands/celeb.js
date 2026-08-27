@@ -18,14 +18,21 @@ module.exports = {
       const season = db.getActiveSeason();
       const winners = db.getWinnersForCeleb(c.id, season.id);
       return [
-        `${c.is_alive ? "🟢" : "💀"} **${c.name}** (id ${c.id})`,
-        c.age_at_pick != null ? `Alter: ${c.age_at_pick}` : null,
-        c.description ? `Notiz: ${c.description}` : null,
-        c.died_at ? `Gestorben: ${c.died_at}` : null,
+        `${c.is_alive ? "🟢" : "💀"} **${c.name}** (id ${c.id})` +
+          (c.exclude_from_auto ? " · excluded" : ""),
+        c.age_at_pick != null ? `Age (season start): ${c.age_at_pick}` : null,
+        c.description ? `Note: ${c.description}` : null,
+        c.died_at ? `Died: ${c.died_at}` : null,
         c.wiki_url ? c.wiki_url : null,
+        db.getAkas(c.id).length
+          ? `AKA: ${db.getAkas(c.id).join(", ")}`
+          : null,
+        db.getBlacklist(c.id).length
+          ? `Blacklist: ${db.getBlacklist(c.id).join(", ")}`
+          : null,
         winners.length
-          ? `Gepickt von: ${winners.map((w) => w.display_name).join(", ")}`
-          : "Von niemandem gepickt",
+          ? `Picked by: ${winners.map((w) => w.display_name).join(", ")}`
+          : "Picked by nobody",
       ]
         .filter(Boolean)
         .join("\n");

@@ -17,7 +17,13 @@ async function resolveEnglish(client, germanUrl) {
   try {
     const response = await client.get(germanUrl);
     const $ = cheerio.load(response.data);
-    return $(".interlanguage-link-en a").attr("href") || null;
+    const href =
+      $('li.interlanguage-link.interwiki-en a').attr("href") ||
+      $('a[lang="en"][hreflang="en"]').attr("href") ||
+      $('a[lang="en"]').attr("href") ||
+      $(".interlanguage-link-en a").attr("href") ||
+      null;
+    return href || null;
   } catch {
     return null;
   }
@@ -54,15 +60,37 @@ async function scrapeUrl(client, url) {
   }
 }
 
-async function scrapeDe(userAgent) {
+function monthUrls(year, monthIndex) {
+  return [`https://de.wikipedia.org/wiki/Nekrolog_${MONTHS[monthIndex]}_${year}`];
+}
+
+/**
+ * @param {string} userAgent
+ * @param {{ scope?: 'recent'|'full' }} [opts]
+ */
+async function scrapeDe(userAgent, opts = {}) {
+  const scope = opts.scope || "full";
   const client = createClient(userAgent);
   const year = new Date().getFullYear();
   const monthIndex = new Date().getMonth();
-  const urls = [`https://de.wikipedia.org/wiki/Nekrolog_${year}`];
-  for (let i = 0; i <= monthIndex; i++) {
-    urls.push(`https://de.wikipedia.org/wiki/Nekrolog_${MONTHS[i]}_${year}`);
+  const urls = [];
+
+  if (scope === "recent") {
+    urls.push(...monthUrls(year, monthIndex));
+    if (monthIndex === 0) {
+      urls.push(...monthUrls(year - 1, 11));
+    } else {
+      urls.push(...monthUrls(year, monthIndex - 1));
+    }
+  } else {
+    urls.push(`https://de.wikipedia.org/wiki/Nekrolog_${year}`);
+    for (let i = 0; i <= monthIndex; i++) urls.push(...monthUrls(year, i));
   }
-  const results = await Promise.all(urls.map((u) => scrapeUrl(client, u)));
+
+  const results = [];
+  for (const u of urls) {
+    results.push(await scrapeUrl(client, u));
+  }
   const seen = new Set();
   const unique = [];
   for (const e of results.flat()) {

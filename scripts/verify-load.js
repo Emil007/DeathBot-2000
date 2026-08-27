@@ -1,0 +1,11 @@
+const path = require("path");
+const root = path.join(__dirname, "..");
+require(path.join(root, "src/db/schema"));
+require(path.join(root, "src/wiki/match"));
+require(path.join(root, "src/wiki/scraper-en"));
+require(path.join(root, "src/wiki/scraper-de"));
+require(path.join(root, "src/phrases"));
+require(path.join(root, "src/discord/import-sheet"));
+require(path.join(root, "src/discord/commands"));
+const phrases = require(path.join(root, "src/phrases/builtin-phrases.json"));
+console.log("modules-ok", phrases.length);

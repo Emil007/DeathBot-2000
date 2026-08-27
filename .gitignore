@@ -10,3 +10,4 @@ data/custom_phrases.txt
 .env.*
 *.log
 .DS_Store
+review_feedback.md

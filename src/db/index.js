@@ -100,14 +100,24 @@ function findOrCreateCeleb({ name, age, description }) {
   const key = nameKey(name);
   let celeb = db.prepare("SELECT * FROM celebs WHERE name_key = ?").get(key);
   if (celeb) {
+    let ageConflict = null;
+    if (
+      age != null &&
+      celeb.age_at_pick != null &&
+      Number(age) !== Number(celeb.age_at_pick)
+    ) {
+      ageConflict = { existing: celeb.age_at_pick, incoming: Number(age) };
+    }
+    // Keep first non-null age (season-global); never overwrite with later import
     db.prepare(
       `UPDATE celebs SET
         name = COALESCE(?, name),
-        age_at_pick = COALESCE(?, age_at_pick),
+        age_at_pick = COALESCE(age_at_pick, ?),
         description = COALESCE(?, description)
        WHERE id = ?`
     ).run(name, age ?? null, description || null, celeb.id);
-    return db.prepare("SELECT * FROM celebs WHERE id = ?").get(celeb.id);
+    celeb = db.prepare("SELECT * FROM celebs WHERE id = ?").get(celeb.id);
+    return { celeb, ageConflict };
   }
   const info = db
     .prepare(
@@ -115,7 +125,110 @@ function findOrCreateCeleb({ name, age, description }) {
        VALUES (?, ?, ?, ?, 1)`
     )
     .run(name, key, age ?? null, description || null);
-  return db.prepare("SELECT * FROM celebs WHERE id = ?").get(info.lastInsertRowid);
+  return {
+    celeb: db.prepare("SELECT * FROM celebs WHERE id = ?").get(info.lastInsertRowid),
+    ageConflict: null,
+  };
+}
+
+function clearPicksForPlayer(playerId, seasonId) {
+  db.prepare("DELETE FROM picks WHERE player_id = ? AND season_id = ?").run(playerId, seasonId);
+}
+
+function addAka(celebId, alias) {
+  db.prepare("INSERT OR IGNORE INTO celeb_aka (celeb_id, alias) VALUES (?, ?)").run(
+    celebId,
+    alias.trim()
+  );
+}
+
+function removeAka(celebId, alias) {
+  db.prepare("DELETE FROM celeb_aka WHERE celeb_id = ? AND alias = ?").run(celebId, alias.trim());
+}
+
+function addBlacklist(celebId, term) {
+  db.prepare("INSERT OR IGNORE INTO celeb_blacklist (celeb_id, term) VALUES (?, ?)").run(
+    celebId,
+    term.trim()
+  );
+}
+
+function removeBlacklist(celebId, term) {
+  db.prepare("DELETE FROM celeb_blacklist WHERE celeb_id = ? AND term = ?").run(
+    celebId,
+    term.trim()
+  );
+}
+
+function setExcludeFromAuto(celebId, exclude) {
+  db.prepare("UPDATE celebs SET exclude_from_auto = ? WHERE id = ?").run(exclude ? 1 : 0, celebId);
+}
+
+function listBonuses() {
+  return db.prepare("SELECT * FROM bonuses ORDER BY name COLLATE NOCASE").all();
+}
+
+function upsertBonus({ id, name, description, points }) {
+  db.prepare(
+    `INSERT INTO bonuses (id, name, description, points) VALUES (?, ?, ?, ?)
+     ON CONFLICT(id) DO UPDATE SET name = excluded.name, description = excluded.description, points = excluded.points`
+  ).run(id, name, description || null, points);
+}
+
+function awardBonus(playerId, bonusId) {
+  const bonus = db.prepare("SELECT * FROM bonuses WHERE id = ?").get(bonusId);
+  if (!bonus) throw new Error("Bonus not found");
+  const row = db
+    .prepare("SELECT * FROM player_bonuses WHERE player_id = ? AND bonus_id = ?")
+    .get(playerId, bonusId);
+  if (row) {
+    db.prepare(
+      "UPDATE player_bonuses SET times = times + 1 WHERE player_id = ? AND bonus_id = ?"
+    ).run(playerId, bonusId);
+  } else {
+    db.prepare(
+      "INSERT INTO player_bonuses (player_id, bonus_id, times) VALUES (?, ?, 1)"
+    ).run(playerId, bonusId);
+  }
+  return bonus;
+}
+
+function revokeBonus(playerId, bonusId) {
+  const row = db
+    .prepare("SELECT * FROM player_bonuses WHERE player_id = ? AND bonus_id = ?")
+    .get(playerId, bonusId);
+  if (!row) return null;
+  if (row.times <= 1) {
+    db.prepare("DELETE FROM player_bonuses WHERE player_id = ? AND bonus_id = ?").run(
+      playerId,
+      bonusId
+    );
+  } else {
+    db.prepare(
+      "UPDATE player_bonuses SET times = times - 1 WHERE player_id = ? AND bonus_id = ?"
+    ).run(playerId, bonusId);
+  }
+  return db.prepare("SELECT * FROM bonuses WHERE id = ?").get(bonusId);
+}
+
+function unlinkPlayer(discordUserId) {
+  const player = db.prepare("SELECT * FROM players WHERE discord_user_id = ?").get(String(discordUserId));
+  if (!player) return null;
+  const season = getActiveSeason();
+  db.prepare("DELETE FROM picks WHERE player_id = ? AND season_id = ?").run(player.id, season.id);
+  return player;
+}
+
+function resolvePlayerFromMessage(msg, token) {
+  const mention = msg.mentions.users.first();
+  if (mention) {
+    return db.prepare("SELECT * FROM players WHERE discord_user_id = ?").get(mention.id);
+  }
+  if (!token) return null;
+  return (
+    db.prepare("SELECT * FROM players WHERE discord_user_id = ?").get(token) ||
+    db.prepare("SELECT * FROM players WHERE display_name LIKE ? COLLATE NOCASE").get(token)
+  );
 }
 
 function setPick(playerId, celebId, seasonId) {
@@ -226,6 +339,7 @@ function retractDeath(celebId) {
     `UPDATE celebs SET
       is_alive = 1,
       died_at = NULL,
+      wiki_url = NULL,
       death_confirmed = 0,
       death_detected_at = NULL,
       death_source = NULL
@@ -417,10 +531,16 @@ module.exports = {
   scoreForAge,
   upsertPlayer,
   findOrCreateCeleb,
+  clearPicksForPlayer,
   setPick,
   getAliveCelebsForAuto,
   getAkas,
   getBlacklist,
+  addAka,
+  removeAka,
+  addBlacklist,
+  removeBlacklist,
+  setExcludeFromAuto,
   getWinnersForCeleb,
   applyDeath,
   retractDeath,
@@ -433,6 +553,12 @@ module.exports = {
   listScores,
   getPlayerPicks,
   findCelebByName,
+  listBonuses,
+  upsertBonus,
+  awardBonus,
+  revokeBonus,
+  unlinkPlayer,
+  resolvePlayerFromMessage,
   isWikiSeen,
   markWikiSeen,
   markWikiAnnounced,

@@ -40,15 +40,38 @@ async function scrapeUrl(client, url) {
   }
 }
 
-async function scrapeEn(userAgent) {
+function monthUrls(year, monthIndex) {
+  return [`https://en.wikipedia.org/wiki/Deaths_in_${MONTHS[monthIndex]}_${year}`];
+}
+
+/**
+ * @param {string} userAgent
+ * @param {{ scope?: 'recent'|'full' }} [opts]
+ * recent = current + previous month; full = year page + all months YTD
+ */
+async function scrapeEn(userAgent, opts = {}) {
+  const scope = opts.scope || "full";
   const client = createClient(userAgent);
   const year = new Date().getFullYear();
   const monthIndex = new Date().getMonth();
-  const urls = [`https://en.wikipedia.org/wiki/Deaths_in_${year}`];
-  for (let i = 0; i <= monthIndex; i++) {
-    urls.push(`https://en.wikipedia.org/wiki/Deaths_in_${MONTHS[i]}_${year}`);
+  const urls = [];
+
+  if (scope === "recent") {
+    urls.push(...monthUrls(year, monthIndex));
+    if (monthIndex === 0) {
+      urls.push(...monthUrls(year - 1, 11));
+    } else {
+      urls.push(...monthUrls(year, monthIndex - 1));
+    }
+  } else {
+    urls.push(`https://en.wikipedia.org/wiki/Deaths_in_${year}`);
+    for (let i = 0; i <= monthIndex; i++) urls.push(...monthUrls(year, i));
   }
-  const results = await Promise.all(urls.map((u) => scrapeUrl(client, u)));
+
+  const results = [];
+  for (const u of urls) {
+    results.push(await scrapeUrl(client, u));
+  }
   const seen = new Set();
   const unique = [];
   for (const e of results.flat()) {

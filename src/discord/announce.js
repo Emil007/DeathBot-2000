@@ -203,23 +203,35 @@ async function announceDailySummary(client, config) {
 
 function formatReconcileSummary(hits, season) {
   const lines = [
-    `📋 **Reconcile** (Setup, keine Channel-Ankündigungen)`,
-    `Saison-Start: **${season.start_date || "?"}** | Live: **nein**`,
-    `Neu als tot erkannt: **${hits.length}**`,
+    `📋 **Reconcile** (setup / pre-live — no channel announcements)`,
+    `Season start: **${season.start_date || "?"}** | Live: **${season.live ? "yes" : "no"}**`,
+    `Newly marked dead: **${hits.length}**`,
     "",
   ];
+  const mismatches = [];
   for (const h of hits.slice(0, 40)) {
     const awardStr = h.result.awards
       .map((a) => `${a.player.display_name} +${a.points}`)
       .join(", ");
     lines.push(
-      `💀 **${h.celeb.name}** — Pool-Alter ${h.result.age ?? "?"} → ${h.result.score} Pkt` +
-        (h.wikiAge != null ? ` (Wiki-Alter ${h.wikiAge})` : "") +
-        (awardStr ? ` | ${awardStr}` : " | niemand")
+      `💀 **${h.celeb.name}** — pool age ${h.result.age ?? "?"} → ${h.result.score} pts` +
+        (h.wikiAge != null ? ` (wiki age ${h.wikiAge})` : "") +
+        (awardStr ? ` | ${awardStr}` : " | nobody")
     );
+    if (
+      h.wikiAge != null &&
+      h.result.age != null &&
+      Math.abs(Number(h.wikiAge) - Number(h.result.age)) >= 3
+    ) {
+      mismatches.push(`${h.celeb.name}: pool ${h.result.age} vs wiki ${h.wikiAge}`);
+    }
   }
   if (hits.length > 40) lines.push(`… +${hits.length - 40}`);
-  lines.push("", `Danach \`!scores\` prüfen, dann \`!go\` für Live-Betrieb.`);
+  if (mismatches.length) {
+    lines.push("", "⚠️ Large pool-age vs wiki-age gaps:");
+    mismatches.slice(0, 15).forEach((m) => lines.push(`• ${m}`));
+  }
+  lines.push("", "Next: `!scores`, then `!go` if not already live.");
   return lines.join("\n").slice(0, 1900);
 }
 
