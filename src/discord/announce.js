@@ -2,6 +2,7 @@ const { EmbedBuilder } = require("discord.js");
 const db = require("../db");
 const { pickPhrase } = require("../phrases");
 const { fetchBestImage } = require("../wiki/page-image");
+const { fetchDeathBrief, resolveDeathImage } = require("../wiki/death-brief");
 
 function emojiBanner(config) {
   return Array(config.alertEmojiRepeat).fill(config.alertEmoji).join(" ");
@@ -127,32 +128,65 @@ async function announceAllDeath(client, config, entry, { isDeOnly = false } = {}
   const channel = await client.channels.fetch(config.channelAllDeaths).catch(() => null);
   if (!channel?.isTextBased()) return;
 
-  const nameGuess = entry.text.split(",")[0].trim();
-  const ageMatch = entry.text.match(/\b(\d{2,3})\b/);
-  const age = ageMatch ? ageMatch[1] : null;
+  const brief = await fetchDeathBrief(entry.url, config.userAgent, {
+    listText: entry.text,
+  });
 
-  const roast = pickPhrase(
-    config,
-    db,
-    { name: nameGuess, age, score: "—", winners: "niemand" },
-    { short: true }
-  );
+  const name = brief.name || entry.text.split(",")[0].trim();
+  const detailLines = [];
+  if (brief.lifespan || brief.age != null) {
+    detailLines.push(
+      [
+        brief.lifespan,
+        brief.age != null ? `gestorben mit **${brief.age}**` : null,
+      ]
+        .filter(Boolean)
+        .join(" · ")
+    );
+  } else if (brief.age != null) {
+    detailLines.push(`Alter: **${brief.age}**`);
+  }
+  if (brief.knownFor) detailLines.push(`Bekannt für: ${brief.knownFor}`);
+
+  // Death-list blurb minus leading "Name, age," — extra context (country, role)
+  let listNote = null;
+  if (entry.text) {
+    let rest = String(entry.text).replace(/\[\d+\]/g, "").trim();
+    const nameRe = new RegExp(
+      `^\\s*${name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\s*`,
+      "i"
+    );
+    rest = rest.replace(nameRe, "").replace(/^[,:\-–]\s*/, "");
+    rest = rest.replace(/^\(?\s*\d{2,3}\s*\)?\s*[,;]?\s*/, "").trim();
+    if (rest.length >= 12 && rest.toLowerCase() !== (brief.summary || "").toLowerCase()) {
+      listNote = rest.length > 220 ? rest.slice(0, 219).trim() + "…" : rest;
+    }
+  }
+
+  const description =
+    brief.summary ||
+    listNote ||
+    "_Neuer Eintrag auf der Wikipedia-Todesliste._";
 
   const embed = new EmbedBuilder()
-    .setColor(isDeOnly ? 0x333333 : 0x222222)
-    .setTitle(isDeOnly ? `🇩🇪 ${nameGuess}` : `🌍 ${nameGuess}`)
-    .setDescription(roast)
-    .addFields({
-      name: "Link",
-      value: `[Wikipedia](${entry.url})${age ? `\nAlter (aus Text): ${age}` : ""}`,
-    })
+    .setColor(isDeOnly ? 0x3d4f5c : 0x2b3a42)
+    .setTitle(isDeOnly ? `🇩🇪 ${name}` : `🌍 ${name}`)
+    .setDescription(description)
+    .addFields(
+      ...(detailLines.length
+        ? [{ name: "Kurzinfo", value: detailLines.join("\n").slice(0, 1000) }]
+        : []),
+      ...(listNote && listNote !== description
+        ? [{ name: "Wikipedia-Liste", value: listNote.slice(0, 1000) }]
+        : []),
+      {
+        name: "Link",
+        value: `[Wikipedia](${brief.url || entry.url})`,
+      }
+    )
     .setTimestamp(new Date());
 
-  const image = await fetchBestImage(
-    entry.lang === "en" ? entry.url : null,
-    entry.lang === "de" ? entry.url : null,
-    config.userAgent
-  );
+  const image = await resolveDeathImage(brief, entry, config.userAgent);
   if (image) embed.setThumbnail(image);
 
   await channel.send({
