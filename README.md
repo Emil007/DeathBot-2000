@@ -1,84 +1,166 @@
-# DeathBot-2000 — Gregg the Grim Reaper
+# DeathBot-2000
 
-Discord bot for celebrity death-pool games. Scrapes English + German Wikipedia death lists, announces pool hits with points and winner pings, optionally announces every new death in a separate channel, and stores everything in SQLite on a NAS volume.
+A Discord bot for celebrity death-pool games. It watches Wikipedia death lists, keeps score for your group’s picks, and posts updates when someone on the list dies.
 
-No LLM. Sarcasm comes from a built-in German phrase bank (Death’s voice) plus an optional `custom_phrases.txt`.
+## What you need
 
-## Late start (your August case)
+1. A Discord bot application (token) with **Message Content Intent** enabled
+2. A Discord server where the bot can read and send messages
+3. Two channel IDs if you want both features:
+   - **Deathpool channel** — when a picked celebrity dies (pings the winners)
+   - **All-deaths channel** (optional) — every newly listed death on Wikipedia (no pings)
+4. Your Discord user ID as admin
+5. Docker (to run the published image), or Node 20+ to run from source
 
-Pool started 1 Jan, bot joins later:
-
-1. `!new-year confirm 2026-01-01` — setup mode, start date set (ages = as of that day)
-2. `!import @User` for each sheet (Name + Alter; **Punkte column ignored**, score = `100 − age`)
-3. `!check` — silent wiki reconcile: marks already-dead picks, awards points, **DM summary**, no channel spam
-4. `!go` — go live; reseeds all-deaths so only deaths **from now on** are announced
-
-Admin commands work in DMs or any channel the bot can see.
-
-## Quick start (NAS)
-
-1. Create channels (deathpool required; all-deaths optional).
-2. Enable **Message Content Intent**. Invite the bot.
-3. On the NAS:
+Copy `docker-compose.yml`, fill in the environment values (no `.env` file), mount a `./data` folder, then:
 
 ```bash
-mkdir -p deathbot-2000/data/{backups,restore}
-cd deathbot-2000
-# edit docker-compose.yml environment values (no .env file)
 docker compose pull
 docker compose up -d
 ```
 
 Image: `ghcr.io/emil007/deathbot-2000:latest`
 
-## Data mount
+Put durable files in the mounted data folder: database, backups, optional custom phrases, restore packages.
+
+---
+
+## What it does
+
+- Tracks each player’s celebrity list for the current season
+- Scores hits as **100 − age** (age as of the season start date; minimum 1)
+- Announces deathpool hits with a Wikipedia portrait, a dark one-liner, who scored how much, and @mentions for winners
+- Optionally announces every new Wikipedia death (English first, then German-only leftovers)
+- Posts a daily “new since yesterday” summary (configurable hour)
+- Can catch up a season that already started earlier in the year without spamming old announcements
+- Can undo a deathpool hit if the person disappears from Wikipedia death lists within a confirmation window (default 7 days)
+
+---
+
+## Season workflow
+
+### New season (or late join)
+
+1. **Start a season** (setup mode — no public announcements yet):
+
+   ```
+   !new-year confirm
+   !new-year confirm 2026-01-01
+   ```
+
+   The date is the season start. Ages in your lists should be as of that day.
+
+2. **Import each player’s list**
+
+   ```
+   !import @User
+   ```
+
+   Then paste the table from a spreadsheet (tab-separated). Required columns: **Name**, **Alter**.  
+   A points column is ignored (always calculated). Optional: description, death date.
+
+3. **Catch up silently**
+
+   ```
+   !check
+   ```
+
+   Compares the lists to Wikipedia, marks who already died, awards points, and sends you a summary (DM when possible). Nothing is posted to the announcement channels.
+
+4. **Go live**
+
+   ```
+   !go
+   ```
+
+   From this moment the bot announces new deathpool hits and (if configured) new all-deaths. Past Wikipedia entries are not dumped into the all-deaths channel.
+
+### During the year
+
+The bot polls Wikipedia on an interval. You can force a run with `!check`.
+
+At year end:
 
 ```
-./data/
-  deathbot.sqlite
-  custom_phrases.txt
-  backups/
-  restore/
+!new-year confirm [YYYY-MM-DD]
 ```
 
-## Environment
+That writes a backup package under `data/backups/`, then starts a fresh season in setup mode.
 
-| Variable | Required | Meaning |
-|----------|----------|---------|
-| `TOKEN` | yes | Discord bot token |
-| `ADMIN_ID` | yes | Your Discord user id |
-| `CHANNEL_DEATHPOOL` | yes | Pool hits (pings winners) |
-| `CHANNEL_ALL_DEATHS` | no | Every new wiki death (never pings) |
-| `WIKI_POLLER_MINUTES` | no | Default `30` |
-| `DAILY_SUMMARY_HOUR` | no | Default `9` |
-| `DEATH_CONFIRM_DAYS` | no | Default `7` — retract if wiki hit disappears within this window |
-| `CUSTOM_PHRASES` | no | `no` / `mix` / `only` |
-| `TZ` | no | e.g. `Europe/Berlin` |
+---
 
 ## Commands
 
-**Everyone:** `!liste`, `!scores`, `!celeb`, `!help`
+### Everyone
 
-**Admin**
+| Command | What it does |
+|---------|----------------|
+| `!liste` / `!mylist` | Your picks (prefers DM) |
+| `!scores` | Leaderboard |
+| `!celeb Name` | Look up someone on the list |
+| `!help` | Command list |
 
-- `!new-year confirm [YYYY-MM-DD]` — archive + new pool in setup
-- `!season` / `!season YYYY-MM-DD` — status / set start date
-- `!import @User` — paste TSV (Name, Alter required)
-- `!check` — setup: silent reconcile + DM; live: poll now
-- `!go` — start live run
-- `!kill` / `!resurrect`, points, `!players`, `!restore`
+### Admin
 
-## Scoring
+| Command | What it does |
+|---------|----------------|
+| `!import @User` | Load that user’s list (next message = paste) |
+| `!check` | Setup: silent catch-up. Live: poll now |
+| `!go` | Leave setup and start announcing |
+| `!season` | Show season status |
+| `!season YYYY-MM-DD` | Set / change season start date |
+| `!new-year confirm [date]` | Backup + new season (setup) |
+| `!kill Name` | Mark dead manually |
+| `!resurrect Name` | Undo a death and reverse points |
+| `!add-points @User N` / `!set-points @User N` | Adjust score |
+| `!players` | List players |
+| `!restore` / `!restore confirm file.zip` | Restore a backup package |
 
-Always `max(1, 100 − age_at_pick)`. Age is the age **at season start**, not the wiki death age (wiki age is only shown for comparison).
+Admin commands work in a server channel or in a DM with the bot.
 
-## False positives
+---
 
-Live wiki kills stay **unconfirmed** for `DEATH_CONFIRM_DAYS`. If the person drops off the Wikipedia death lists within that window, Gregg **retracts** (marks alive again, reverses points, announces). After the window, the death is locked.
+## Backups and restore
 
-Reconcile / sheet / setup kills are confirmed immediately (historical catch-up).
+- Automatic backups go to `data/backups/`
+- `!new-year` also writes a full season package there
+- To restore: put a `.zip` in `data/restore/` (or use a name from `backups/`), then `!restore confirm filename.zip`  
+  A safety backup of the current database is created first.
 
-## Notes
+---
 
-- While not live, the interval poll only seeds the wiki cache (no announcements).
-- `!go` reseeds all-deaths so history is not dumped into the channel.
+## Custom phrases
+
+Optional file: `data/custom_phrases.txt` (one line per phrase).  
+Placeholders: `{name}` `{age}` `{score}` `{winners}` `{losers}`
+
+In compose, set `CUSTOM_PHRASES` to:
+
+- `no` — built-in phrases only (default)
+- `mix` — built-in + your file
+- `only` — your file only
+
+---
+
+## Settings (compose `environment`)
+
+| Setting | Purpose |
+|---------|---------|
+| `TOKEN` | Bot token |
+| `ADMIN_ID` | Admin Discord user id |
+| `CHANNEL_DEATHPOOL` | Deathpool announcements |
+| `CHANNEL_ALL_DEATHS` | Optional all-deaths channel (empty = off) |
+| `PREFIX` | Command prefix (default `!`) |
+| `WIKI_POLLER_MINUTES` | How often to poll (default `30`) |
+| `DAILY_SUMMARY_HOUR` | Hour for the daily digest (default `9`) |
+| `DEATH_CONFIRM_DAYS` | Days before a live hit is locked in (default `7`) |
+| `CUSTOM_PHRASES` | `no` / `mix` / `only` |
+| `TZ` | Timezone for cron (e.g. `Europe/Berlin`) |
+| `DATA_DIR` | Data path inside the container (default `/app/data`) |
+
+---
+
+## Scoring note
+
+Points always use **age at season start**: `max(1, 100 − age)`.  
+Wikipedia’s listed age at death is only used for matching / comparison in messages, not for the score.
