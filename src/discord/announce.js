@@ -284,7 +284,7 @@ async function announceSimulatedDeath(
   if (image) embed.setImage(image);
 
   await channel.send({
-    content: `${emojiBanner(config)} **${inPool ? "Deathpool" : "Simulation"}**`,
+    content: `${emojiBanner(config)} **Simulation** (kein DB-Write)`,
     embeds: [embed],
     allowedMentions: { parse: [] },
   });

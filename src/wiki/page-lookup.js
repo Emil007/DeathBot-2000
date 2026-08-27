@@ -56,7 +56,7 @@ async function searchWikipedia(client, lang, query) {
       action: "query",
       list: "search",
       srsearch: query,
-      srlimit: 5,
+      srlimit: 8,
       format: "json",
       origin: "*",
     },
@@ -68,6 +68,106 @@ async function searchWikipedia(client, lang, query) {
     url: `https://${lang}.wikipedia.org/wiki/${encodeURIComponent(h.title.replace(/ /g, "_"))}`,
     lang,
   }));
+}
+
+/** Titles that are almost never a biography page */
+const NON_PERSON_TITLE =
+  /\b(discography|filmography|bibliography|videography|soundtrack|album|ep\)|singles|songs|film\)|tv series|list of|tournament|election|disambiguation)\b/i;
+
+function titleLooksNonPerson(title) {
+  return NON_PERSON_TITLE.test(String(title || ""));
+}
+
+function instanceOfIds(entity) {
+  const claims = entity?.claims?.P31 || [];
+  return claims
+    .map((c) => c?.mainsnak?.datavalue?.value?.id)
+    .filter(Boolean);
+}
+
+/** Wikidata: human = Q5 */
+function entityIsHuman(entity) {
+  if (!entity) return null;
+  const ids = instanceOfIds(entity);
+  if (!ids.length) return null;
+  if (ids.includes("Q5")) return true;
+  // Common non-person types that sneak into search
+  const reject = new Set([
+    "Q11424", // film
+    "Q5398426", // TV series
+    "Q482994", // album
+    "Q7366", // song
+    "Q134556", // single
+    "Q7889", // video game
+    "Q4167410", // disambiguation
+    "Q13406463", // Wikimedia list article
+    "Q5", // (human — already handled)
+    "Q43229", // organization
+    "Q7278", // political party
+    "Q215380", // band — bands sometimes wanted but death-pool is people; skip
+  ]);
+  if (ids.some((id) => reject.has(id))) return false;
+  // Has birth date → almost certainly a person even if P31 odd
+  if (entity.claims?.P569?.[0]) return true;
+  return false;
+}
+
+async function getPageCategories(client, lang, title) {
+  try {
+    const api = `https://${lang}.wikipedia.org/w/api.php`;
+    const { data } = await client.get(api, {
+      params: {
+        action: "query",
+        titles: title,
+        prop: "categories",
+        cllimit: 50,
+        clshow: "!hidden",
+        format: "json",
+        origin: "*",
+        redirects: 1,
+      },
+    });
+    const page = Object.values(data?.query?.pages || {})[0];
+    return (page?.categories || []).map((c) => c.title || "");
+  } catch {
+    return [];
+  }
+}
+
+function categoriesSuggestPerson(cats) {
+  return cats.some((c) =>
+    /\d{4} births|\d{4} deaths|living people|people from|geborene|gestorben|\d{4} gestorben|männlich|weiblich|biograph/i.test(
+      c
+    )
+  );
+}
+
+function categoriesSuggestNonPerson(cats) {
+  return cats.some((c) =>
+    /discograph|filmograph|bibliograph|albums|film stubs|songs |lists of|soundtracks|video games/i.test(
+      c
+    )
+  );
+}
+
+/**
+ * Decide if a page is a person biography.
+ * @returns {Promise<boolean>}
+ */
+async function isPersonPage(client, lang, title, entity) {
+  if (titleLooksNonPerson(title)) return false;
+
+  const human = entityIsHuman(entity);
+  if (human === true) return true;
+  if (human === false) return false;
+
+  // No clear P31 — use categories + birth claim
+  if (entity?.claims?.P569?.[0]) return true;
+  const cats = await getPageCategories(client, lang, title);
+  if (categoriesSuggestNonPerson(cats)) return false;
+  if (categoriesSuggestPerson(cats)) return true;
+  // Unknown: reject to avoid filmography/list false positives
+  return false;
 }
 
 async function getWikidataEntity(client, qid) {
@@ -82,12 +182,6 @@ async function getWikidataEntity(client, qid) {
     },
   });
   return data?.entities?.[qid] || null;
-}
-
-async function getWikidataBirth(client, qid) {
-  const entity = await getWikidataEntity(client, qid);
-  const claim = entity?.claims?.P569?.[0]?.mainsnak?.datavalue?.value;
-  return parseWikidataTime(claim?.time);
 }
 
 function sitelinksFromEntity(entity) {
@@ -119,6 +213,8 @@ async function getPageMeta(client, lang, titleOrUrl) {
     title = norm.title;
     lang = norm.lang;
   }
+  if (titleLooksNonPerson(title)) return null;
+
   const api = `https://${lang}.wikipedia.org/w/api.php`;
   const { data } = await client.get(api, {
     params: {
@@ -134,8 +230,13 @@ async function getPageMeta(client, lang, titleOrUrl) {
   });
   const page = Object.values(data?.query?.pages || {})[0];
   if (!page || page.missing != null) return null;
+  if (titleLooksNonPerson(page.title)) return null;
+
   const qid = page.pageprops?.wikibase_item || null;
   const entity = qid ? await getWikidataEntity(client, qid) : null;
+  const person = await isPersonPage(client, lang, page.title, entity);
+  if (!person) return null;
+
   const birth = parseWikidataTime(
     entity?.claims?.P569?.[0]?.mainsnak?.datavalue?.value?.time
   );
@@ -154,6 +255,7 @@ async function getPageMeta(client, lang, titleOrUrl) {
     thumb: page.thumbnail?.source || null,
     enLink: links.en,
     deLink: links.de,
+    isPerson: true,
   };
 }
 
@@ -203,26 +305,27 @@ function proposalFromMeta(meta, seasonStartDate, sheetAge, candidates = []) {
 }
 
 /**
- * Propose EN (preferred) or DE wiki + age; include top search candidates.
+ * Propose EN (preferred) or DE wiki + age; include top **person** candidates only.
  */
 async function proposeWikiForName(userAgent, name, seasonStartDate, sheetAge) {
   const client = createClient(userAgent);
   const candidates = [];
   let primaryMeta = null;
 
-  try {
-    const enHits = await searchWikipedia(client, "en", name);
-    for (const hit of enHits.slice(0, 3)) {
+  async function collect(lang, hits) {
+    for (const hit of hits) {
+      if (candidates.length >= 3) break;
+      if (titleLooksNonPerson(hit.title)) continue;
       try {
-        await new Promise((r) => setTimeout(r, 400));
-        const meta = await getPageMeta(client, "en", hit.title);
+        await new Promise((r) => setTimeout(r, 350));
+        const meta = await getPageMeta(client, lang, hit.title);
         if (!meta) continue;
         const wikiAge = meta.birthDate ? ageAtDate(meta.birthDate, seasonStartDate) : null;
         candidates.push({
           title: meta.title,
-          url: meta.url,
-          norm: meta.norm,
-          lang: "en",
+          url: meta.enLink?.url || meta.url,
+          norm: meta.enLink?.norm || meta.norm,
+          lang: meta.enLink ? "en" : meta.lang,
           qid: meta.qid,
           proposedAge: wikiAge ?? sheetAge ?? null,
           thumb: meta.thumb,
@@ -230,38 +333,23 @@ async function proposeWikiForName(userAgent, name, seasonStartDate, sheetAge) {
         });
         if (!primaryMeta) primaryMeta = meta;
       } catch (e) {
-        console.warn("[page-lookup] EN candidate", e.message);
+        console.warn(`[page-lookup] ${lang} candidate`, e.message);
       }
     }
+  }
+
+  try {
+    const enHits = await searchWikipedia(client, "en", name);
+    await collect("en", enHits);
   } catch (e) {
     console.warn("[page-lookup] EN search", e.message);
   }
 
-  if (!primaryMeta) {
+  if (candidates.length < 3) {
     try {
-      await new Promise((r) => setTimeout(r, 400));
+      await new Promise((r) => setTimeout(r, 350));
       const deHits = await searchWikipedia(client, "de", name);
-      for (const hit of deHits.slice(0, 3)) {
-        try {
-          await new Promise((r) => setTimeout(r, 400));
-          const meta = await getPageMeta(client, "de", hit.title);
-          if (!meta) continue;
-          const wikiAge = meta.birthDate ? ageAtDate(meta.birthDate, seasonStartDate) : null;
-          candidates.push({
-            title: meta.title,
-            url: meta.enLink?.url || meta.url,
-            norm: meta.enLink?.norm || meta.norm,
-            lang: meta.enLink ? "en" : "de",
-            qid: meta.qid,
-            proposedAge: wikiAge ?? sheetAge ?? null,
-            thumb: meta.thumb,
-            snippet: hit.snippet || "",
-          });
-          if (!primaryMeta) primaryMeta = meta;
-        } catch (e) {
-          console.warn("[page-lookup] DE candidate", e.message);
-        }
-      }
+      await collect("de", deHits);
     } catch (e) {
       console.warn("[page-lookup] DE search", e.message);
     }
@@ -275,7 +363,11 @@ async function lookupUrl(userAgent, url, seasonStartDate, sheetAge) {
   const norm = normalizeWikiUrl(url);
   if (!norm) throw new Error("Need an en.wikipedia.org or de.wikipedia.org /wiki/ URL");
   const meta = await getPageMeta(client, norm.lang, norm.url);
-  if (!meta) throw new Error("Wikipedia page not found");
+  if (!meta) {
+    throw new Error(
+      "Wikipedia page not found or not a person page (filtered discography/filmography/lists/…)"
+    );
+  }
   return proposalFromMeta(meta, seasonStartDate, sheetAge, [
     {
       title: meta.title,
@@ -297,4 +389,6 @@ module.exports = {
   lookupUrl,
   searchWikipedia,
   getPageMeta,
+  titleLooksNonPerson,
+  isPersonPage,
 };

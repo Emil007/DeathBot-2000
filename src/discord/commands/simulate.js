@@ -1,6 +1,6 @@
 const db = require("../../db");
 const { lookupUrl, normalizeWikiUrl } = require("../../wiki/page-lookup");
-const { processDeathpoolHit, announceSimulatedDeath } = require("../announce");
+const { announceSimulatedDeath } = require("../announce");
 const { usageReply } = require("../usage");
 
 const cmd = {
@@ -8,14 +8,14 @@ const cmd = {
   aliases: ["simkill", "fake-kill"],
   admin: true,
   group: "match",
-  description: "Wiki-Link: Person als tot ankündigen (Test / manueller Hit)",
+  description: "Test: Wiki-Link nur ankündigen (kein DB-Schreibzugriff)",
   usage: "/simulate url:<Wikipedia-URL>\n{prefix}simulate <url>",
   examples: [
     "/simulate url:https://en.wikipedia.org/wiki/Ozzy_Osbourne",
     "{prefix}simulate https://de.wikipedia.org/wiki/…",
   ],
   details:
-    "Wenn die Person im Pool ist → Punkte + Deathpool-Ankündigung. Sonst nur Ankündigung ohne Punkte (Simulation).",
+    "Nur Channel-Ankündigung zum Testen von Scraping/Phrases/Embed. Schreibt nichts in die DB und vergibt keine Punkte.",
   options: [
     {
       name: "url",
@@ -44,59 +44,23 @@ const cmd = {
       return;
     }
 
-    let celeb =
+    // Optional hint if this URL matches a pool celeb — still no DB write
+    const inPool = Boolean(
       (meta.qid && db.findCelebByWikidataId(meta.qid)) ||
-      (meta.wikiNorm && db.findCelebByWikiNorm(meta.wikiNorm)) ||
-      null;
-
-    // Also try DE/EN alternate norms from URL itself
-    if (!celeb) {
-      const n = normalizeWikiUrl(urlArg);
-      if (n) celeb = db.findCelebByWikiNorm(n.norm);
-    }
-
-    const entry = {
-      id: `sim:${meta.wikiNorm || urlArg}`,
-      text: `${meta.title || "Unknown"}, ${meta.proposedAge ?? "?"}`,
-      url: meta.wikiUrl || urlArg,
-      wikiPath: meta.wikiNorm ? `/wiki/${meta.wikiNorm.split(":")[1]}` : null,
-      lang: meta.lang || "en",
-    };
-
-    if (celeb) {
-      if (!celeb.is_alive) {
-        await msg.reply(`**${celeb.name}** ist schon tot. Sende trotzdem Ankündigung…`);
-        await announceSimulatedDeath(ctx.client, ctx.config, {
-          name: celeb.name,
-          age: celeb.age_at_pick,
-          url: entry.url,
-          inPool: true,
-          alreadyDead: true,
-        });
-        return;
-      }
-      const live = db.isLive();
-      await processDeathpoolHit(
-        ctx.client,
-        ctx.config,
-        { celeb, entry, wikiAge: meta.proposedAge },
-        { announce: true, confirmed: true, source: "simulate" }
-      );
-      await msg.reply(
-        `Simulate → Pool-Hit **${celeb.name}**` +
-          (live ? " (angekündigt + Punkte)." : " (angekündigt; Saison noch nicht live).")
-      );
-      return;
-    }
+        (meta.wikiNorm && db.findCelebByWikiNorm(meta.wikiNorm))
+    );
 
     await announceSimulatedDeath(ctx.client, ctx.config, {
       name: meta.title || "Unbekannt",
       age: meta.proposedAge,
-      url: entry.url,
-      inPool: false,
+      url: meta.wikiUrl || urlArg,
+      inPool,
+      alreadyDead: false,
     });
     await msg.reply(
-      `Simulate → **${meta.title}** ist **nicht** im Pool. Nur Channel-Ankündigung, keine Punkte.`
+      `Simulation gesendet: **${meta.title}**` +
+        (inPool ? " _(wäre im Pool — DB unverändert)_" : " _(nicht im Pool)_") +
+        " · keine Punkte, kein DB-Write."
     );
   },
 };
