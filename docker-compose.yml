@@ -19,6 +19,8 @@ services:
       TZ: "Europe/Berlin"
       ALERT_EMOJI: "⚰️"
       ALERT_EMOJI_REPEAT: "3"
+      # Days a live wiki-hit must stay on death lists before it is locked (else retract)
+      DEATH_CONFIRM_DAYS: "7"
       # Custom phrases file: /app/data/custom_phrases.txt (one phrase per line)
       # Placeholders: {name} {age} {score} {winners} {losers}
       CUSTOM_PHRASES: "no"

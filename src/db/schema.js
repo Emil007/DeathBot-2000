@@ -6,6 +6,8 @@ CREATE TABLE IF NOT EXISTS seasons (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   year INTEGER NOT NULL,
   active INTEGER NOT NULL DEFAULT 0,
+  start_date TEXT,
+  live INTEGER NOT NULL DEFAULT 0,
   created_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
@@ -25,7 +27,10 @@ CREATE TABLE IF NOT EXISTS celebs (
   is_alive INTEGER NOT NULL DEFAULT 1,
   died_at TEXT,
   wiki_url TEXT,
-  exclude_from_auto INTEGER NOT NULL DEFAULT 0
+  exclude_from_auto INTEGER NOT NULL DEFAULT 0,
+  death_confirmed INTEGER NOT NULL DEFAULT 0,
+  death_detected_at TEXT,
+  death_source TEXT
 );
 
 CREATE TABLE IF NOT EXISTS picks (
@@ -68,6 +73,16 @@ CREATE TABLE IF NOT EXISTS player_bonuses (
   FOREIGN KEY (bonus_id) REFERENCES bonuses(id) ON DELETE CASCADE
 );
 
+CREATE TABLE IF NOT EXISTS death_awards (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  celeb_id INTEGER NOT NULL,
+  player_id INTEGER NOT NULL,
+  points INTEGER NOT NULL,
+  awarded_at TEXT NOT NULL DEFAULT (datetime('now')),
+  FOREIGN KEY (celeb_id) REFERENCES celebs(id) ON DELETE CASCADE,
+  FOREIGN KEY (player_id) REFERENCES players(id) ON DELETE CASCADE
+);
+
 CREATE TABLE IF NOT EXISTS wiki_seen (
   entry_id TEXT PRIMARY KEY,
   lang TEXT,
@@ -96,4 +111,40 @@ CREATE TABLE IF NOT EXISTS meta (
 );
 `;
 
-module.exports = { SCHEMA };
+function migrate(db) {
+  const cols = (table) =>
+    new Set(db.prepare(`PRAGMA table_info(${table})`).all().map((c) => c.name));
+
+  const seasonCols = cols("seasons");
+  if (!seasonCols.has("start_date")) {
+    db.exec(`ALTER TABLE seasons ADD COLUMN start_date TEXT`);
+  }
+  if (!seasonCols.has("live")) {
+    db.exec(`ALTER TABLE seasons ADD COLUMN live INTEGER NOT NULL DEFAULT 0`);
+  }
+
+  const celebCols = cols("celebs");
+  if (!celebCols.has("death_confirmed")) {
+    db.exec(`ALTER TABLE celebs ADD COLUMN death_confirmed INTEGER NOT NULL DEFAULT 0`);
+  }
+  if (!celebCols.has("death_detected_at")) {
+    db.exec(`ALTER TABLE celebs ADD COLUMN death_detected_at TEXT`);
+  }
+  if (!celebCols.has("death_source")) {
+    db.exec(`ALTER TABLE celebs ADD COLUMN death_source TEXT`);
+  }
+
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS death_awards (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      celeb_id INTEGER NOT NULL,
+      player_id INTEGER NOT NULL,
+      points INTEGER NOT NULL,
+      awarded_at TEXT NOT NULL DEFAULT (datetime('now')),
+      FOREIGN KEY (celeb_id) REFERENCES celebs(id) ON DELETE CASCADE,
+      FOREIGN KEY (player_id) REFERENCES players(id) ON DELETE CASCADE
+    );
+  `);
+}
+
+module.exports = { SCHEMA, migrate };

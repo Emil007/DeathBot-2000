@@ -1,19 +1,63 @@
 const { scrapeEn } = require("../wiki/scraper-en");
 const { scrapeDe } = require("../wiki/scraper-de");
-const { findPoolMatches } = require("../wiki/match");
+const { findPoolMatches, entryMatchesCeleb } = require("../wiki/match");
 const db = require("../db");
-const { announceDeathpool, announceAllDeath } = require("../discord/announce");
+const {
+  processDeathpoolHit,
+  announceAllDeath,
+  announceRetraction,
+} = require("../discord/announce");
 
-async function runWikiPoll(client, config, { seedOnly = false } = {}) {
-  console.log(new Date().toISOString(), "[poll] starting wiki scrape…");
+async function scrapeAll(config) {
   const [enEntries, deData] = await Promise.all([
     scrapeEn(config.userAgent),
     scrapeDe(config.userAgent),
   ]);
+  return { enEntries, deData, poolEntries: [...enEntries, ...deData.entries] };
+}
+
+async function processRetractions(client, config, poolEntries) {
+  const pending = db.getUnconfirmedDeaths();
+  if (!pending.length) return;
+
+  const confirmMs = config.deathConfirmDays * 24 * 60 * 60 * 1000;
+  const now = Date.now();
+
+  for (const celeb of pending) {
+    const detected = celeb.death_detected_at ? Date.parse(celeb.death_detected_at) : now;
+    const stillOnList = poolEntries.some((entry) => {
+      const akas = db.getAkas(celeb.id);
+      const blacklist = db.getBlacklist(celeb.id);
+      return entryMatchesCeleb(entry, celeb, akas, blacklist);
+    });
+
+    if (!stillOnList) {
+      console.log(new Date().toISOString(), "[retract]", celeb.name);
+      const result = db.retractDeath(celeb.id);
+      if (result && db.isLive()) {
+        await announceRetraction(client, config, result).catch((e) =>
+          console.error("[retract] announce", e.message)
+        );
+      }
+      continue;
+    }
+
+    if (now - detected >= confirmMs) {
+      console.log(new Date().toISOString(), "[confirm]", celeb.name);
+      db.confirmDeath(celeb.id);
+    }
+  }
+}
+
+/**
+ * @param {'seed'|'reconcile'|'live'} mode
+ */
+async function runWikiPoll(client, config, { mode = "live" } = {}) {
+  console.log(new Date().toISOString(), `[poll] mode=${mode}`);
+  const { enEntries, deData, poolEntries } = await scrapeAll(config);
 
   const enIds = new Set(enEntries.map((e) => e.wikiPath));
   const newEn = [];
-  const newDeOnly = [];
 
   for (const e of enEntries) {
     if (db.isWikiSeen(e.id)) continue;
@@ -22,54 +66,71 @@ async function runWikiPoll(client, config, { seedOnly = false } = {}) {
   }
 
   for (const d of deData.entries) {
-    if (db.isWikiSeen(d.id)) continue;
-    db.markWikiSeen(d);
+    if (!db.isWikiSeen(d.id)) db.markWikiSeen(d);
+  }
 
-    let enUrl = null;
-    try {
-      enUrl = await deData.resolveEnglish(d.url);
-    } catch {
-      /* ignore */
-    }
+  const newDeOnly = [];
+  if (mode !== "seed") {
+    for (const d of deData.entries) {
+      const row = db
+        .getDb()
+        .prepare("SELECT announced_at FROM wiki_seen WHERE entry_id = ?")
+        .get(d.id);
+      if (row?.announced_at) continue;
 
-    if (enUrl) {
-      const path = enUrl.includes("wikipedia.org")
-        ? "/" + enUrl.split("wikipedia.org")[1].replace(/^\/+/, "")
-        : null;
-      const wikiPath = path?.startsWith("/wiki/") ? path : null;
-      if (wikiPath && enIds.has(wikiPath)) {
-        continue;
+      let enUrl = null;
+      try {
+        enUrl = await deData.resolveEnglish(d.url);
+      } catch {
+        /* ignore */
       }
-      if (wikiPath) {
-        const bridged = {
-          id: `en:${wikiPath}`,
-          wikiPath,
-          text: d.text + " 🌍",
-          url: enUrl.startsWith("http") ? enUrl : `https:${enUrl}`,
-          lang: "en",
-          fromDe: true,
-        };
-        if (!db.isWikiSeen(bridged.id)) {
-          db.markWikiSeen(bridged);
-          newEn.push(bridged);
+      if (enUrl) {
+        const pathPart = enUrl.includes("wikipedia.org")
+          ? "/" + enUrl.split("wikipedia.org")[1].replace(/^\/+/, "")
+          : null;
+        const wikiPath = pathPart?.startsWith("/wiki/") ? pathPart : null;
+        if (wikiPath && enIds.has(wikiPath)) {
+          db.markWikiAnnounced(d.id);
+          continue;
         }
-        continue;
+        if (wikiPath) {
+          const bridged = {
+            id: `en:${wikiPath}`,
+            wikiPath,
+            text: d.text + " 🌍",
+            url: enUrl.startsWith("http") ? enUrl : `https:${enUrl}`,
+            lang: "en",
+            fromDe: true,
+          };
+          const bridgedRow = db
+            .getDb()
+            .prepare("SELECT announced_at FROM wiki_seen WHERE entry_id = ?")
+            .get(bridged.id);
+          if (!db.isWikiSeen(bridged.id)) {
+            db.markWikiSeen(bridged);
+            newEn.push(bridged);
+          } else if (!bridgedRow?.announced_at) {
+            newEn.push(bridged);
+          }
+          db.markWikiAnnounced(d.id);
+          continue;
+        }
       }
+      newDeOnly.push(d);
     }
-    newDeOnly.push(d);
   }
 
   console.log(
     new Date().toISOString(),
-    `[poll] new EN=${newEn.length} DE-only=${newDeOnly.length} (seedOnly=${seedOnly})`
+    `[poll] new EN=${newEn.length} DE-only=${newDeOnly.length}`
   );
 
-  if (seedOnly) {
-    // First run: mark everything seen so all-deaths doesn't spam history
-    for (const e of [...newEn, ...newDeOnly]) {
-      db.markWikiAnnounced(e.id);
-    }
-  } else if (config.channelAllDeaths) {
+  if (mode === "seed") {
+    db.seedAllWikiSeen([...enEntries, ...deData.entries, ...newEn]);
+    return { hits: [], seeded: true };
+  }
+
+  if (mode === "live" && config.channelAllDeaths) {
     for (const e of newEn) {
       try {
         await announceAllDeath(client, config, e, { isDeOnly: false });
@@ -90,34 +151,60 @@ async function runWikiPoll(client, config, { seedOnly = false } = {}) {
     for (const e of [...newEn, ...newDeOnly]) db.markWikiAnnounced(e.id);
   }
 
-  // Deathpool matching always runs (including first boot after imports)
-  const poolEntries = [...enEntries, ...deData.entries];
   const matches = findPoolMatches(poolEntries);
+  const hits = [];
+  const announce = mode === "live";
+  const confirmed = mode === "reconcile";
+
   for (const m of matches) {
     try {
-      console.log(new Date().toISOString(), "[poll] DEATHPOOL HIT", m.celeb.name);
-      await announceDeathpool(client, config, m);
+      console.log(new Date().toISOString(), `[poll] DEATHPOOL HIT (${mode})`, m.celeb.name);
+      const result = await processDeathpoolHit(
+        client,
+        config,
+        { celeb: m.celeb, entry: m.entry, wikiAge: m.age },
+        { announce, confirmed, source: mode === "reconcile" ? "reconcile" : "wiki" }
+      );
+      hits.push({ celeb: m.celeb, entry: m.entry, wikiAge: m.age, result });
     } catch (err) {
-      console.error("[poll] deathpool announce", err.message);
+      console.error("[poll] deathpool", err.message);
     }
   }
+
+  if (mode === "live") {
+    await processRetractions(client, config, poolEntries);
+  }
+
+  return { hits, seeded: false };
 }
 
 function startWikiPoller(client, config) {
-  let seeding = true;
-  runWikiPoll(client, config, { seedOnly: true })
-    .catch((e) => console.error("[poll] seed failed", e))
-    .finally(() => {
-      seeding = false;
-    });
+  let busy = false;
 
-  const ms = config.wikiPollerMinutes * 60 * 1000;
-  setInterval(() => {
-    if (seeding) return;
-    runWikiPoll(client, config, { seedOnly: false }).catch((e) =>
-      console.error("[poll] failed", e)
-    );
-  }, ms);
+  const tick = async (forcedMode) => {
+    if (busy) return;
+    busy = true;
+    try {
+      if (forcedMode) {
+        await runWikiPoll(client, config, { mode: forcedMode });
+        return;
+      }
+      if (!db.isLive()) {
+        await runWikiPoll(client, config, { mode: "seed" });
+        return;
+      }
+      await runWikiPoll(client, config, { mode: "live" });
+    } catch (e) {
+      console.error("[poll] failed", e);
+    } finally {
+      busy = false;
+    }
+  };
+
+  tick("seed").finally(() => {
+    const ms = config.wikiPollerMinutes * 60 * 1000;
+    setInterval(() => tick(), ms);
+  });
 }
 
-module.exports = { runWikiPoll, startWikiPoller };
+module.exports = { runWikiPoll, startWikiPoller, scrapeAll };

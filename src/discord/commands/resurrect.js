@@ -3,7 +3,7 @@ const db = require("../../db");
 module.exports = {
   name: "resurrect",
   admin: true,
-  description: "Belebt einen Celeb wieder",
+  description: "Belebt einen Celeb wieder (Punkte-Rückbuchung wie Retract)",
   async run(ctx, args, msg) {
     const q = args.join(" ").trim();
     if (!q) {
@@ -15,9 +15,14 @@ module.exports = {
       await msg.reply(found.length ? "Mehrdeutig — genauer bitte." : "Nicht gefunden.");
       return;
     }
-    db.getDb()
-      .prepare("UPDATE celebs SET is_alive = 1, died_at = NULL WHERE id = ?")
-      .run(found[0].id);
-    await msg.reply(`${found[0].name} lebt wieder (zumindest in meiner DB).`);
+    const celeb = found[0];
+    if (celeb.is_alive) {
+      await msg.reply("Lebt bereits.");
+      return;
+    }
+    const result = db.retractDeath(celeb.id);
+    await msg.reply(
+      `${result.celeb.name} lebt wieder. ${result.awards.length} Punkte-Buchungen rückgängig.`
+    );
   },
 };

@@ -7,26 +7,37 @@ function emojiBanner(config) {
   return Array(config.alertEmojiRepeat).fill(config.alertEmoji).join(" ");
 }
 
-async function announceDeathpool(client, config, { celeb, entry, age }) {
+/**
+ * Apply death + optional public announce.
+ * Uses age_at_pick for scoring (100 - age), not wiki age.
+ */
+async function processDeathpoolHit(
+  client,
+  config,
+  { celeb, entry, wikiAge },
+  { announce = true, confirmed = false, source = "wiki" } = {}
+) {
+  const result = db.applyDeath(celeb.id, {
+    confirmed,
+    source,
+    diedAt: new Date().toISOString().slice(0, 10),
+    wikiUrl: entry?.url || null,
+  });
+
+  if (!announce) return result;
+
   const channel = await client.channels.fetch(config.channelDeathpool).catch(() => null);
   if (!channel?.isTextBased()) {
     console.error("[announce] deathpool channel missing");
-    return;
+    return result;
   }
 
-  const season = db.getActiveSeason();
-  const winners = db.getWinnersForCeleb(celeb.id, season.id);
-  const score = db.scoreForAge(age);
-  const winnerNames = winners.map((w) => w.display_name);
-
-  db.markCelebDead(celeb.id, new Date().toISOString().slice(0, 10), entry.url);
-
-  const scoreLines = [];
-  for (const w of winners) {
-    if (score > 0) db.addPoints(w.id, score);
-    const total = db.playerTotal(w.id);
-    scoreLines.push(`<@${w.discord_user_id}> **+${score}** (Gesamt **${total}**)`);
-  }
+  const { awards, score, age } = result;
+  const winnerNames = awards.map((a) => a.player.display_name);
+  const scoreLines = awards.map(
+    (a) =>
+      `<@${a.player.discord_user_id}> **+${a.points}** (Gesamt **${a.total}**)`
+  );
 
   const roast = pickPhrase(config, db, {
     name: celeb.name,
@@ -36,8 +47,18 @@ async function announceDeathpool(client, config, { celeb, entry, age }) {
   });
 
   const image =
-    (await fetchBestImage(entry.lang === "en" ? entry.url : null, entry.url, config.userAgent)) ||
-    null;
+    (await fetchBestImage(
+      entry?.lang === "en" ? entry.url : null,
+      entry?.url || null,
+      config.userAgent
+    )) || null;
+
+  const ageLine =
+    age != null
+      ? `Alter (Pool-Start): **${age}** → Punkte **${score}** (=100−Alter)`
+      : "Alter unbekannt → 0 Punkte";
+  const wikiAgeLine =
+    wikiAge != null && wikiAge !== age ? `Alter (Wiki-Text): ${wikiAge}` : null;
 
   const embed = new EmbedBuilder()
     .setColor(0x1a1a1a)
@@ -46,11 +67,7 @@ async function announceDeathpool(client, config, { celeb, entry, age }) {
     .addFields(
       {
         name: "Details",
-        value: [
-          age != null ? `Alter: **${age}**` : "Alter: unbekannt",
-          entry.url ? `[Wikipedia](${entry.url})` : null,
-          `Punkte pro Treffer: **${score}**`,
-        ]
+        value: [ageLine, wikiAgeLine, entry?.url ? `[Wikipedia](${entry.url})` : null]
           .filter(Boolean)
           .join("\n"),
       },
@@ -58,20 +75,48 @@ async function announceDeathpool(client, config, { celeb, entry, age }) {
         name: "Deathpool",
         value: scoreLines.length
           ? scoreLines.join("\n")
-          : "_Niemand hatte diesen Pick. Pech für euch, Freude für mich._",
+          : "_Niemand hatte diesen Pick._",
       }
     )
     .setTimestamp(new Date());
 
   if (image) embed.setImage(image);
 
-  const banner = `${emojiBanner(config)} **Deathpool-Treffer**`;
   await channel.send({
-    content: banner,
+    content: `${emojiBanner(config)} **Deathpool-Treffer**`,
     embeds: [embed],
     allowedMentions: {
       parse: [],
-      users: winners.map((w) => w.discord_user_id),
+      users: awards.map((a) => a.player.discord_user_id),
+    },
+  });
+
+  return result;
+}
+
+async function announceRetraction(client, config, { celeb, awards }) {
+  const channel = await client.channels.fetch(config.channelDeathpool).catch(() => null);
+  if (!channel?.isTextBased()) return;
+
+  const lines = awards.map((a) => {
+    const player = db.getDb().prepare("SELECT * FROM players WHERE id = ?").get(a.player_id);
+    const total = player ? db.playerTotal(player.id) : "?";
+    return player
+      ? `<@${player.discord_user_id}> **−${a.points}** (Gesamt **${total}**)`
+      : `player ${a.player_id} −${a.points}`;
+  });
+
+  await channel.send({
+    content: [
+      `↩️ **Rücknahme** — ${celeb.name} steht nicht mehr (zuverlässig) auf den Wiki-Todeslisten.`,
+      `Innerhalb von ${config.deathConfirmDays} Tagen widerrufen. Punkte zurückgebucht:`,
+      lines.length ? lines.join("\n") : "_keine Punkte_",
+    ].join("\n"),
+    allowedMentions: {
+      parse: [],
+      users: awards
+        .map((a) => db.getDb().prepare("SELECT discord_user_id FROM players WHERE id = ?").get(a.player_id)?.discord_user_id)
+        .filter(Boolean),
     },
   });
 }
@@ -116,6 +161,8 @@ async function announceAllDeath(client, config, entry, { isDeOnly = false } = {}
 }
 
 async function announceDailySummary(client, config) {
+  if (!db.isLive()) return;
+
   const targetId = config.channelAllDeaths || config.channelDeathpool;
   const channel = await client.channels.fetch(targetId).catch(() => null);
   if (!channel?.isTextBased()) return;
@@ -154,8 +201,35 @@ async function announceDailySummary(client, config) {
   });
 }
 
+function formatReconcileSummary(hits, season) {
+  const lines = [
+    `📋 **Reconcile** (Setup, keine Channel-Ankündigungen)`,
+    `Saison-Start: **${season.start_date || "?"}** | Live: **nein**`,
+    `Neu als tot erkannt: **${hits.length}**`,
+    "",
+  ];
+  for (const h of hits.slice(0, 40)) {
+    const awardStr = h.result.awards
+      .map((a) => `${a.player.display_name} +${a.points}`)
+      .join(", ");
+    lines.push(
+      `💀 **${h.celeb.name}** — Pool-Alter ${h.result.age ?? "?"} → ${h.result.score} Pkt` +
+        (h.wikiAge != null ? ` (Wiki-Alter ${h.wikiAge})` : "") +
+        (awardStr ? ` | ${awardStr}` : " | niemand")
+    );
+  }
+  if (hits.length > 40) lines.push(`… +${hits.length - 40}`);
+  lines.push("", `Danach \`!scores\` prüfen, dann \`!go\` für Live-Betrieb.`);
+  return lines.join("\n").slice(0, 1900);
+}
+
 module.exports = {
-  announceDeathpool,
+  processDeathpoolHit,
+  announceRetraction,
   announceAllDeath,
   announceDailySummary,
+  formatReconcileSummary,
+  // back-compat alias
+  announceDeathpool: (client, config, m) =>
+    processDeathpoolHit(client, config, { ...m, wikiAge: m.age }, { announce: true, confirmed: false }),
 };

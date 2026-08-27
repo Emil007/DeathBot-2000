@@ -1,5 +1,5 @@
 const db = require("../../db");
-const { announceDeathpool } = require("../announce");
+const { processDeathpoolHit } = require("../announce");
 
 module.exports = {
   name: "kill",
@@ -17,9 +17,7 @@ module.exports = {
       return;
     }
     if (found.length > 1) {
-      await msg.reply(
-        "Mehrdeutig:\n" + found.map((c) => `• ${c.name} (id ${c.id})`).join("\n")
-      );
+      await msg.reply("Mehrdeutig:\n" + found.map((c) => `• ${c.name} (id ${c.id})`).join("\n"));
       return;
     }
     const celeb = found[0];
@@ -33,11 +31,17 @@ module.exports = {
       url: celeb.wiki_url || null,
       lang: "en",
     };
-    await announceDeathpool(ctx.client, ctx.config, {
-      celeb,
-      entry,
-      age: celeb.age_at_pick,
-    });
-    await msg.reply(`Erledigt: ${celeb.name}`);
+    const live = db.isLive();
+    await processDeathpoolHit(
+      ctx.client,
+      ctx.config,
+      { celeb, entry, wikiAge: celeb.age_at_pick },
+      { announce: live, confirmed: !live, source: "manual" }
+    );
+    await msg.reply(
+      live
+        ? `Erledigt (live angekündigt): ${celeb.name}`
+        : `Erledigt (Setup, ohne Channel-Ping): ${celeb.name}`
+    );
   },
 };

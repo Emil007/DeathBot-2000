@@ -1,7 +1,6 @@
 const fs = require("fs");
-const path = require("path");
 const Database = require("better-sqlite3");
-const { SCHEMA } = require("./schema");
+const { SCHEMA, migrate } = require("./schema");
 
 let db = null;
 
@@ -12,6 +11,7 @@ function openDb(config) {
 
   db = new Database(config.dbPath);
   db.exec(SCHEMA);
+  migrate(db);
   ensureActiveSeason();
   return db;
 }
@@ -37,7 +37,12 @@ function ensureActiveSeason() {
   const active = db.prepare("SELECT id FROM seasons WHERE active = 1 LIMIT 1").get();
   if (active) return active.id;
   const year = new Date().getFullYear();
-  const info = db.prepare("INSERT INTO seasons (year, active) VALUES (?, 1)").run(year);
+  const start = `${year}-01-01`;
+  const info = db
+    .prepare(
+      `INSERT INTO seasons (year, active, start_date, live) VALUES (?, 1, ?, 0)`
+    )
+    .run(year, start);
   return info.lastInsertRowid;
 }
 
@@ -45,6 +50,22 @@ function getActiveSeason() {
   const row = db.prepare("SELECT * FROM seasons WHERE active = 1 LIMIT 1").get();
   if (!row) return db.prepare("SELECT * FROM seasons WHERE id = ?").get(ensureActiveSeason());
   return row;
+}
+
+function isLive() {
+  return !!getActiveSeason().live;
+}
+
+function setSeasonStartDate(startDate) {
+  const s = getActiveSeason();
+  db.prepare("UPDATE seasons SET start_date = ? WHERE id = ?").run(startDate, s.id);
+  return getActiveSeason();
+}
+
+function setSeasonLive(live) {
+  const s = getActiveSeason();
+  db.prepare("UPDATE seasons SET live = ? WHERE id = ?").run(live ? 1 : 0, s.id);
+  return getActiveSeason();
 }
 
 function nameKey(name) {
@@ -58,7 +79,7 @@ function nameKey(name) {
 
 function scoreForAge(age) {
   if (age == null || Number.isNaN(age)) return 0;
-  return Math.max(1, 100 - age);
+  return Math.max(1, 100 - Number(age));
 }
 
 function upsertPlayer({ displayName, discordUserId }) {
@@ -105,9 +126,7 @@ function setPick(playerId, celebId, seasonId) {
 
 function getAliveCelebsForAuto() {
   return db
-    .prepare(
-      `SELECT * FROM celebs WHERE is_alive = 1 AND exclude_from_auto = 0`
-    )
+    .prepare(`SELECT * FROM celebs WHERE is_alive = 1 AND exclude_from_auto = 0`)
     .all();
 }
 
@@ -132,11 +151,114 @@ function getWinnersForCeleb(celebId, seasonId) {
     .all(celebId, seasonId);
 }
 
-function markCelebDead(celebId, diedAt, wikiUrl) {
+/**
+ * Mark dead + award points using age_at_pick (100-age).
+ * @param {{ confirmed: boolean, source: string, diedAt?: string, wikiUrl?: string }} opts
+ */
+function applyDeath(celebId, opts = {}) {
+  const celeb = db.prepare("SELECT * FROM celebs WHERE id = ?").get(celebId);
+  if (!celeb || !celeb.is_alive) return { celeb, awards: [], score: 0 };
+
+  const season = getActiveSeason();
+  const age = celeb.age_at_pick;
+  const score = scoreForAge(age);
+  const winners = getWinnersForCeleb(celebId, season.id);
+  const now = new Date().toISOString();
+  const diedAt = opts.diedAt || now.slice(0, 10);
+
   db.prepare(
-    `UPDATE celebs SET is_alive = 0, died_at = COALESCE(?, died_at), wiki_url = COALESCE(?, wiki_url)
+    `UPDATE celebs SET
+      is_alive = 0,
+      died_at = ?,
+      wiki_url = COALESCE(?, wiki_url),
+      death_confirmed = ?,
+      death_detected_at = ?,
+      death_source = ?
      WHERE id = ?`
-  ).run(diedAt || new Date().toISOString().slice(0, 10), wikiUrl || null, celebId);
+  ).run(
+    diedAt,
+    opts.wikiUrl || null,
+    opts.confirmed ? 1 : 0,
+    now,
+    opts.source || "wiki",
+    celebId
+  );
+
+  const awards = [];
+  for (const w of winners) {
+    if (score > 0) {
+      db.prepare("UPDATE players SET base_points = base_points + ? WHERE id = ?").run(score, w.id);
+      db.prepare(
+        `INSERT INTO death_awards (celeb_id, player_id, points) VALUES (?, ?, ?)`
+      ).run(celebId, w.id, score);
+    }
+    awards.push({
+      player: w,
+      points: score,
+      total: playerTotal(w.id),
+    });
+  }
+
+  return {
+    celeb: db.prepare("SELECT * FROM celebs WHERE id = ?").get(celebId),
+    awards,
+    score,
+    age,
+  };
+}
+
+function retractDeath(celebId) {
+  const celeb = db.prepare("SELECT * FROM celebs WHERE id = ?").get(celebId);
+  if (!celeb || celeb.is_alive) return null;
+
+  const awards = db
+    .prepare("SELECT * FROM death_awards WHERE celeb_id = ?")
+    .all(celebId);
+
+  for (const a of awards) {
+    db.prepare("UPDATE players SET base_points = base_points - ? WHERE id = ?").run(
+      a.points,
+      a.player_id
+    );
+  }
+  db.prepare("DELETE FROM death_awards WHERE celeb_id = ?").run(celebId);
+  db.prepare(
+    `UPDATE celebs SET
+      is_alive = 1,
+      died_at = NULL,
+      death_confirmed = 0,
+      death_detected_at = NULL,
+      death_source = NULL
+     WHERE id = ?`
+  ).run(celebId);
+
+  return {
+    celeb: db.prepare("SELECT * FROM celebs WHERE id = ?").get(celebId),
+    awards,
+  };
+}
+
+function confirmDeath(celebId) {
+  db.prepare("UPDATE celebs SET death_confirmed = 1 WHERE id = ?").run(celebId);
+}
+
+function getUnconfirmedDeaths() {
+  return db
+    .prepare(
+      `SELECT * FROM celebs
+       WHERE is_alive = 0 AND death_confirmed = 0 AND exclude_from_auto = 0`
+    )
+    .all();
+}
+
+/** @deprecated use applyDeath */
+function markCelebDead(celebId, diedAt, wikiUrl) {
+  applyDeath(celebId, {
+    confirmed: true,
+    source: "manual",
+    diedAt,
+    wikiUrl,
+  });
 }
 
 function addPoints(playerId, points) {
@@ -214,13 +336,21 @@ function markWikiSeen(entry) {
 }
 
 function markWikiAnnounced(entryId) {
-  db.prepare(
-    `UPDATE wiki_seen SET announced_at = datetime('now') WHERE entry_id = ?`
-  ).run(entryId);
+  db.prepare(`UPDATE wiki_seen SET announced_at = datetime('now') WHERE entry_id = ?`).run(entryId);
   db.prepare(
     `INSERT OR REPLACE INTO announced_deaths (entry_id, name, url, lang, announced_at)
      SELECT entry_id, text, url, lang, datetime('now') FROM wiki_seen WHERE entry_id = ?`
   ).run(entryId);
+}
+
+function seedAllWikiSeen(entries) {
+  const tx = db.transaction((list) => {
+    for (const e of list) {
+      markWikiSeen(e);
+      markWikiAnnounced(e.id);
+    }
+  });
+  tx(entries);
 }
 
 function deathsSinceHours(hours) {
@@ -248,15 +378,19 @@ function recentPhraseHashes(limit = 80) {
   );
 }
 
-function clearSeasonForNewYear(archiveYear) {
+function clearSeasonForNewYear(year, startDate) {
   const old = getActiveSeason();
   db.prepare("UPDATE seasons SET active = 0 WHERE id = ?").run(old.id);
+  const y = year || new Date().getFullYear();
+  const start = startDate || `${y}-01-01`;
   const info = db
-    .prepare("INSERT INTO seasons (year, active) VALUES (?, 1)")
-    .run(archiveYear || new Date().getFullYear());
+    .prepare(
+      `INSERT INTO seasons (year, active, start_date, live) VALUES (?, 1, ?, 0)`
+    )
+    .run(y, start);
   db.prepare("UPDATE players SET base_points = 0").run();
   db.prepare("DELETE FROM player_bonuses").run();
-  return { oldSeason: old, newSeasonId: info.lastInsertRowid };
+  return { oldSeason: old, newSeasonId: info.lastInsertRowid, startDate: start };
 }
 
 function statsSnapshot() {
@@ -276,6 +410,9 @@ module.exports = {
   reopenDb,
   ensureActiveSeason,
   getActiveSeason,
+  isLive,
+  setSeasonStartDate,
+  setSeasonLive,
   nameKey,
   scoreForAge,
   upsertPlayer,
@@ -285,6 +422,10 @@ module.exports = {
   getAkas,
   getBlacklist,
   getWinnersForCeleb,
+  applyDeath,
+  retractDeath,
+  confirmDeath,
+  getUnconfirmedDeaths,
   markCelebDead,
   addPoints,
   setPoints,
@@ -295,6 +436,7 @@ module.exports = {
   isWikiSeen,
   markWikiSeen,
   markWikiAnnounced,
+  seedAllWikiSeen,
   deathsSinceHours,
   recordPhraseUse,
   recentPhraseHashes,

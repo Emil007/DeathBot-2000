@@ -4,86 +4,81 @@ Discord bot for celebrity death-pool games. Scrapes English + German Wikipedia d
 
 No LLM. Sarcasm comes from a built-in German phrase bank (Death’s voice) plus an optional `custom_phrases.txt`.
 
+## Late start (your August case)
+
+Pool started 1 Jan, bot joins later:
+
+1. `!new-year confirm 2026-01-01` — setup mode, start date set (ages = as of that day)
+2. `!import @User` for each sheet (Name + Alter; **Punkte column ignored**, score = `100 − age`)
+3. `!check` — silent wiki reconcile: marks already-dead picks, awards points, **DM summary**, no channel spam
+4. `!go` — go live; reseeds all-deaths so only deaths **from now on** are announced
+
+Admin commands work in DMs or any channel the bot can see.
+
 ## Quick start (NAS)
 
-1. Create two Discord channels (deathpool required; all-deaths optional).
-2. Invite the bot with permissions to read/send messages and use embeds. Enable **Message Content Intent** in the Discord Developer Portal.
+1. Create channels (deathpool required; all-deaths optional).
+2. Enable **Message Content Intent**. Invite the bot.
 3. On the NAS:
 
 ```bash
 mkdir -p deathbot-2000/data/{backups,restore}
 cd deathbot-2000
-# copy docker-compose.yml from the repo, fill in environment values (no .env file)
+# edit docker-compose.yml environment values (no .env file)
 docker compose pull
 docker compose up -d
 ```
 
-Image: `ghcr.io/emil007/deathbot-2000:latest` (built by GitHub Actions on push to `main`).
+Image: `ghcr.io/emil007/deathbot-2000:latest`
 
 ## Data mount
 
 ```
 ./data/
   deathbot.sqlite
-  custom_phrases.txt      # optional; see CUSTOM_PHRASES
-  backups/                # !new-year + auto backups
-  restore/                # drop a zip here, then !restore
+  custom_phrases.txt
+  backups/
+  restore/
 ```
 
-All durable state lives here. The container image is disposable.
-
-## Environment (docker-compose)
+## Environment
 
 | Variable | Required | Meaning |
 |----------|----------|---------|
 | `TOKEN` | yes | Discord bot token |
 | `ADMIN_ID` | yes | Your Discord user id |
-| `CHANNEL_DEATHPOOL` | yes | Pool hit announcements (pings winners) |
+| `CHANNEL_DEATHPOOL` | yes | Pool hits (pings winners) |
 | `CHANNEL_ALL_DEATHS` | no | Every new wiki death (never pings) |
-| `PREFIX` | no | Default `!` |
 | `WIKI_POLLER_MINUTES` | no | Default `30` |
-| `DAILY_SUMMARY_HOUR` | no | Default `9` (server `TZ`) |
-| `CUSTOM_PHRASES` | no | `no` (default) / `mix` / `only` |
+| `DAILY_SUMMARY_HOUR` | no | Default `9` |
+| `DEATH_CONFIRM_DAYS` | no | Default `7` — retract if wiki hit disappears within this window |
+| `CUSTOM_PHRASES` | no | `no` / `mix` / `only` |
 | `TZ` | no | e.g. `Europe/Berlin` |
-
-`CUSTOM_PHRASES`:
-
-- `no` — ignore `custom_phrases.txt`
-- `mix` — built-in + custom
-- `only` — custom only (falls back to built-in if file empty)
 
 ## Commands
 
-**Everyone**
-
-- `!liste` / `!mylist` — your picks (DM if possible)
-- `!scores` — leaderboard
-- `!celeb Name` — lookup
-- `!help`
+**Everyone:** `!liste`, `!scores`, `!celeb`, `!help`
 
 **Admin**
 
-- `!import @User` — then paste a Google Sheets TSV (columns Name + Alter required; Beschreibung / gestorben optional)
-- `!check` — run wiki poll now
-- `!kill Name` / `!resurrect Name`
-- `!add-points @User N` / `!set-points @User N`
-- `!players`
-- `!new-year confirm` — writes a zip package under `data/backups/`, resets season
-- `!restore` / `!restore confirm file.zip` — restore from `data/restore/` or `data/backups/`
+- `!new-year confirm [YYYY-MM-DD]` — archive + new pool in setup
+- `!season` / `!season YYYY-MM-DD` — status / set start date
+- `!import @User` — paste TSV (Name, Alter required)
+- `!check` — setup: silent reconcile + DM; live: poll now
+- `!go` — start live run
+- `!kill` / `!resurrect`, points, `!players`, `!restore`
 
 ## Scoring
 
-`points = max(1, 100 - age)` when age is known; otherwise `0`.
+Always `max(1, 100 − age_at_pick)`. Age is the age **at season start**, not the wiki death age (wiki age is only shown for comparison).
 
-## Local / rebuild
+## False positives
 
-```bash
-docker build -t deathbot-2000 .
-docker compose up -d
-```
+Live wiki kills stay **unconfirmed** for `DEATH_CONFIRM_DAYS`. If the person drops off the Wikipedia death lists within that window, Gregg **retracts** (marks alive again, reverses points, announces). After the window, the death is locked.
+
+Reconcile / sheet / setup kills are confirmed immediately (historical catch-up).
 
 ## Notes
 
-- First poll after start **seeds** the wiki cache (no spam). Later polls announce only new rows.
-- Deathpool matching still runs against the full current lists so imported celebs are caught when they appear.
-- Year history lives in backup packages; `!new-year` clears celebs/picks for a clean import.
+- While not live, the interval poll only seeds the wiki cache (no announcements).
+- `!go` reseeds all-deaths so history is not dumped into the channel.
