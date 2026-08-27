@@ -40,7 +40,7 @@ async function main() {
   const commands = loadCommands();
   const ctx = { client, config, commands };
 
-  client.once("ready", async () => {
+  client.once("clientReady", async () => {
     console.log(`Logged in as ${client.user.tag}`);
     try {
       await registerSlashCommands(client, config, commands);

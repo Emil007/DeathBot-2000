@@ -72,7 +72,11 @@ function buildSlashCommand(cmd) {
       });
     }
   } else {
-    for (const opt of cmd.options || []) addOption(builder, opt);
+    const opts = [...(cmd.options || [])].sort((a, b) => {
+      // Discord: required options must come before optional ones
+      return Number(Boolean(b.required)) - Number(Boolean(a.required));
+    });
+    for (const opt of opts) addOption(builder, opt);
   }
 
   return builder;

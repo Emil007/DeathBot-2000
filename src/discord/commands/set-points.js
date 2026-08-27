@@ -13,6 +13,12 @@ const cmd = {
   ],
   options: [
     {
+      name: "points",
+      description: "Neuer Punktestand",
+      type: "INTEGER",
+      required: true,
+    },
+    {
       name: "user",
       description: "Spieler",
       type: "USER",
@@ -23,12 +29,6 @@ const cmd = {
       description: "Discord-Snowflake (Fallback in DMs)",
       type: "STRING",
       required: false,
-    },
-    {
-      name: "points",
-      description: "Neuer Punktestand",
-      type: "INTEGER",
-      required: true,
     },
   ],
   parseSlash(interaction) {
