@@ -48,8 +48,8 @@ async function processDeathpoolHit(
 
   const image =
     (await fetchBestImage(
-      entry?.lang === "en" ? entry.url : null,
-      entry?.url || null,
+      celeb.wiki_url || (entry?.lang === "en" ? entry.url : null),
+      celeb.wiki_url_de || (entry?.lang === "de" ? entry.url : null) || entry?.url,
       config.userAgent
     )) || null;
 
@@ -80,7 +80,8 @@ async function processDeathpoolHit(
     )
     .setTimestamp(new Date());
 
-  if (image) embed.setImage(image);
+  // Thumbnail sits beside the text (Discord layout); full-width setImage is too large
+  if (image) embed.setThumbnail(image);
 
   await channel.send({
     content: `${emojiBanner(config)} **Deathpool-Treffer**`,
@@ -299,8 +300,8 @@ async function announceSimulatedDeath(
   const enUrl = url && /en\.wikipedia/i.test(url) ? url : null;
   const deUrl =
     urlDe || (url && /de\.wikipedia/i.test(url) ? url : null) || (!enUrl ? url : null);
-  const image = await fetchBestImage(enUrl, deUrl, config.userAgent);
-  if (image) embed.setImage(image);
+  const image = await fetchBestImage(enUrl || url, deUrl, config.userAgent);
+  if (image) embed.setThumbnail(image);
 
   await channel.send({
     content: `${emojiBanner(config)} **Simulation** (kein DB-Write · keine Pings)`,
