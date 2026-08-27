@@ -181,7 +181,10 @@ async function runWikiPoll(client, config, { mode = "live" } = {}) {
   // Secondary: death-list name/URL matching
   let categoryHits = [];
   try {
-    categoryHits = await findPoolDeathsByCategory(config.userAgent, { delayMs: 300 });
+    categoryHits = await findPoolDeathsByCategory(config.userAgent, {
+      delayMs: 300,
+      seasonStartDate: db.getActiveSeason().start_date,
+    });
   } catch (e) {
     console.error("[poll] category check failed", e.message);
   }
