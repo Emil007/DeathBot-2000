@@ -1,9 +1,24 @@
 const db = require("../../db");
 
-module.exports = {
+const cmd = {
   name: "liste",
   aliases: ["mylist", "mypicks"],
-  description: "Zeigt deine Picks (per DM wenn möglich)",
+  admin: false,
+  group: "everyone",
+  description: "Zeigt deine Picks (per DM wenn möglich; Admin: fremde Liste)",
+  usage: "/liste [user:@Spieler]\n{prefix}liste [@User]",
+  examples: ["/liste", "{prefix}liste", "/liste user:@Spieler"],
+  options: [
+    {
+      name: "user",
+      description: "Spieler (nur Admin sieht fremde Listen)",
+      type: "USER",
+      required: false,
+    },
+  ],
+  parseSlash() {
+    return [];
+  },
   async run(ctx, args, msg) {
     const target =
       msg.mentions.users.first() && msg.author.id === ctx.config.adminId
@@ -12,7 +27,12 @@ module.exports = {
 
     const data = db.getPlayerPicks(target.id);
     if (!data) {
-      await msg.reply("Keine Picks gefunden. Admin muss dich per `!import @User` anlegen.");
+      await msg.reply(
+        "Keine Picks gefunden. Admin muss dich per `/import` bzw. `{prefix}import @User` anlegen.".replace(
+          "{prefix}",
+          ctx.config.prefix
+        )
+      );
       return;
     }
 
@@ -37,9 +57,14 @@ module.exports = {
 
     try {
       for (const chunk of chunks) await msg.author.send(chunk);
-      if (msg.guild) await msg.reply("Liste per DM geschickt.");
+      await msg.reply("Liste per DM geschickt.");
     } catch {
-      for (const chunk of chunks) await msg.channel.send(chunk);
+      for (let i = 0; i < chunks.length; i++) {
+        if (i === 0) await msg.reply(chunks[i]);
+        else await msg.channel.send(chunks[i]);
+      }
     }
   },
 };
+
+module.exports = cmd;

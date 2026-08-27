@@ -8,20 +8,52 @@ function parseDate(s) {
   return s;
 }
 
-module.exports = {
+const cmd = {
   name: "new-year",
   admin: true,
-  description: "Neuer Pool. Optional: !new-year confirm YYYY-MM-DD",
+  group: "season",
+  description: "Archiviert die Saison und startet einen neuen Pool (Setup)",
+  usage: "/new-year confirm:true [start_date:YYYY-MM-DD]\n{prefix}new-year confirm [YYYY-MM-DD]",
+  examples: [
+    "/new-year confirm:true",
+    "/new-year confirm:true start_date:2026-01-01",
+    "{prefix}new-year confirm 2026-01-01",
+  ],
+  details:
+    "Löscht Celebs/Picks der aktiven Saison nach Backup. Danach: /import → /review → /go.",
+  options: [
+    {
+      name: "confirm",
+      description: "Muss true sein, um wirklich zu starten",
+      type: "BOOLEAN",
+      required: true,
+    },
+    {
+      name: "start_date",
+      description: "Saisonstart YYYY-MM-DD (Standard: 1. Jan dieses Jahres)",
+      type: "STRING",
+      required: false,
+    },
+  ],
+  parseSlash(interaction) {
+    const confirm = interaction.options.getBoolean("confirm");
+    if (!confirm) return [];
+    const start = interaction.options.getString("start_date");
+    return ["confirm", start].filter(Boolean);
+  },
   async run(ctx, args, msg) {
     if (args[0] !== "confirm") {
       await msg.reply(
         [
           "Archiviert die Saison und startet einen neuen Pool im **Setup-Modus** (noch nicht live).",
           "",
-          "`!new-year confirm` — Start = 1. Januar dieses Jahres",
-          "`!new-year confirm 2026-01-01` — explizites Startdatum (Alter = Stand dieses Tags)",
+          "`/new-year confirm:true` bzw. `{prefix}new-year confirm` — Start = 1. Januar dieses Jahres".replace(
+            "{prefix}",
+            ctx.config.prefix
+          ),
+          "`/new-year confirm:true start_date:2026-01-01` — explizites Startdatum",
           "",
-          "Danach: `!import @User` → `!check` → `!go`",
+          "Danach: `/import` → `/check` → `/go` (Prefix geht auch)",
         ].join("\n")
       );
       return;
@@ -54,10 +86,15 @@ module.exports = {
         `• Alte Saison: ${oldSeason.year}`,
         `• Neue Saison id ${newSeasonId}, Start **${startDate}**, live=**nein**`,
         "",
-        "1. `!import @User` (Name + Alter zum Startdatum; Punkte-Spalte wird ignoriert)",
-        "2. `!check` — stiller Wiki-Abgleich, Zusammenfassung per DM",
-        "3. `!go` — Live ab jetzt (All-Deaths nur ab diesem Moment)",
+        "1. `/import` bzw. `{prefix}import @User` (Name + Alter zum Startdatum; Punkte-Spalte wird ignoriert)".replace(
+          "{prefix}",
+          ctx.config.prefix
+        ),
+        "2. `/check` — stiller Wiki-Abgleich, Zusammenfassung per DM",
+        "3. `/go` — Live ab jetzt (All-Deaths nur ab diesem Moment)",
       ].join("\n")
     );
   },
 };
+
+module.exports = cmd;

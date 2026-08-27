@@ -1,18 +1,68 @@
 const { listRestoreCandidates, restorePackage } = require("../../backup");
+const { usageReply } = require("../usage");
 
-module.exports = {
+const cmd = {
   name: "restore",
   admin: true,
-  description: "Stellt ein Backup-Package wieder her",
+  group: "season",
+  description: "Backup-Package anzeigen oder wiederherstellen",
+  usage:
+    "/restore list|info|confirm\n{prefix}restore [confirm] <dateiname.zip>",
+  examples: [
+    "/restore list",
+    "/restore info file:backup.zip",
+    "{prefix}restore confirm backup.zip",
+  ],
+  details: "confirm erstellt vorher automatisch ein Safety-Backup.",
+  subcommands: [
+    {
+      name: "list",
+      description: "Dateien in data/restore/ auflisten",
+    },
+    {
+      name: "info",
+      description: "Infos zu einem Package (noch nicht einspielen)",
+      options: [
+        {
+          name: "file",
+          description: "Dateiname.zip",
+          type: "STRING",
+          required: true,
+        },
+      ],
+    },
+    {
+      name: "confirm",
+      description: "Package wiederherstellen",
+      options: [
+        {
+          name: "file",
+          description: "Dateiname.zip",
+          type: "STRING",
+          required: true,
+        },
+      ],
+    },
+  ],
+  parseSlash(interaction) {
+    const sub = interaction.options.getSubcommand(false);
+    if (!sub || sub === "list") return [];
+    const file = interaction.options.getString("file");
+    if (sub === "confirm") return ["confirm", file].filter(Boolean);
+    return file ? [file] : [];
+  },
   async run(ctx, args, msg) {
     if (!args.length) {
       const list = listRestoreCandidates(ctx.config);
       const names = list.map((f) => `• \`${f.name}\``).join("\n") || "_nichts in data/restore/_";
       await msg.reply(
         [
-          "Usage:",
-          "`!restore <dateiname.zip>` — zeigt Infos",
-          "`!restore confirm <dateiname.zip>` — stellt wieder her",
+          "So geht’s:",
+          "`/restore info file:…` bzw. `{prefix}restore <dateiname.zip>` — Infos".replace(
+            "{prefix}",
+            ctx.config.prefix
+          ),
+          "`/restore confirm file:…` — stellt wieder her",
           "",
           "Lege ZIPs in `data/restore/` (oder nutze Dateien aus `data/backups/`).",
           "",
@@ -26,7 +76,7 @@ module.exports = {
     if (args[0] === "confirm") {
       const file = args.slice(1).join(" ");
       if (!file) {
-        await msg.reply("Usage: `!restore confirm dateiname.zip`");
+        await msg.reply(usageReply(cmd, ctx.config));
         return;
       }
       try {
@@ -42,7 +92,9 @@ module.exports = {
 
     const file = args.join(" ");
     await msg.reply(
-      `Package: \`${file}\`\nZum Einspielen: \`!restore confirm ${file}\`\n(Erstellt vorher automatisch ein Safety-Backup.)`
+      `Package: \`${file}\`\nZum Einspielen: \`/restore confirm file:${file}\` bzw. \`${ctx.config.prefix}restore confirm ${file}\`\n(Erstellt vorher automatisch ein Safety-Backup.)`
     );
   },
 };
+
+module.exports = cmd;

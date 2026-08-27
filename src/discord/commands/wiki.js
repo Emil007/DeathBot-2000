@@ -1,20 +1,47 @@
 const db = require("../../db");
 const { lookupUrl } = require("../../wiki/page-lookup");
+const { usageReply } = require("../usage");
 
-module.exports = {
+const cmd = {
   name: "wiki",
   admin: true,
-  description: "!wiki <celeb> <url|none> — set wiki link or manual-only",
+  group: "season",
+  description: "Wiki-URL setzen oder Celeb auf manuell (none)",
+  usage: "/wiki name:<Name> url:<URL|none>\n{prefix}wiki <Name> <url|none>",
+  examples: [
+    "/wiki name:Ozzy Osbourne url:https://en.wikipedia.org/wiki/Ozzy_Osbourne",
+    "/wiki name:Foo url:none",
+    "{prefix}wiki Ozzy Osbourne none",
+  ],
+  options: [
+    {
+      name: "name",
+      description: "Celeb-Name",
+      type: "STRING",
+      required: true,
+    },
+    {
+      name: "url",
+      description: "Wikipedia-URL oder none (nur manuell)",
+      type: "STRING",
+      required: true,
+    },
+  ],
+  parseSlash(interaction) {
+    const name = interaction.options.getString("name");
+    const url = interaction.options.getString("url");
+    return [name, url].filter((x) => x != null && x !== "");
+  },
   async run(ctx, args, msg) {
     if (args.length < 2) {
-      await msg.reply("Usage: `!wiki Name https://en.wikipedia.org/wiki/…` or `!wiki Name none`");
+      await msg.reply(usageReply(cmd, ctx.config));
       return;
     }
     const last = args[args.length - 1];
     const name = args.slice(0, -1).join(" ");
     const found = db.findCelebByName(name);
     if (found.length !== 1) {
-      await msg.reply(found.length ? "Ambiguous name." : "Not found.");
+      await msg.reply(found.length ? "Mehrdeutiger Name." : "Nicht gefunden.");
       return;
     }
     const celeb = found[0];
@@ -24,7 +51,7 @@ module.exports = {
         age: celeb.age_at_pick ?? celeb.sheet_age_hint,
         manualOnly: true,
       });
-      await msg.reply(`**${celeb.name}** set to manual-only (no auto wiki match).`);
+      await msg.reply(`**${celeb.name}** auf manuell gesetzt (kein Auto-Wiki-Match).`);
       return;
     }
 
@@ -43,10 +70,12 @@ module.exports = {
         manualOnly: false,
       });
       await msg.reply(
-        `Wiki set for **${confirmed.name}**: ${confirmed.wiki_url}\nAge at season start: **${confirmed.age_at_pick ?? "?"}** (auto-match on).`
+        `Wiki für **${confirmed.name}**: ${confirmed.wiki_url}\nAlter zum Saisonstart: **${confirmed.age_at_pick ?? "?"}** (Auto-Match an).`
       );
     } catch (e) {
-      await msg.reply(`Failed: ${e.message}`);
+      await msg.reply(`Fehlgeschlagen: ${e.message}`);
     }
   },
 };
+
+module.exports = cmd;

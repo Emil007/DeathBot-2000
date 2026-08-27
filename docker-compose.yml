@@ -9,6 +9,8 @@ services:
       TOKEN: "PUT_DISCORD_BOT_TOKEN_HERE"
       PREFIX: "!"
       ADMIN_ID: "PUT_YOUR_DISCORD_USER_ID_HERE"
+      # Instant slash-command updates in this server (also registered globally for DMs):
+      DISCORD_GUILD_ID: "PUT_DISCORD_SERVER_ID_HERE"
       CHANNEL_DEATHPOOL: "PUT_DEATHPOOL_CHANNEL_ID_HERE"
       # Optional all-deaths channel (never pings). Comment in and set an id to enable:
       # CHANNEL_ALL_DEATHS: "PUT_ALL_DEATHS_CHANNEL_ID_HERE"

@@ -1,13 +1,60 @@
 const db = require("../../db");
 const { resolveCelebArgs } = require("../resolve-celeb");
+const { usageReply } = require("../usage");
 
-module.exports = {
+const cmd = {
   name: "aka",
   admin: true,
-  description: "!aka <celeb> <alias…> | !aka list <celeb>",
+  group: "match",
+  description: "AKA-Alias hinzufügen oder auflisten",
+  usage: "/aka add|list …\n{prefix}aka <Name> <Alias…> | {prefix}aka list <Name>",
+  examples: [
+    "/aka add name:Ozzy Osbourne alias:John Osbourne",
+    "/aka list name:Ozzy",
+    "{prefix}aka Ozzy Osbourne John Osbourne",
+  ],
+  subcommands: [
+    {
+      name: "add",
+      description: "Alias hinzufügen",
+      options: [
+        {
+          name: "name",
+          description: "Celeb-Name",
+          type: "STRING",
+          required: true,
+        },
+        {
+          name: "alias",
+          description: "AKA-Text",
+          type: "STRING",
+          required: true,
+        },
+      ],
+    },
+    {
+      name: "list",
+      description: "AKAs eines Celebs anzeigen",
+      options: [
+        {
+          name: "name",
+          description: "Celeb-Name",
+          type: "STRING",
+          required: true,
+        },
+      ],
+    },
+  ],
+  parseSlash(interaction) {
+    const sub = interaction.options.getSubcommand();
+    const name = interaction.options.getString("name");
+    if (sub === "list") return ["list", name].filter(Boolean);
+    const alias = interaction.options.getString("alias") || "";
+    return [name, ...alias.split(/\s+/).filter(Boolean)].filter(Boolean);
+  },
   async run(ctx, args, msg) {
     if (!args.length) {
-      await msg.reply("Usage: `!aka Name Alias…` · `!aka list Name` · see also `!unaka`");
+      await msg.reply(usageReply(cmd, ctx.config));
       return;
     }
     if (args[0].toLowerCase() === "list") {
@@ -21,7 +68,6 @@ module.exports = {
       );
       return;
     }
-    // alias is last token(s): find celeb as longest prefix
     const { celeb, rest, error } = (() => {
       for (let len = args.length - 1; len >= 1; len--) {
         const name = args.slice(0, len).join(" ");
@@ -35,7 +81,7 @@ module.exports = {
           };
         }
       }
-      return { error: "Usage: `!aka Celebrity Name The Alias`" };
+      return { error: usageReply(cmd, ctx.config) };
     })();
     if (error) return msg.reply(error);
     const alias = rest.join(" ").trim();
@@ -44,3 +90,5 @@ module.exports = {
     await msg.reply(`AKA **${alias}** added for **${celeb.name}**.`);
   },
 };
+
+module.exports = cmd;

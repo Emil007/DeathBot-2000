@@ -1,14 +1,60 @@
 const db = require("../../db");
+const { usageReply } = require("../usage");
 
-module.exports = {
+const cmd = {
   name: "blacklist",
   admin: true,
-  description: "!blacklist <celeb> <term…> | !blacklist list <celeb>",
+  group: "match",
+  description: "Wiki-Auto-Match blockieren wenn Terme in der Zeile vorkommen",
+  usage: "/blacklist add|list …\n{prefix}blacklist <Name> <term…> | {prefix}blacklist list <Name>",
+  examples: [
+    "/blacklist add name:Foo term:junior",
+    "/blacklist list name:Foo",
+    "{prefix}blacklist Foo junior",
+  ],
+  details: "Blockiert Auto-Match, wenn alle Term-Wörter in der Wiki-Zeile vorkommen.",
+  subcommands: [
+    {
+      name: "add",
+      description: "Blacklist-Term hinzufügen",
+      options: [
+        {
+          name: "name",
+          description: "Celeb-Name",
+          type: "STRING",
+          required: true,
+        },
+        {
+          name: "term",
+          description: "Block-Term(e)",
+          type: "STRING",
+          required: true,
+        },
+      ],
+    },
+    {
+      name: "list",
+      description: "Blacklist eines Celebs anzeigen",
+      options: [
+        {
+          name: "name",
+          description: "Celeb-Name",
+          type: "STRING",
+          required: true,
+        },
+      ],
+    },
+  ],
+  parseSlash(interaction) {
+    const sub = interaction.options.getSubcommand();
+    const name = interaction.options.getString("name");
+    if (sub === "list") return ["list", name].filter(Boolean);
+    const term = interaction.options.getString("term") || "";
+    return [name, ...term.split(/\s+/).filter(Boolean)].filter(Boolean);
+  },
   async run(ctx, args, msg) {
     if (!args.length) {
-      await msg.reply(
-        "Usage: `!blacklist Name term…` · `!blacklist list Name` · `!unblacklist …`\nBlocks auto-match when all term words appear in the wiki line."
-      );
+      await msg.reply(usageReply(cmd, ctx.config));
       return;
     }
     if (args[0].toLowerCase() === "list") {
@@ -33,6 +79,8 @@ module.exports = {
         return;
       }
     }
-    await msg.reply("Usage: `!blacklist Celebrity Name block term`");
+    await msg.reply(usageReply(cmd, ctx.config));
   },
 };
+
+module.exports = cmd;

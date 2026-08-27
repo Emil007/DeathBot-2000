@@ -1,13 +1,29 @@
 const db = require("../../db");
+const { usageReply } = require("../usage");
 
-module.exports = {
+const cmd = {
   name: "resurrect",
   admin: true,
+  group: "match",
   description: "Belebt einen Celeb wieder (Punkte-Rückbuchung wie Retract)",
+  usage: "/resurrect name:<Name>\n{prefix}resurrect <Name>",
+  examples: ["/resurrect name:Ozzy Osbourne", "{prefix}resurrect Ozzy Osbourne"],
+  options: [
+    {
+      name: "name",
+      description: "Celeb-Name",
+      type: "STRING",
+      required: true,
+    },
+  ],
+  parseSlash(interaction) {
+    const name = interaction.options.getString("name");
+    return name ? name.split(/\s+/) : [];
+  },
   async run(ctx, args, msg) {
     const q = args.join(" ").trim();
     if (!q) {
-      await msg.reply("Usage: `!resurrect Name`");
+      await msg.reply(usageReply(cmd, ctx.config));
       return;
     }
     const found = db.findCelebByName(q);
@@ -26,3 +42,5 @@ module.exports = {
     );
   },
 };
+
+module.exports = cmd;

@@ -1,14 +1,30 @@
 const db = require("../../db");
 const { processDeathpoolHit } = require("../announce");
+const { usageReply } = require("../usage");
 
-module.exports = {
+const cmd = {
   name: "kill",
   admin: true,
+  group: "match",
   description: "Markiert einen Celeb manuell als tot",
+  usage: "/kill name:<Name>\n{prefix}kill <Name>",
+  examples: ["/kill name:Ozzy Osbourne", "{prefix}kill Ozzy Osbourne"],
+  options: [
+    {
+      name: "name",
+      description: "Celeb-Name",
+      type: "STRING",
+      required: true,
+    },
+  ],
+  parseSlash(interaction) {
+    const name = interaction.options.getString("name");
+    return name ? name.split(/\s+/) : [];
+  },
   async run(ctx, args, msg) {
     const q = args.join(" ").trim();
     if (!q) {
-      await msg.reply("Usage: `!kill Name`");
+      await msg.reply(usageReply(cmd, ctx.config));
       return;
     }
     const found = db.findCelebByName(q);
@@ -45,3 +61,5 @@ module.exports = {
     );
   },
 };
+
+module.exports = cmd;

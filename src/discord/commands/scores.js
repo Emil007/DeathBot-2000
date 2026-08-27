@@ -1,9 +1,16 @@
 const db = require("../../db");
 
-module.exports = {
+const cmd = {
   name: "scores",
   aliases: ["score", "scoreboard"],
-  description: "Aktuelle Rangliste",
+  admin: false,
+  group: "everyone",
+  description: "Aktuelle Deathpool-Rangliste mit Punkten",
+  usage: "/scores\n{prefix}scores",
+  examples: ["/scores", "{prefix}scores"],
+  parseSlash() {
+    return [];
+  },
   async run(ctx, args, msg) {
     const rows = db.listScores();
     if (!rows.length) {
@@ -14,9 +21,11 @@ module.exports = {
       (p, i) =>
         `**${i + 1}.** <@${p.discord_user_id}> — **${p.total}** Punkte (${p.pickCount} Picks)`
     );
-    await msg.channel.send({
+    await msg.reply({
       content: `📊 **Deathpool Scores**\n${lines.join("\n")}`.slice(0, 1900),
       allowedMentions: { parse: [] },
     });
   },
 };
+
+module.exports = cmd;

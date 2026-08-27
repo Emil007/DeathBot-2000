@@ -2,6 +2,7 @@ const axios = require("axios");
 const db = require("../../db");
 const { parseSheetTable } = require("../import-sheet");
 const { queueCelebsForReview } = require("../celeb-review");
+const { usageReply } = require("../usage");
 
 const pending = new Map();
 const DONE = /^(done|fertig|end)$/i;
@@ -98,35 +99,134 @@ async function readAttachmentText(attachment) {
   return String(data);
 }
 
-module.exports = {
+async function finalize(ctx, msg, wait, text) {
+  const parsed = parseSheetTable(text);
+  if (parsed.error) {
+    await msg.reply(`Import fehlgeschlagen: ${parsed.error}`);
+    return true;
+  }
+
+  const player = db.upsertPlayer({
+    displayName: wait.displayName,
+    discordUserId: wait.playerDiscordId,
+  });
+
+  const { added, deadAwarded, errors, ageWarnings, reviewIds } = applyImportRows(
+    player,
+    parsed.rows
+  );
+
+  await msg.reply(
+    [
+      `✅ Liste ersetzt für <@${wait.playerDiscordId}> (**${wait.displayName}**)`,
+      `• Picks: **${added}**`,
+      `• Sheet-tot + Punkte: **${deadAwarded}**`,
+      `• Punkte gesamt: **${db.playerTotal(player.id)}**`,
+      `• In Wiki-/Alter-Review: **${reviewIds.length}**`,
+      ageWarnings.length
+        ? `• Alter behalten (erster gewinnt):\n` +
+          ageWarnings.slice(0, 8).map((w) => `  – ${w}`).join("\n")
+        : null,
+      errors.length ? `• Fehler: ${errors.slice(0, 5).join("; ")}` : null,
+    ]
+      .filter(Boolean)
+      .join("\n")
+  );
+
+  if (reviewIds.length) {
+    try {
+      await queueCelebsForReview(ctx, reviewIds, await msg.author.createDM());
+    } catch {
+      await queueCelebsForReview(ctx, reviewIds, msg.channel);
+    }
+  }
+  return true;
+}
+
+const cmd = {
   name: "import",
   admin: true,
-  description: "Replace @User list; multi-paste until done, or upload file; then wiki review",
+  group: "season",
+  description: "Spielerliste ersetzen; Paste bis done/fertig/end oder Datei",
+  usage: "/import user:@Spieler [file:…]\n{prefix}import @User",
+  examples: [
+    "/import user:@Spieler",
+    "/import user:@Spieler file:liste.tsv",
+    "{prefix}import @User",
+  ],
+  details:
+    "Ersetzt die gesamte Pick-Liste des Spielers und stellt Celebs in die Wiki-/Alter-Review. Mehrere Paste-Nachrichten OK — abschließen mit done/fertig/end.",
+  options: [
+    {
+      name: "user",
+      description: "Spieler (Discord-User)",
+      type: "USER",
+      required: false,
+    },
+    {
+      name: "user_id",
+      description: "Discord-Snowflake (Fallback in DMs)",
+      type: "STRING",
+      required: false,
+    },
+    {
+      name: "file",
+      description: "Optional .tsv / .csv / .txt — importiert sofort",
+      type: "ATTACHMENT",
+      required: false,
+    },
+  ],
+  parseSlash(interaction) {
+    const user = interaction.options.getUser("user");
+    if (user) return [];
+    const id = interaction.options.getString("user_id");
+    return id ? [id] : [];
+  },
   async run(ctx, args, msg) {
-    const mention = msg.mentions.users.first();
+    let mention = msg.mentions.users.first();
+    if (!mention && args[0] && /^\d{16,20}$/.test(args[0])) {
+      mention = await ctx.client.users.fetch(args[0]).catch(() => null);
+    }
     if (!mention) {
-      await msg.reply(
-        [
-          "Usage: `!import @User`",
-          "Paste sheet rows (tab-separated). **Multiple messages** OK — finish with `done`.",
-          "Or upload `.tsv` / `.csv` / `.txt`.",
-          "Required: Name, Alter. Then wiki/age **review buttons** for new celebs.",
-        ].join("\n")
-      );
+      await msg.reply(usageReply(cmd, ctx.config));
       return;
     }
     const season = db.getActiveSeason();
     const displayName = msg.mentions.members?.first()?.displayName || mention.username;
-    pending.set(msg.author.id, {
+    const wait = {
       playerDiscordId: mention.id,
       displayName,
       chunks: [],
       expires: Date.now() + 15 * 60 * 1000,
-    });
+    };
+    pending.set(msg.author.id, wait);
+
+    const file = msg.attachments?.first?.() || null;
+    if (file) {
+      try {
+        const text = await readAttachmentText(file);
+        if (!text) {
+          pending.delete(msg.author.id);
+          await msg.reply("Brauchst eine .tsv / .csv / .txt Anlage.");
+          return;
+        }
+        pending.delete(msg.author.id);
+        await msg.reply(
+          `Import für **${displayName}** — Datei wird eingelesen (Saisonstart **${season.start_date || "?"}**).`
+        );
+        await finalize(ctx, msg, wait, text);
+        return;
+      } catch (e) {
+        pending.delete(msg.author.id);
+        await msg.reply(`Datei lesen fehlgeschlagen: ${e.message}`);
+        return;
+      }
+    }
+
     await msg.reply(
       [
-        `Import for **${displayName}** — replace mode.`,
-        `Season start **${season.start_date || "?"}**. Paste chunks, then type \`done\` (or attach a file).`,
+        `Import für **${displayName}** — Ersetzen-Modus.`,
+        `Saisonstart **${season.start_date || "?"}**. Chunks pasten, dann \`done\` / \`fertig\` / \`end\` (oder Datei anhängen).`,
       ].join("\n")
     );
   },
@@ -150,13 +250,13 @@ module.exports = {
       try {
         const text = await readAttachmentText(file);
         if (!text) {
-          await msg.reply("Need a .tsv / .csv / .txt attachment.");
+          await msg.reply("Brauchst eine .tsv / .csv / .txt Anlage.");
           return true;
         }
         pending.delete(msg.author.id);
         return finalize(ctx, msg, wait, text);
       } catch (e) {
-        await msg.reply(`Attachment read failed: ${e.message}`);
+        await msg.reply(`Datei lesen fehlgeschlagen: ${e.message}`);
         return true;
       }
     }
@@ -166,7 +266,7 @@ module.exports = {
       pending.delete(msg.author.id);
       const text = wait.chunks.join("\n");
       if (!text.trim()) {
-        await msg.reply("No rows received. Send lines then `done`.");
+        await msg.reply("Keine Zeilen empfangen. Zeilen senden, dann `done`/`fertig`/`end`.");
         return true;
       }
       return finalize(ctx, msg, wait, text);
@@ -175,51 +275,11 @@ module.exports = {
     wait.chunks.push(body);
     wait.expires = Date.now() + 15 * 60 * 1000;
     const lineCount = wait.chunks.join("\n").split(/\n/).filter((l) => l.trim()).length;
-    await msg.reply(`Buffered (~${lineCount} lines). Send more, or \`done\` to import.`);
+    await msg.reply(
+      `Gepuffert (~${lineCount} Zeilen). Mehr senden, oder \`done\`/\`fertig\`/\`end\` zum Import.`
+    );
     return true;
   },
 };
 
-async function finalize(ctx, msg, wait, text) {
-  const parsed = parseSheetTable(text);
-  if (parsed.error) {
-    await msg.reply(`Import failed: ${parsed.error}`);
-    return true;
-  }
-
-  const player = db.upsertPlayer({
-    displayName: wait.displayName,
-    discordUserId: wait.playerDiscordId,
-  });
-
-  const { added, deadAwarded, errors, ageWarnings, reviewIds } = applyImportRows(
-    player,
-    parsed.rows
-  );
-
-  await msg.reply(
-    [
-      `✅ List replaced for <@${wait.playerDiscordId}> (**${wait.displayName}**)`,
-      `• Picks: **${added}**`,
-      `• Sheet-dead + points: **${deadAwarded}**`,
-      `• Points total: **${db.playerTotal(player.id)}**`,
-      `• Queued for wiki/age review: **${reviewIds.length}**`,
-      ageWarnings.length
-        ? `• Age kept (first wins):\n` + ageWarnings.slice(0, 8).map((w) => `  – ${w}`).join("\n")
-        : null,
-      errors.length ? `• Errors: ${errors.slice(0, 5).join("; ")}` : null,
-    ]
-      .filter(Boolean)
-      .join("\n")
-  );
-
-  if (reviewIds.length) {
-    const target = msg.author;
-    try {
-      await queueCelebsForReview(ctx, reviewIds, await msg.author.createDM());
-    } catch {
-      await queueCelebsForReview(ctx, reviewIds, msg.channel);
-    }
-  }
-  return true;
-}
+module.exports = cmd;

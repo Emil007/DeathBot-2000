@@ -1,12 +1,29 @@
+const { usageReply } = require("../usage");
 const db = require("../../db");
 
-module.exports = {
+const cmd = {
   name: "celeb",
-  description: "Suche einen Celeb in der DB",
+  admin: false,
+  group: "everyone",
+  description: "Sucht einen Celeb in der Datenbank (Status, Wiki, Picks)",
+  usage: "/celeb name:<Name>\n{prefix}celeb <Name>",
+  examples: ["/celeb name:Ozzy Osbourne", "{prefix}celeb Ozzy"],
+  options: [
+    {
+      name: "name",
+      description: "Name oder Teil des Namens",
+      type: "STRING",
+      required: true,
+    },
+  ],
+  parseSlash(interaction) {
+    const name = interaction.options.getString("name");
+    return name ? name.split(/\s+/) : [];
+  },
   async run(ctx, args, msg) {
     const q = args.join(" ").trim();
     if (!q) {
-      await msg.reply("Usage: `!celeb Name`");
+      await msg.reply(usageReply(cmd, ctx.config));
       return;
     }
     const found = db.findCelebByName(q);
@@ -40,3 +57,5 @@ module.exports = {
     await msg.reply(lines.join("\n\n").slice(0, 1900));
   },
 };
+
+module.exports = cmd;

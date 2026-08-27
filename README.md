@@ -2,6 +2,8 @@
 
 A Discord bot for celebrity death-pool games. It watches Wikipedia death lists, keeps score for your group’s picks, and posts updates when someone on the list dies.
 
+**In Discord:** start with **`/help`** (slash is the main UX). Prefix (`!`, configurable) stays as fallback — especially for multi-message paste and “send the wiki URL next”.
+
 ## What you need
 
 1. A Discord bot token with **Message Content Intent** enabled
@@ -10,7 +12,8 @@ A Discord bot for celebrity death-pool games. It watches Wikipedia death lists, 
    - **Deathpool channel** — when a picked celebrity dies (pings winners only)
    - **All-deaths channel** (optional) — every newly listed Wikipedia death (never pings)
 4. Your Discord user ID as admin
-5. Docker (published image) or Node 20+ from source
+5. Your **server (guild) ID** as `DISCORD_GUILD_ID` (fast slash registration in that server; commands also register globally so they work in **DMs with the bot**)
+6. Docker (published image) or Node 20+ from source
 
 Copy `docker-compose.yml`, fill in the `environment:` values (no `.env` file), mount `./data`, then:
 
@@ -20,6 +23,8 @@ docker compose up -d
 ```
 
 Image: `ghcr.io/emil007/deathbot-2000:latest`
+
+Admin season flow works in a **DM with the bot** (`/…` or `!…`). Announcement channels are only for public posts.
 
 ---
 
@@ -31,55 +36,45 @@ Image: `ghcr.io/emil007/deathbot-2000:latest`
 - Deathpool announcements with portrait, dark Death-voice line, scores, winner @mentions
 - Optional all-deaths channel (no pings)
 - Frequent polls = **recent months** for near-realtime; **nightly full-year scrape** catches late edits on older month pages and runs retract checks safely
-- Late-start safe: `!go` silent-reconciles before live
+- Late-start safe: `/go` silent-reconciles before live
 - Retract window (`DEATH_CONFIRM_DAYS`): undoes a hit **only if** the person leaves the wiki death lists within that window — not an auto-unkill while still listed
 
 ---
 
 ## Season workflow
 
-1. `!new-year confirm 2026-01-01` — setup mode, season start date  
-2. `!import @User` — paste sheet chunks, finish with **`done`** (or upload a file). Replaces that player’s picks.  
+1. `/new-year confirm:true` (optional `start_date`) — setup mode  
+2. `/import user:@Player` — paste sheet chunks, finish with **`done`** (or attach a file). Replaces that player’s picks.  
 3. **Review queue** (DM/buttons): Confirm · Wrong link · Set age · No wiki (manual only) · Skip  
-   - Until confirmed, celebs are **not** auto-matched  
-   - Same person on another list reuses the existing celeb row  
-4. `!go` — silent full-year catch-up → seed all-deaths → live  
+4. `/go` — silent full-year catch-up → seed all-deaths → live  
 
-Optional: `!check` before `!go`. Resume review anytime with `!review`.
+Optional: `/check` before `/go`. Resume review with `/review`.  
+Prefix equivalents: `!new-year confirm …`, `!import @User`, `!go`, …
+
+Details for any command: `/help command:import` or `!help import`.
 
 ---
 
 ## Commands
 
+Use **`/help`** in Discord for the live grouped list. Non-admins only see player commands there.
+
 ### Everyone
 
-| Command | What it does |
-|---------|----------------|
-| `!liste` / `!mylist` | Your picks |
-| `!scores` | Leaderboard |
-| `!celeb Name` | Lookup |
-| `!help` | Help |
+| Slash | Prefix | What it does |
+|-------|--------|----------------|
+| `/liste` | `!liste` | Your picks |
+| `/scores` | `!scores` | Leaderboard |
+| `/celeb` | `!celeb` | Lookup |
+| `/help` | `!help` | Help |
 
-### Admin — season & lists
+### Admin (see `/help` when you’re `ADMIN_ID`)
 
-| Command | What it does |
-|---------|----------------|
-| `!import @User` | Replace list (multi-message until `done`, or file) + queue review |
-| `!review` | Resume wiki/age review queue |
-| `!wiki Name <url\|none>` | Set/replace Wikipedia link, or manual-only |
-| `!age Name N` | Override age (blocked if death awards already exist) |
-| `!check` / `!go` / `!season` / `!new-year` / `!unlink` | As before |
+Season: `/import`, `/review`, `/wiki`, `/age`, `/check`, `/go`, `/season`, `/new-year`, `/unlink`, `/restore`  
+Matching: `/aka`, `/blacklist`, `/exclude`, `/include`, `/kill`, `/resurrect`, …  
+Points: `/add-points`, `/set-points`, `/bonus`, `/players`
 
-### Admin — false positives
-
-| Command | What it does |
-|---------|----------------|
-| `!aka` / `!unaka` / `!blacklist` / `!unblacklist` | Aliases / block terms |
-| `!exclude` / `!include` | Stop / resume auto match |
-
-### Admin — scoring
-
-`!kill` / `!resurrect` / `!add-points` / `!set-points` / `!bonus` / `!players` / `!restore`
+In DMs, if a User option fails, many commands accept a `user_id` snowflake option / argument.
 
 ---
 
@@ -100,7 +95,9 @@ Placeholders: `{name}` `{age}` `{score}` `{winners}` `{losers}`
 | Setting | Purpose |
 |---------|---------|
 | `TOKEN` / `ADMIN_ID` / `CHANNEL_DEATHPOOL` | Required |
+| `DISCORD_GUILD_ID` | Guild for instant slash sync (recommended) |
 | `CHANNEL_ALL_DEATHS` | Optional all-deaths |
+| `PREFIX` | Prefix fallback (default `!`) |
 | `WIKI_POLLER_MINUTES` | Recent-month poll interval (default `30`) |
 | `NIGHTLY_FULL_SCRAPE_HOUR` | Full-year scrape hour (default `3`) |
 | `DAILY_SUMMARY_HOUR` | Daily digest hour (default `9`) |
@@ -113,4 +110,4 @@ Placeholders: `{name}` `{age}` `{score}` `{winners}` `{losers}`
 ## Scoring
 
 `max(1, 100 − age_at_pick)`.  
-After wiki confirm, age comes from birth date + season start when available. Sheet “Punkte” ignored. Manual-only celebs never auto-kill — use `!kill` or sheet death dates.
+After wiki confirm, age comes from birth date + season start when available. Sheet “Punkte” ignored. Manual-only celebs never auto-kill — use `/kill` or sheet death dates.

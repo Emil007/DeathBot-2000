@@ -7,13 +7,21 @@ const { loadConfig } = require("./config");
 const db = require("./db");
 const { loadCommands } = require("./discord/commands");
 const importCmd = require("./discord/commands/import");
+const helpCmd = require("./discord/commands/help");
 const {
   handleReviewInteraction,
   tryConsumeReviewUrl,
 } = require("./discord/celeb-review");
+const { fromInteraction } = require("./discord/msg-adapter");
+const { registerSlashCommands } = require("./discord/slash");
+const { suggestCommands } = require("./discord/usage");
 const { startWikiPoller } = require("./jobs/wiki-poll");
 const { startDailySummary } = require("./jobs/daily-summary");
 const { startAutoBackup } = require("./backup");
+
+async function runCommand(ctx, cmd, args, msg) {
+  await cmd.run(ctx, args, msg);
+}
 
 async function main() {
   const config = loadConfig();
@@ -32,8 +40,13 @@ async function main() {
   const commands = loadCommands();
   const ctx = { client, config, commands };
 
-  client.once("ready", () => {
+  client.once("ready", async () => {
     console.log(`Logged in as ${client.user.tag}`);
+    try {
+      await registerSlashCommands(client, config, commands);
+    } catch (e) {
+      console.error("[slash] registration failed:", e);
+    }
     startWikiPoller(client, config);
     startDailySummary(client, config);
     startAutoBackup(config);
@@ -41,11 +54,35 @@ async function main() {
 
   client.on("interactionCreate", async (interaction) => {
     try {
-      await handleReviewInteraction(ctx, interaction);
+      if (await helpCmd.handleButton?.(ctx, interaction)) return;
+      if (await handleReviewInteraction(ctx, interaction)) return;
+
+      if (!interaction.isChatInputCommand()) return;
+
+      const cmd = commands.get(interaction.commandName);
+      if (!cmd || cmd._aliasOf) {
+        await interaction.reply({ content: "Unbekannter Befehl. `/help`", ephemeral: true });
+        return;
+      }
+
+      if (cmd.admin && interaction.user.id !== config.adminId) {
+        await interaction.reply({ content: "Nope. Nur Admin.", ephemeral: true });
+        return;
+      }
+
+      await interaction.deferReply();
+      const msg = fromInteraction(interaction);
+      const args = typeof cmd.parseSlash === "function" ? cmd.parseSlash(interaction) : [];
+      await runCommand(ctx, cmd, args, msg);
     } catch (e) {
       console.error("[interaction]", e);
-      if (interaction.isRepliable() && !interaction.replied) {
-        await interaction.reply({ content: `Error: ${e.message}`, ephemeral: true }).catch(() => {});
+      const text = `Fehler: ${e.message}`;
+      if (interaction.isRepliable()) {
+        if (interaction.deferred || interaction.replied) {
+          await interaction.followUp({ content: text, ephemeral: true }).catch(() => {});
+        } else {
+          await interaction.reply({ content: text, ephemeral: true }).catch(() => {});
+        }
       }
     }
   });
@@ -69,7 +106,22 @@ async function main() {
     const parts = msg.content.slice(config.prefix.length).trim().split(/\s+/);
     const name = (parts.shift() || "").toLowerCase();
     const cmd = commands.get(name);
-    if (!cmd) return;
+    if (!cmd) {
+      const isAdmin = msg.author.id === config.adminId;
+      const suggestions = suggestCommands(name, commands, { admin: isAdmin });
+      if (suggestions.length) {
+        await msg.reply(
+          `Unbekannter Befehl \`${config.prefix}${name}\`. Meintest du: ${suggestions
+            .map((s) => `\`${config.prefix}${s}\` / \`/${s}\``)
+            .join(", ")}?\nÜbersicht: \`/help\` oder \`${config.prefix}help\``
+        );
+      } else {
+        await msg.reply(
+          `Unbekannter Befehl. Übersicht: \`/help\` oder \`${config.prefix}help\``
+        );
+      }
+      return;
+    }
 
     if (cmd.admin && msg.author.id !== config.adminId) {
       await msg.reply("Nope. Admin only.");
@@ -77,7 +129,7 @@ async function main() {
     }
 
     try {
-      await cmd.run(ctx, parts, msg);
+      await runCommand(ctx, cmd, parts, msg);
     } catch (e) {
       console.error(`[cmd ${name}]`, e);
       await msg.reply(`Fehler: ${e.message}`).catch(() => {});

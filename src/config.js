@@ -34,6 +34,7 @@ function loadConfig() {
     token: required("TOKEN"),
     prefix: optional("PREFIX", "!"),
     adminId: required("ADMIN_ID"),
+    discordGuildId: optional("DISCORD_GUILD_ID", ""),
     channelDeathpool: required("CHANNEL_DEATHPOOL"),
     channelAllDeaths: optional("CHANNEL_ALL_DEATHS", ""),
     wikiPollerMinutes: intEnv("WIKI_POLLER_MINUTES", 30),

@@ -2,11 +2,18 @@ const db = require("../../db");
 const { runWikiPoll } = require("../../jobs/wiki-poll");
 const { formatReconcileSummary } = require("../announce");
 
-module.exports = {
+const cmd = {
   name: "check",
   aliases: ["reconcile"],
   admin: true,
+  group: "season",
   description: "Wiki-Check: Setup=stiller Abgleich, Live=sofortiger Poll",
+  usage: "/check\n{prefix}check",
+  examples: ["/check", "{prefix}check"],
+  details: "Im Setup keine Channel-Ankündigungen; Zusammenfassung per DM.",
+  parseSlash() {
+    return [];
+  },
   async run(ctx, args, msg) {
     const season = db.getActiveSeason();
     if (!season.live) {
@@ -18,7 +25,7 @@ module.exports = {
       try {
         await msg.author.send(summary);
         await msg.reply(
-          `Fertig: **${hits.length}** Todesfälle nachgetragen. Zusammenfassung per DM. Danach \`!scores\` / \`!go\`.`
+          `Fertig: **${hits.length}** Todesfälle nachgetragen. Zusammenfassung per DM. Danach \`/scores\` / \`/go\`.`
         );
       } catch {
         await msg.reply(summary);
@@ -35,3 +42,5 @@ module.exports = {
     }
   },
 };
+
+module.exports = cmd;
