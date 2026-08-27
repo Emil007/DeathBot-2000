@@ -49,11 +49,27 @@ function listRestoreCandidates(config) {
     .map((f) => ({ name: f, path: path.join(config.restoreDir, f) }));
 }
 
+function safeJoinDir(dir, fileName) {
+  const base = path.basename(String(fileName || ""));
+  if (!base || base === "." || base === "..") return null;
+  const root = path.resolve(dir);
+  const resolved = path.resolve(root, base);
+  const rel = path.relative(root, resolved);
+  if (rel.startsWith("..") || path.isAbsolute(rel)) return null;
+  return resolved;
+}
+
 function findPackage(config, fileName) {
-  const inRestore = path.join(config.restoreDir, fileName);
-  if (fs.existsSync(inRestore)) return inRestore;
-  const inBackups = path.join(config.backupsDir, fileName);
-  if (fs.existsSync(inBackups)) return inBackups;
+  const raw = String(fileName || "").trim();
+  if (!raw) throw new Error("Package name required");
+  // Basename only — reject traversal / separators
+  if (raw.includes("..") || /[\\/]/.test(raw) || path.basename(raw) !== raw) {
+    throw new Error("Invalid package name (use basename only, e.g. backup.zip)");
+  }
+  for (const dir of [config.restoreDir, config.backupsDir]) {
+    const candidate = safeJoinDir(dir, raw);
+    if (candidate && fs.existsSync(candidate)) return candidate;
+  }
   return null;
 }
 

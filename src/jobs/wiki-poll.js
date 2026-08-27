@@ -183,9 +183,16 @@ async function runWikiPoll(client, config, { mode = "live" } = {}) {
 
 function startWikiPoller(client, config) {
   let busy = false;
+  let nightlyPending = false;
 
   const tick = async (forcedMode) => {
-    if (busy) return;
+    if (busy) {
+      if (forcedMode === "nightly") {
+        nightlyPending = true;
+        console.log("[nightly] deferred — poller busy, will retry after current job");
+      }
+      return;
+    }
     busy = true;
     try {
       if (forcedMode) {
@@ -201,6 +208,13 @@ function startWikiPoller(client, config) {
       console.error("[poll] failed", e);
     } finally {
       busy = false;
+      if (nightlyPending) {
+        nightlyPending = false;
+        setImmediate(() => {
+          console.log(new Date().toISOString(), "[nightly] running deferred full-year scrape");
+          tick("nightly");
+        });
+      }
     }
   };
 

@@ -25,8 +25,19 @@ const cmd = {
     if (!q) return msg.reply(usageReply(cmd, ctx.config));
     const found = db.findCelebByName(q);
     if (found.length !== 1) return msg.reply(found.length ? "Ambiguous." : "Not found.");
-    db.setExcludeFromAuto(found[0].id, false);
-    await msg.reply(`**${found[0].name}** included in auto wiki matching again.`);
+    const c = found[0];
+    if (!c.wiki_confirmed) {
+      return msg.reply(
+        `**${c.name}** ist noch nicht wiki-bestätigt. Zuerst \`/review\` oder \`/wiki\` — Include umgeht das nicht.`
+      );
+    }
+    if (c.manual_only) {
+      return msg.reply(
+        `**${c.name}** ist manual-only. Auto-Match geht nur nach \`/wiki\` mit echter URL (nicht none).`
+      );
+    }
+    db.setExcludeFromAuto(c.id, false);
+    await msg.reply(`**${c.name}** wieder im Auto-Wiki-Matching.`);
   },
 };
 

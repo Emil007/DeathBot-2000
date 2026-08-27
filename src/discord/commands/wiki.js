@@ -66,11 +66,15 @@ const cmd = {
       const confirmed = db.applyWikiConfirm(celeb.id, {
         wikiUrl: proposal.wikiUrl,
         wikiNorm: proposal.wikiNorm,
+        wikiUrlDe: proposal.wikiUrlDe || null,
+        wikidataId: proposal.qid || null,
         age: proposal.proposedAge ?? celeb.age_at_pick,
         manualOnly: false,
       });
       await msg.reply(
-        `Wiki für **${confirmed.name}**: ${confirmed.wiki_url}\nAlter zum Saisonstart: **${confirmed.age_at_pick ?? "?"}** (Auto-Match an).`
+        `Wiki für **${confirmed.name}**: ${confirmed.wiki_url}` +
+          (confirmed.wikidata_id ? ` · ${confirmed.wikidata_id}` : "") +
+          `\nAlter zum Saisonstart: **${confirmed.age_at_pick ?? "?"}** (Auto-Match an).`
       );
     } catch (e) {
       await msg.reply(`Fehlgeschlagen: ${e.message}`);

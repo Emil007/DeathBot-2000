@@ -70,7 +70,10 @@ async function main() {
         return;
       }
 
-      await interaction.deferReply();
+      // Admin slash in guild channels: ephemeral so sheet/go/restore stay private.
+      // Player commands stay public. DMs are already private.
+      const ephemeral = Boolean(cmd.admin && interaction.guildId);
+      await interaction.deferReply({ ephemeral });
       const msg = fromInteraction(interaction);
       const args = typeof cmd.parseSlash === "function" ? cmd.parseSlash(interaction) : [];
       await runCommand(ctx, cmd, args, msg);

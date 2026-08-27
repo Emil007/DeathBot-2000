@@ -30,16 +30,21 @@ CREATE TABLE IF NOT EXISTS celebs (
   wiki_url TEXT,
   wiki_url_norm TEXT,
   wiki_url_de TEXT,
+  wikidata_id TEXT,
   wiki_confirmed INTEGER NOT NULL DEFAULT 0,
   manual_only INTEGER NOT NULL DEFAULT 0,
   exclude_from_auto INTEGER NOT NULL DEFAULT 0,
   death_confirmed INTEGER NOT NULL DEFAULT 0,
   death_detected_at TEXT,
-  death_source TEXT
+  death_source TEXT,
+  death_list_url TEXT
 );
 
 CREATE UNIQUE INDEX IF NOT EXISTS idx_celebs_wiki_url_norm
   ON celebs(wiki_url_norm) WHERE wiki_url_norm IS NOT NULL;
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_celebs_wikidata_id
+  ON celebs(wikidata_id) WHERE wikidata_id IS NOT NULL;
 
 CREATE TABLE IF NOT EXISTS celeb_review_queue (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -47,6 +52,7 @@ CREATE TABLE IF NOT EXISTS celeb_review_queue (
   proposed_wiki_url TEXT,
   proposed_age INTEGER,
   proposed_lang TEXT,
+  proposed_candidates TEXT,
   status TEXT NOT NULL DEFAULT 'pending',
   created_at TEXT NOT NULL DEFAULT (datetime('now')),
   updated_at TEXT NOT NULL DEFAULT (datetime('now')),
@@ -103,6 +109,16 @@ CREATE TABLE IF NOT EXISTS death_awards (
   FOREIGN KEY (player_id) REFERENCES players(id) ON DELETE CASCADE
 );
 
+CREATE UNIQUE INDEX IF NOT EXISTS idx_death_awards_celeb_player
+  ON death_awards(celeb_id, player_id);
+
+CREATE TABLE IF NOT EXISTS celeb_url_wait (
+  admin_user_id TEXT PRIMARY KEY,
+  celeb_id INTEGER NOT NULL,
+  expires_at TEXT NOT NULL,
+  FOREIGN KEY (celeb_id) REFERENCES celebs(id) ON DELETE CASCADE
+);
+
 CREATE TABLE IF NOT EXISTS wiki_seen (
   entry_id TEXT PRIMARY KEY,
   lang TEXT,
@@ -151,6 +167,8 @@ function migrate(db) {
   addCeleb("wiki_url_norm", "wiki_url_norm TEXT");
   addCeleb("wiki_url_de", "wiki_url_de TEXT");
   addCeleb("sheet_age_hint", "sheet_age_hint INTEGER");
+  addCeleb("wikidata_id", "wikidata_id TEXT");
+  addCeleb("death_list_url", "death_list_url TEXT");
 
   // Drop unique on name_key if present (SQLite: rebuild when legacy unique index exists)
   const indexes = db.prepare(`PRAGMA index_list(celebs)`).all();
@@ -179,12 +197,14 @@ function migrate(db) {
         wiki_url TEXT,
         wiki_url_norm TEXT,
         wiki_url_de TEXT,
+        wikidata_id TEXT,
         wiki_confirmed INTEGER NOT NULL DEFAULT 0,
         manual_only INTEGER NOT NULL DEFAULT 0,
         exclude_from_auto INTEGER NOT NULL DEFAULT 0,
         death_confirmed INTEGER NOT NULL DEFAULT 0,
         death_detected_at TEXT,
-        death_source TEXT
+        death_source TEXT,
+        death_list_url TEXT
       );
       INSERT INTO celebs_new (
         id, name, name_key, age_at_pick, sheet_age_hint, description, is_alive, died_at,
@@ -202,9 +222,28 @@ function migrate(db) {
     `);
   }
 
+  const reviewCols = cols("celeb_review_queue");
+  if (reviewCols.size && !reviewCols.has("proposed_candidates")) {
+    db.exec(`ALTER TABLE celeb_review_queue ADD COLUMN proposed_candidates TEXT`);
+  }
+
+  // Dedupe death_awards before unique index
+  db.exec(`
+    DELETE FROM death_awards
+    WHERE id NOT IN (
+      SELECT MIN(id) FROM death_awards GROUP BY celeb_id, player_id
+    );
+  `);
+
   db.exec(`
     CREATE UNIQUE INDEX IF NOT EXISTS idx_celebs_wiki_url_norm
       ON celebs(wiki_url_norm) WHERE wiki_url_norm IS NOT NULL;
+
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_celebs_wikidata_id
+      ON celebs(wikidata_id) WHERE wikidata_id IS NOT NULL;
+
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_death_awards_celeb_player
+      ON death_awards(celeb_id, player_id);
 
     CREATE TABLE IF NOT EXISTS celeb_review_queue (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -212,6 +251,7 @@ function migrate(db) {
       proposed_wiki_url TEXT,
       proposed_age INTEGER,
       proposed_lang TEXT,
+      proposed_candidates TEXT,
       status TEXT NOT NULL DEFAULT 'pending',
       created_at TEXT NOT NULL DEFAULT (datetime('now')),
       updated_at TEXT NOT NULL DEFAULT (datetime('now')),
@@ -226,6 +266,13 @@ function migrate(db) {
       awarded_at TEXT NOT NULL DEFAULT (datetime('now')),
       FOREIGN KEY (celeb_id) REFERENCES celebs(id) ON DELETE CASCADE,
       FOREIGN KEY (player_id) REFERENCES players(id) ON DELETE CASCADE
+    );
+
+    CREATE TABLE IF NOT EXISTS celeb_url_wait (
+      admin_user_id TEXT PRIMARY KEY,
+      celeb_id INTEGER NOT NULL,
+      expires_at TEXT NOT NULL,
+      FOREIGN KEY (celeb_id) REFERENCES celebs(id) ON DELETE CASCADE
     );
   `);
 }

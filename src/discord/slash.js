@@ -1,3 +1,4 @@
+const crypto = require("crypto");
 const {
   SlashCommandBuilder,
   ApplicationCommandOptionType,
@@ -58,8 +59,9 @@ function buildSlashCommand(cmd) {
       ApplicationIntegrationType.UserInstall
     );
 
-  // Admin visibility: enforced at runtime via ADMIN_ID (ephemeral deny).
-  // Do not use Discord role permissions — bot admin may lack ManageGuild.
+  // Admin visibility: runtime ADMIN_ID check. Discord cannot hide by user id.
+  // Optional ADMIN_ROLE_ID is documented only (no reliable role→picker mapping without
+  // tying to a Discord permission bit the role already has).
 
   if (cmd.subcommands?.length) {
     for (const sub of cmd.subcommands) {
@@ -82,22 +84,57 @@ function buildSlashPayload(commands) {
     .map((c) => buildSlashCommand(c).toJSON());
 }
 
+function payloadHash(body) {
+  return crypto.createHash("sha256").update(JSON.stringify(body)).digest("hex");
+}
+
 async function registerSlashCommands(client, config, commands) {
   const body = buildSlashPayload(commands);
+  const hash = payloadHash(body);
   const app = client.application;
   if (!app) throw new Error("client.application missing — register after ready");
 
-  // Global: DMs + any guild (propagation can take time).
-  await app.commands.set(body);
-  console.log(`[slash] Registered ${body.length} global commands (incl. DM contexts)`);
+  const db = require("../db");
+  const prev = db
+    .getDb()
+    .prepare(`SELECT value FROM meta WHERE key = 'slash_commands_hash'`)
+    .get()?.value;
+
+  if (prev !== hash) {
+    await app.commands.set(body);
+    db.getDb()
+      .prepare(
+        `INSERT INTO meta (key, value) VALUES ('slash_commands_hash', ?)
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value`
+      )
+      .run(hash);
+    console.log(`[slash] Updated ${body.length} global commands (hash changed)`);
+  } else {
+    console.log(`[slash] Global commands unchanged (hash ${hash.slice(0, 8)}…)`);
+  }
 
   if (config.discordGuildId) {
     const guild = await client.guilds.fetch(config.discordGuildId).catch(() => null);
     if (!guild) {
       console.warn(`[slash] DISCORD_GUILD_ID=${config.discordGuildId} not found / bot not in guild`);
     } else {
-      await guild.commands.set(body);
-      console.log(`[slash] Registered ${body.length} guild commands on ${guild.name} (instant)`);
+      const gPrev = db
+        .getDb()
+        .prepare(`SELECT value FROM meta WHERE key = 'slash_guild_hash'`)
+        .get()?.value;
+      const gKey = `${config.discordGuildId}:${hash}`;
+      if (gPrev !== gKey) {
+        await guild.commands.set(body);
+        db.getDb()
+          .prepare(
+            `INSERT INTO meta (key, value) VALUES ('slash_guild_hash', ?)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value`
+          )
+          .run(gKey);
+        console.log(`[slash] Updated ${body.length} guild commands on ${guild.name}`);
+      } else {
+        console.log(`[slash] Guild commands unchanged on ${guild.name}`);
+      }
     }
   } else {
     console.log("[slash] No DISCORD_GUILD_ID — guild picker updates may lag until global propagates");

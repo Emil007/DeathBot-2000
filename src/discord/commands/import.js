@@ -134,11 +134,12 @@ async function finalize(ctx, msg, wait, text) {
   );
 
   if (reviewIds.length) {
-    try {
-      await queueCelebsForReview(ctx, reviewIds, await msg.author.createDM());
-    } catch {
-      await queueCelebsForReview(ctx, reviewIds, msg.channel);
-    }
+    const { resolveAdminTarget } = require("../admin-notify");
+    const target = await resolveAdminTarget(ctx, {
+      preferDmUser: msg.author,
+      fallbackChannel: msg.channel,
+    });
+    await queueCelebsForReview(ctx, reviewIds, target || msg.channel);
   }
   return true;
 }

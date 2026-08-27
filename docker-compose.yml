@@ -15,6 +15,11 @@ services:
       # Optional all-deaths channel (never pings). Comment in and set an id to enable:
       # CHANNEL_ALL_DEATHS: "PUT_ALL_DEATHS_CHANNEL_ID_HERE"
       CHANNEL_ALL_DEATHS: ""
+      # Optional admin ops channel (wiki/age review + long admin summaries). Empty = DM-first:
+      # CHANNEL_ADMIN: "PUT_ADMIN_CHANNEL_ID_HERE"
+      CHANNEL_ADMIN: ""
+      # Optional: documented only — Discord cannot hide slash cmds by ADMIN_ID alone
+      # ADMIN_ROLE_ID: ""
       WIKI_POLLER_MINUTES: "30"
       DAILY_SUMMARY_HOUR: "9"
       DATA_DIR: "/app/data"

@@ -17,7 +17,6 @@ function normalizeWikiUrl(url) {
     const lang = parsed.hostname.split(".")[0];
     let path = parsed.pathname;
     if (!path.startsWith("/wiki/")) return null;
-    // Decode then re-encode consistently
     const title = decodeURIComponent(path.replace(/^\/wiki\//, "")).replace(/ /g, "_");
     return {
       url: `https://${lang}.wikipedia.org/wiki/${encodeURIComponent(title).replace(/%2F/gi, "/")}`,
@@ -44,7 +43,6 @@ function ageAtDate(birthIso, onDateIso) {
 }
 
 function parseWikidataTime(time) {
-  // +1947-09-14T00:00:00Z
   if (!time) return null;
   const m = String(time).match(/([+-]?\d{4})-(\d{2})-(\d{2})/);
   if (!m) return null;
@@ -66,24 +64,52 @@ async function searchWikipedia(client, lang, query) {
   const hits = data?.query?.search || [];
   return hits.map((h) => ({
     title: h.title,
+    snippet: (h.snippet || "").replace(/<[^>]+>/g, ""),
     url: `https://${lang}.wikipedia.org/wiki/${encodeURIComponent(h.title.replace(/ /g, "_"))}`,
     lang,
   }));
 }
 
-async function getWikidataBirth(client, qid) {
+async function getWikidataEntity(client, qid) {
   if (!qid) return null;
   const { data } = await client.get("https://www.wikidata.org/w/api.php", {
     params: {
       action: "wbgetentities",
       ids: qid,
-      props: "claims",
+      props: "claims|sitelinks",
       format: "json",
       origin: "*",
     },
   });
-  const claim = data?.entities?.[qid]?.claims?.P569?.[0]?.mainsnak?.datavalue?.value;
+  return data?.entities?.[qid] || null;
+}
+
+async function getWikidataBirth(client, qid) {
+  const entity = await getWikidataEntity(client, qid);
+  const claim = entity?.claims?.P569?.[0]?.mainsnak?.datavalue?.value;
   return parseWikidataTime(claim?.time);
+}
+
+function sitelinksFromEntity(entity) {
+  if (!entity?.sitelinks) return { en: null, de: null };
+  const en = entity.sitelinks.enwiki;
+  const de = entity.sitelinks.dewiki;
+  return {
+    en: en
+      ? {
+          title: en.title,
+          url: `https://en.wikipedia.org/wiki/${encodeURIComponent(en.title.replace(/ /g, "_"))}`,
+          norm: `en:${en.title.replace(/ /g, "_").toLowerCase()}`,
+        }
+      : null,
+    de: de
+      ? {
+          title: de.title,
+          url: `https://de.wikipedia.org/wiki/${encodeURIComponent(de.title.replace(/ /g, "_"))}`,
+          norm: `de:${de.title.replace(/ /g, "_").toLowerCase()}`,
+        }
+      : null,
+  };
 }
 
 async function getPageMeta(client, lang, titleOrUrl) {
@@ -109,8 +135,14 @@ async function getPageMeta(client, lang, titleOrUrl) {
   const page = Object.values(data?.query?.pages || {})[0];
   if (!page || page.missing != null) return null;
   const qid = page.pageprops?.wikibase_item || null;
-  const birth = await getWikidataBirth(client, qid);
-  const fullUrl = page.fullurl || `https://${lang}.wikipedia.org/wiki/${encodeURIComponent(page.title.replace(/ /g, "_"))}`;
+  const entity = qid ? await getWikidataEntity(client, qid) : null;
+  const birth = parseWikidataTime(
+    entity?.claims?.P569?.[0]?.mainsnak?.datavalue?.value?.time
+  );
+  const links = sitelinksFromEntity(entity);
+  const fullUrl =
+    page.fullurl ||
+    `https://${lang}.wikipedia.org/wiki/${encodeURIComponent(page.title.replace(/ /g, "_"))}`;
   const n = normalizeWikiUrl(fullUrl);
   return {
     title: page.title,
@@ -120,48 +152,119 @@ async function getPageMeta(client, lang, titleOrUrl) {
     qid,
     birthDate: birth,
     thumb: page.thumbnail?.source || null,
+    enLink: links.en,
+    deLink: links.de,
+  };
+}
+
+function proposalFromMeta(meta, seasonStartDate, sheetAge, candidates = []) {
+  if (!meta) {
+    return {
+      wikiUrl: null,
+      wikiNorm: null,
+      wikiUrlDe: null,
+      lang: null,
+      qid: null,
+      birthDate: null,
+      proposedAge: sheetAge ?? null,
+      sheetAge: sheetAge ?? null,
+      thumb: null,
+      title: null,
+      candidates,
+    };
+  }
+  const wikiAge = meta.birthDate ? ageAtDate(meta.birthDate, seasonStartDate) : null;
+  // Prefer EN biography URL when sitelink available
+  let wikiUrl = meta.url;
+  let wikiNorm = meta.norm;
+  let lang = meta.lang;
+  let wikiUrlDe = meta.deLink?.url || null;
+  if (meta.lang === "de" && meta.enLink) {
+    wikiUrl = meta.enLink.url;
+    wikiNorm = meta.enLink.norm;
+    lang = "en";
+    wikiUrlDe = meta.url;
+  } else if (meta.lang === "en") {
+    wikiUrlDe = meta.deLink?.url || null;
+  }
+  return {
+    wikiUrl,
+    wikiNorm,
+    wikiUrlDe,
+    lang,
+    qid: meta.qid || null,
+    birthDate: meta.birthDate || null,
+    proposedAge: wikiAge ?? sheetAge ?? null,
+    sheetAge: sheetAge ?? null,
+    thumb: meta.thumb || null,
+    title: meta.title || null,
+    candidates,
   };
 }
 
 /**
- * Propose EN (preferred) or DE wiki + age at season start.
+ * Propose EN (preferred) or DE wiki + age; include top search candidates.
  */
 async function proposeWikiForName(userAgent, name, seasonStartDate, sheetAge) {
   const client = createClient(userAgent);
-  let meta = null;
-  let lang = "en";
+  const candidates = [];
+  let primaryMeta = null;
 
   try {
     const enHits = await searchWikipedia(client, "en", name);
-    if (enHits[0]) meta = await getPageMeta(client, "en", enHits[0].title);
+    for (const hit of enHits.slice(0, 3)) {
+      try {
+        const meta = await getPageMeta(client, "en", hit.title);
+        if (!meta) continue;
+        const wikiAge = meta.birthDate ? ageAtDate(meta.birthDate, seasonStartDate) : null;
+        candidates.push({
+          title: meta.title,
+          url: meta.url,
+          norm: meta.norm,
+          lang: "en",
+          qid: meta.qid,
+          proposedAge: wikiAge ?? sheetAge ?? null,
+          thumb: meta.thumb,
+          snippet: hit.snippet || "",
+        });
+        if (!primaryMeta) primaryMeta = meta;
+      } catch (e) {
+        console.warn("[page-lookup] EN candidate", e.message);
+      }
+    }
   } catch (e) {
     console.warn("[page-lookup] EN search", e.message);
   }
 
-  if (!meta) {
+  if (!primaryMeta) {
     try {
       const deHits = await searchWikipedia(client, "de", name);
-      if (deHits[0]) {
-        meta = await getPageMeta(client, "de", deHits[0].title);
-        lang = "de";
+      for (const hit of deHits.slice(0, 3)) {
+        try {
+          const meta = await getPageMeta(client, "de", hit.title);
+          if (!meta) continue;
+          const wikiAge = meta.birthDate ? ageAtDate(meta.birthDate, seasonStartDate) : null;
+          candidates.push({
+            title: meta.title,
+            url: meta.enLink?.url || meta.url,
+            norm: meta.enLink?.norm || meta.norm,
+            lang: meta.enLink ? "en" : "de",
+            qid: meta.qid,
+            proposedAge: wikiAge ?? sheetAge ?? null,
+            thumb: meta.thumb,
+            snippet: hit.snippet || "",
+          });
+          if (!primaryMeta) primaryMeta = meta;
+        } catch (e) {
+          console.warn("[page-lookup] DE candidate", e.message);
+        }
       }
     } catch (e) {
       console.warn("[page-lookup] DE search", e.message);
     }
   }
 
-  // If DE page, try EN interwiki via sitelinks would need another call; keep DE for now
-  const wikiAge = meta?.birthDate ? ageAtDate(meta.birthDate, seasonStartDate) : null;
-  return {
-    wikiUrl: meta?.url || null,
-    wikiNorm: meta?.norm || null,
-    lang: meta?.lang || lang,
-    birthDate: meta?.birthDate || null,
-    proposedAge: wikiAge ?? sheetAge ?? null,
-    sheetAge: sheetAge ?? null,
-    thumb: meta?.thumb || null,
-    title: meta?.title || null,
-  };
+  return proposalFromMeta(primaryMeta, seasonStartDate, sheetAge, candidates);
 }
 
 async function lookupUrl(userAgent, url, seasonStartDate, sheetAge) {
@@ -170,17 +273,18 @@ async function lookupUrl(userAgent, url, seasonStartDate, sheetAge) {
   if (!norm) throw new Error("Need an en.wikipedia.org or de.wikipedia.org /wiki/ URL");
   const meta = await getPageMeta(client, norm.lang, norm.url);
   if (!meta) throw new Error("Wikipedia page not found");
-  const wikiAge = meta.birthDate ? ageAtDate(meta.birthDate, seasonStartDate) : null;
-  return {
-    wikiUrl: meta.url,
-    wikiNorm: meta.norm,
-    lang: meta.lang,
-    birthDate: meta.birthDate,
-    proposedAge: wikiAge ?? sheetAge ?? null,
-    sheetAge: sheetAge ?? null,
-    thumb: meta.thumb,
-    title: meta.title,
-  };
+  return proposalFromMeta(meta, seasonStartDate, sheetAge, [
+    {
+      title: meta.title,
+      url: meta.enLink?.url || meta.url,
+      norm: meta.enLink?.norm || meta.norm,
+      lang: meta.enLink ? "en" : meta.lang,
+      qid: meta.qid,
+      proposedAge: meta.birthDate ? ageAtDate(meta.birthDate, seasonStartDate) : sheetAge,
+      thumb: meta.thumb,
+      snippet: "",
+    },
+  ]);
 }
 
 module.exports = {

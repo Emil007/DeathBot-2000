@@ -1,5 +1,6 @@
 const db = require("../../db");
 const { sendNextReview } = require("../celeb-review");
+const { resolveAdminTarget } = require("../admin-notify");
 
 const cmd = {
   name: "review",
@@ -8,7 +9,8 @@ const cmd = {
   description: "Setzt die Wiki-/Alter-Review-Warteschlange fort",
   usage: "/review\n{prefix}review",
   examples: ["/review", "{prefix}review"],
-  details: "Nach /import erscheinen Karten mit Buttons; /review zeigt die nächste.",
+  details:
+    "Nach /import erscheinen Karten mit Buttons; /review zeigt die nächste. Mit CHANNEL_ADMIN landen Karten dort.",
   parseSlash() {
     return [];
   },
@@ -18,8 +20,17 @@ const cmd = {
       await msg.reply("Review-Warteschlange ist leer.");
       return;
     }
-    await msg.reply(`${n} offen. Nächste Karte:`);
-    await sendNextReview(ctx, msg.channel);
+    const target = await resolveAdminTarget(ctx, {
+      preferDmUser: null,
+      fallbackChannel: msg.channel,
+    });
+    await msg.reply(
+      `${n} offen. Nächste Karte` +
+        (ctx.config.channelAdmin && target?.id === ctx.config.channelAdmin
+          ? " im Admin-Kanal."
+          : ":")
+    );
+    await sendNextReview(ctx, target || msg.channel);
   },
 };
 
