@@ -50,7 +50,14 @@ async function pageHasDeathCategory(client, url) {
     if (r.status !== 200 || typeof r.data !== "string") {
       return { dead: false, status: r.status };
     }
-    const m = DEATH_REGEX.exec(r.data);
+    const html = String(r.data);
+    // Only the page's own category box — not body mentions of other death cats
+    const catBox =
+      html.match(/id="catlinks"[\s\S]*?<\/div><\/div>/i)?.[0] ||
+      html.match(/id="mw-normal-catlinks"[\s\S]*?<\/div>/i)?.[0] ||
+      "";
+    const haystack = catBox || html;
+    const m = DEATH_REGEX.exec(haystack);
     if (!m) return { dead: false, status: 200 };
     return { dead: true, category: m[1], status: 200 };
   } catch (e) {
@@ -89,6 +96,10 @@ async function checkUrlDead(userAgent, url) {
       return pageHasDeathCategory(client, url);
     }
     const cats = (page.categories || []).map((c) => c.title || "");
+    const living = cats.some((c) => {
+      const bare = c.replace(/^(Category|Kategorie):/i, "").trim();
+      return /^Living people$/i.test(bare) || /^Lebende Person$/i.test(bare);
+    });
     for (const c of cats) {
       if (/^\d{4} deaths$/i.test(c.replace(/^Category:/i, "").trim())) {
         return { dead: true, category: c, via: "api", lang, title };
@@ -97,8 +108,10 @@ async function checkUrlDead(userAgent, url) {
         return { dead: true, category: c, via: "api", lang, title };
       }
     }
-    const html = await pageHasDeathCategory(client, url);
-    return { ...html, lang, title };
+    // API answered with categories: trust it. Do not HTML-fallback (body text can
+    // mention other people's Category:YYYY_deaths / related deaths).
+    if (living) return { dead: false, via: "api-living", lang, title };
+    return { dead: false, via: "api", lang, title };
   } catch {
     return pageHasDeathCategory(client, url);
   }

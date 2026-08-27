@@ -30,6 +30,17 @@ function titleFromWikiPath(wikiPath) {
   return decodeURIComponent(String(wikiPath).replace(/^\/wiki\//, "").replace(/_/g, " "));
 }
 
+function escapeRegExp(s) {
+  return String(s).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+/** Whole-token match — avoids "un" hitting "under"/"June" (Kim Jong Un false positives). */
+function tokenInText(token, text) {
+  const t = String(token).toLowerCase();
+  if (!t) return false;
+  return new RegExp(`(?:^|[^a-z0-9])${escapeRegExp(t)}(?:[^a-z0-9]|$)`, "i").test(text);
+}
+
 function entryMatchesCeleb(entry, celeb, akas, blacklist) {
   const text = entry.text.toLowerCase();
   const nameLower = celeb.name.toLowerCase();
@@ -53,6 +64,16 @@ function entryMatchesCeleb(entry, celeb, akas, blacklist) {
       /* ignore */
     }
   }
+  if (celeb.wiki_url_de && linkTitle) {
+    try {
+      const storedPath = new URL(celeb.wiki_url_de).pathname.replace(/^\/wiki\//, "").replace(/_/g, " ").toLowerCase();
+      const storedKey = db.nameKey(storedPath);
+      const titleKey = db.nameKey(linkTitle);
+      if (storedKey && titleKey && storedKey === titleKey) return true;
+    } catch {
+      /* ignore */
+    }
+  }
 
   if (linkTitle) {
     const celebKey = db.nameKey(celeb.name);
@@ -65,6 +86,10 @@ function entryMatchesCeleb(entry, celeb, akas, blacklist) {
     }
   }
 
+  // Confirmed wiki identity: only match via article title/path above.
+  // Mentions in another person's death blurb ("… advisor to Kim Jong Un") must not kill the pick.
+  if (celeb.wiki_confirmed) return false;
+
   if (akas?.length) {
     if (akas.some((a) => text.includes(a.toLowerCase()))) return true;
     if (text.includes(nameLower)) return true;
@@ -76,7 +101,9 @@ function entryMatchesCeleb(entry, celeb, akas, blacklist) {
   const tokens = significantTokens(celeb.name);
   if (tokens.length === 0) return false;
   if (tokens.length === 1 && tokens[0].length < 4) return false;
-  return tokens.every((t) => text.includes(t));
+  // Require at least one "solid" token so short leftovers (Un, Li, …) can't carry a hit alone
+  if (!tokens.some((t) => t.length >= 3)) return false;
+  return tokens.every((t) => tokenInText(t, text));
 }
 
 function findPoolMatches(entries) {
@@ -106,5 +133,6 @@ module.exports = {
   findPoolMatches,
   significantTokens,
   titleFromWikiPath,
+  tokenInText,
   NAME_PARTICLES,
 };

@@ -437,6 +437,40 @@ function setExcludeFromAuto(celebId, exclude) {
   db.prepare("UPDATE celebs SET exclude_from_auto = ? WHERE id = ?").run(exclude ? 1 : 0, celebId);
 }
 
+/**
+ * Undo a bad death hit and/or void a pick without restarting the season.
+ * - Always excludes from auto-match
+ * - Retracts death awards if currently marked dead
+ * - Optionally removes all season picks for this celeb (cheat / invalid pick)
+ */
+function invalidateCeleb(celebId, { removePicks = false } = {}) {
+  const celeb = db.prepare("SELECT * FROM celebs WHERE id = ?").get(celebId);
+  if (!celeb) return null;
+
+  let retract = null;
+  if (!celeb.is_alive) {
+    retract = retractDeath(celebId);
+  }
+
+  setExcludeFromAuto(celebId, true);
+
+  let picksRemoved = 0;
+  if (removePicks) {
+    const season = getActiveSeason();
+    const info = db
+      .prepare("DELETE FROM picks WHERE celeb_id = ? AND season_id = ?")
+      .run(celebId, season.id);
+    picksRemoved = info.changes || 0;
+  }
+
+  return {
+    celeb: db.prepare("SELECT * FROM celebs WHERE id = ?").get(celebId),
+    retracted: Boolean(retract),
+    awardsUndone: retract?.awards?.length || 0,
+    picksRemoved,
+  };
+}
+
 function listBonuses() {
   return db.prepare("SELECT * FROM bonuses ORDER BY name COLLATE NOCASE").all();
 }
@@ -910,6 +944,7 @@ module.exports = {
   addBlacklist,
   removeBlacklist,
   setExcludeFromAuto,
+  invalidateCeleb,
   getWinnersForCeleb,
   applyDeath,
   retractDeath,
