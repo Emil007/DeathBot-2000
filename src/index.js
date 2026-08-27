@@ -7,6 +7,10 @@ const { loadConfig } = require("./config");
 const db = require("./db");
 const { loadCommands } = require("./discord/commands");
 const importCmd = require("./discord/commands/import");
+const {
+  handleReviewInteraction,
+  tryConsumeReviewUrl,
+} = require("./discord/celeb-review");
 const { startWikiPoller } = require("./jobs/wiki-poll");
 const { startDailySummary } = require("./jobs/daily-summary");
 const { startAutoBackup } = require("./backup");
@@ -35,8 +39,25 @@ async function main() {
     startAutoBackup(config);
   });
 
+  client.on("interactionCreate", async (interaction) => {
+    try {
+      await handleReviewInteraction(ctx, interaction);
+    } catch (e) {
+      console.error("[interaction]", e);
+      if (interaction.isRepliable() && !interaction.replied) {
+        await interaction.reply({ content: `Error: ${e.message}`, ephemeral: true }).catch(() => {});
+      }
+    }
+  });
+
   client.on("messageCreate", async (msg) => {
     if (msg.author.bot) return;
+
+    try {
+      if (await tryConsumeReviewUrl(ctx, msg)) return;
+    } catch (e) {
+      console.error("[review url]", e);
+    }
 
     try {
       if (await importCmd.tryConsumePaste(ctx, msg)) return;

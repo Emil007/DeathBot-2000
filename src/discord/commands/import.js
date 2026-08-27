@@ -1,9 +1,10 @@
 const axios = require("axios");
 const db = require("../../db");
 const { parseSheetTable } = require("../import-sheet");
+const { queueCelebsForReview } = require("../celeb-review");
 
 const pending = new Map();
-const DONE = /^(done|fertig|end|import)$/i;
+const DONE = /^(done|fertig|end)$/i;
 
 function applyImportRows(player, rows) {
   const season = db.getActiveSeason();
@@ -11,14 +12,14 @@ function applyImportRows(player, rows) {
   let deadAwarded = 0;
   const errors = [];
   const ageWarnings = [];
+  const reviewIds = [];
 
-  // Replace semantics: drop old picks for this season, then insert
   db.clearPicksForPlayer(player.id, season.id);
 
   const tx = db.getDb().transaction(() => {
     for (const row of rows) {
       try {
-        const { celeb, ageConflict } = db.findOrCreateCeleb({
+        const { celeb, ageConflict, created } = db.findOrCreateCeleb({
           name: row.name,
           age: row.age,
           description: row.description,
@@ -33,6 +34,12 @@ function applyImportRows(player, rows) {
 
         const fresh = db.getDb().prepare("SELECT * FROM celebs WHERE id = ?").get(celeb.id);
 
+        if (!fresh.wiki_confirmed) {
+          reviewIds.push(fresh.id);
+        } else if (created) {
+          reviewIds.push(fresh.id);
+        }
+
         if (row.diedAt && fresh.is_alive) {
           const result = db.applyDeath(celeb.id, {
             confirmed: true,
@@ -46,7 +53,7 @@ function applyImportRows(player, rows) {
             .prepare("SELECT 1 FROM death_awards WHERE celeb_id = ? AND player_id = ?")
             .get(celeb.id, player.id);
           if (!existing) {
-            const score = db.scoreForAge(fresh.age_at_pick);
+            const score = db.scoreForAge(fresh.age_at_pick ?? fresh.sheet_age_hint);
             if (score > 0) {
               db.addPoints(player.id, score);
               db.getDb()
@@ -65,32 +72,45 @@ function applyImportRows(player, rows) {
   });
   tx();
 
-  return { added, deadAwarded, errors, ageWarnings, season };
+  return {
+    added,
+    deadAwarded,
+    errors,
+    ageWarnings,
+    season,
+    reviewIds: [...new Set(reviewIds)],
+  };
 }
 
 async function readAttachmentText(attachment) {
   const name = (attachment.name || "").toLowerCase();
-  if (!/\.(tsv|csv|txt)$/i.test(name) && attachment.contentType && !/text|csv/i.test(attachment.contentType)) {
+  if (
+    !/\.(tsv|csv|txt)$/i.test(name) &&
+    attachment.contentType &&
+    !/text|csv/i.test(attachment.contentType)
+  ) {
     return null;
   }
-  const { data } = await axios.get(attachment.url, { responseType: "text", timeout: 20000 });
+  const { data } = await axios.get(attachment.url, {
+    responseType: "text",
+    timeout: 20000,
+  });
   return String(data);
 }
 
 module.exports = {
   name: "import",
   admin: true,
-  description: "Replace @User list: paste TSV (multi-message OK) or upload .tsv/.csv/.txt",
+  description: "Replace @User list; multi-paste until done, or upload file; then wiki review",
   async run(ctx, args, msg) {
     const mention = msg.mentions.users.first();
     if (!mention) {
       await msg.reply(
         [
           "Usage: `!import @User`",
-          "Then paste the sheet (tab-separated). You can send **multiple messages**; finish with `done`.",
-          "Or upload a `.tsv` / `.csv` / `.txt` file.",
-          "Required: **Name**, **Alter**. Points column ignored (`100 − age`). Optional: description, death date.",
-          "**Replaces** that player's picks for the active season.",
+          "Paste sheet rows (tab-separated). **Multiple messages** OK — finish with `done`.",
+          "Or upload `.tsv` / `.csv` / `.txt`.",
+          "Required: Name, Alter. Then wiki/age **review buttons** for new celebs.",
         ].join("\n")
       );
       return;
@@ -101,13 +121,12 @@ module.exports = {
       playerDiscordId: mention.id,
       displayName,
       chunks: [],
-      expires: Date.now() + 10 * 60 * 1000,
+      expires: Date.now() + 15 * 60 * 1000,
     });
     await msg.reply(
       [
-        `Import for **${displayName}** (<@${mention.id}>) — **replace** mode.`,
-        `Season start: **${season.start_date || "?"}**. Paste rows, more messages OK, then \`done\`. Or attach a file.`,
-        `Timeout 10 min.`,
+        `Import for **${displayName}** — replace mode.`,
+        `Season start **${season.start_date || "?"}**. Paste chunks, then type \`done\` (or attach a file).`,
       ].join("\n")
     );
   },
@@ -119,11 +138,13 @@ module.exports = {
       pending.delete(msg.author.id);
       return false;
     }
-    if (msg.content.startsWith(ctx.config.prefix) && !DONE.test(msg.content.slice(ctx.config.prefix.length).trim())) {
+    if (
+      msg.content.startsWith(ctx.config.prefix) &&
+      !DONE.test(msg.content.slice(ctx.config.prefix.length).trim())
+    ) {
       return false;
     }
 
-    // Attachment?
     const file = msg.attachments?.first();
     if (file) {
       try {
@@ -145,21 +166,15 @@ module.exports = {
       pending.delete(msg.author.id);
       const text = wait.chunks.join("\n");
       if (!text.trim()) {
-        await msg.reply("No rows received.");
+        await msg.reply("No rows received. Send lines then `done`.");
         return true;
       }
       return finalize(ctx, msg, wait, text);
     }
 
     wait.chunks.push(body);
-    wait.expires = Date.now() + 10 * 60 * 1000;
-    const combined = wait.chunks.join("\n");
-    const lineCount = combined.split(/\n/).filter((l) => l.trim()).length;
-    // Auto-finish when it already looks like a full table paste
-    if (lineCount >= 3 || (body.includes("\t") && body.includes("\n"))) {
-      pending.delete(msg.author.id);
-      return finalize(ctx, msg, wait, combined);
-    }
+    wait.expires = Date.now() + 15 * 60 * 1000;
+    const lineCount = wait.chunks.join("\n").split(/\n/).filter((l) => l.trim()).length;
     await msg.reply(`Buffered (~${lineCount} lines). Send more, or \`done\` to import.`);
     return true;
   },
@@ -177,18 +192,18 @@ async function finalize(ctx, msg, wait, text) {
     discordUserId: wait.playerDiscordId,
   });
 
-  const { added, deadAwarded, errors, ageWarnings, season } = applyImportRows(
+  const { added, deadAwarded, errors, ageWarnings, reviewIds } = applyImportRows(
     player,
     parsed.rows
   );
 
   await msg.reply(
     [
-      `✅ Import replaced list for <@${wait.playerDiscordId}> (**${wait.displayName}**)`,
-      `• Picks now: **${added}**`,
-      `• Already dead (sheet) + points: **${deadAwarded}**`,
+      `✅ List replaced for <@${wait.playerDiscordId}> (**${wait.displayName}**)`,
+      `• Picks: **${added}**`,
+      `• Sheet-dead + points: **${deadAwarded}**`,
       `• Points total: **${db.playerTotal(player.id)}**`,
-      season.live ? null : "_Setup: `!check` optional; `!go` auto-reconciles before live._",
+      `• Queued for wiki/age review: **${reviewIds.length}**`,
       ageWarnings.length
         ? `• Age kept (first wins):\n` + ageWarnings.slice(0, 8).map((w) => `  – ${w}`).join("\n")
         : null,
@@ -197,5 +212,14 @@ async function finalize(ctx, msg, wait, text) {
       .filter(Boolean)
       .join("\n")
   );
+
+  if (reviewIds.length) {
+    const target = msg.author;
+    try {
+      await queueCelebsForReview(ctx, reviewIds, await msg.author.createDM());
+    } catch {
+      await queueCelebsForReview(ctx, reviewIds, msg.channel);
+    }
+  }
   return true;
 }

@@ -50,11 +50,11 @@ async function processRetractions(client, config, poolEntries) {
 }
 
 /**
- * @param {'seed'|'reconcile'|'live'} mode
+ * @param {'seed'|'reconcile'|'live'|'nightly'} mode
  */
 async function runWikiPoll(client, config, { mode = "live" } = {}) {
   console.log(new Date().toISOString(), `[poll] mode=${mode}`);
-  // live polls: recent months only; reconcile/seed/check: full year
+  // live: recent months; everything else (incl. nightly): full year
   const scope = mode === "live" ? "recent" : "full";
   const { enEntries, deData, poolEntries } = await scrapeAll(config, scope);
 
@@ -132,7 +132,7 @@ async function runWikiPoll(client, config, { mode = "live" } = {}) {
     return { hits: [], seeded: true };
   }
 
-  if (mode === "live" && config.channelAllDeaths) {
+  if ((mode === "live" || mode === "nightly") && config.channelAllDeaths) {
     for (const e of newEn) {
       try {
         await announceAllDeath(client, config, e, { isDeOnly: false });
@@ -155,7 +155,7 @@ async function runWikiPoll(client, config, { mode = "live" } = {}) {
 
   const matches = findPoolMatches(poolEntries);
   const hits = [];
-  const announce = mode === "live";
+  const announce = mode === "live" || mode === "nightly";
   const confirmed = mode === "reconcile";
 
   for (const m of matches) {
@@ -173,7 +173,8 @@ async function runWikiPoll(client, config, { mode = "live" } = {}) {
     }
   }
 
-  if (mode === "live") {
+  // Retractions only on full-year scrapes (nightly) — never on recent-only live polls
+  if (mode === "nightly") {
     await processRetractions(client, config, poolEntries);
   }
 
@@ -207,6 +208,19 @@ function startWikiPoller(client, config) {
     const ms = config.wikiPollerMinutes * 60 * 1000;
     setInterval(() => tick(), ms);
   });
+
+  // Nightly full-year scrape: matching + all-deaths + safe retractions
+  const cron = require("node-cron");
+  const hour = Math.min(23, Math.max(0, config.nightlyFullScrapeHour));
+  cron.schedule(`0 ${hour} * * *`, () => {
+    if (!db.isLive()) {
+      console.log("[nightly] skipped (not live)");
+      return;
+    }
+    console.log(new Date().toISOString(), "[nightly] full-year scrape starting");
+    tick("nightly");
+  });
+  console.log(`[nightly] scheduled at hour ${hour}`);
 }
 
 module.exports = { runWikiPoll, startWikiPoller, scrapeAll };

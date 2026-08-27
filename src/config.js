@@ -47,6 +47,7 @@ function loadConfig() {
     alertEmoji: optional("ALERT_EMOJI", "⚰️"),
     alertEmojiRepeat: intEnv("ALERT_EMOJI_REPEAT", 3),
     deathConfirmDays: intEnv("DEATH_CONFIRM_DAYS", 7),
+    nightlyFullScrapeHour: intEnv("NIGHTLY_FULL_SCRAPE_HOUR", 3),
     userAgent: optional(
       "USER_AGENT",
       "DeathBot-2000/1.0 (Discord death pool bot; +https://github.com/Emil007/DeathBot-2000)"

@@ -21,67 +21,31 @@ docker compose up -d
 
 Image: `ghcr.io/emil007/deathbot-2000:latest`
 
-Durable files live under the data mount: database, backups, optional custom phrases, restore packages.
-
 ---
 
 ## What it does
 
-- Tracks each player’s celebrity list for the season
-- Scores hits as **100 − age** (age at season start; minimum 1). Sheet “points” columns are ignored
-- Announces deathpool hits with a Wikipedia portrait, a dark line, scores, and winner @mentions
-- Optionally announces every new Wikipedia death (English first, then German-only leftovers)
-- Daily “new since yesterday” summary (configurable hour)
-- Late-start safe: `!go` silently catches up history **before** going live (no Channel A spam)
-- Can retract a live hit if the person drops off Wikipedia death lists within a confirmation window (default 7 days). It does **not** auto-unkill someone who is still listed after 7 days — that window only locks the hit in
-
-Ambiguous names: prefer wiki link-title matches; otherwise name tokens with particles like *van* / *de* / *bin* stripped. For stubborn false positives use AKA, blacklist, or exclude (below).
+- One **celeb row per person** (identity = confirmed Wikipedia URL when set); players share via picks
+- After import: **wiki/age review** with Discord buttons before auto-matching
+- Scores hits as **100 − age at season start** (wiki birth date preferred; sheet age is a hint)
+- Deathpool announcements with portrait, dark Death-voice line, scores, winner @mentions
+- Optional all-deaths channel (no pings)
+- Frequent polls = **recent months** for near-realtime; **nightly full-year scrape** catches late edits on older month pages and runs retract checks safely
+- Late-start safe: `!go` silent-reconciles before live
+- Retract window (`DEATH_CONFIRM_DAYS`): undoes a hit **only if** the person leaves the wiki death lists within that window — not an auto-unkill while still listed
 
 ---
 
 ## Season workflow
 
-### New season or late join
+1. `!new-year confirm 2026-01-01` — setup mode, season start date  
+2. `!import @User` — paste sheet chunks, finish with **`done`** (or upload a file). Replaces that player’s picks.  
+3. **Review queue** (DM/buttons): Confirm · Wrong link · Set age · No wiki (manual only) · Skip  
+   - Until confirmed, celebs are **not** auto-matched  
+   - Same person on another list reuses the existing celeb row  
+4. `!go` — silent full-year catch-up → seed all-deaths → live  
 
-1. **Start a season** (setup — no public announcements yet):
-
-   ```
-   !new-year confirm
-   !new-year confirm 2026-01-01
-   ```
-
-   The date is the season start. List ages should be as of that day.
-
-2. **Import each player’s list** (replaces that player’s picks for the season):
-
-   ```
-   !import @User
-   ```
-
-   Paste a spreadsheet (tab-separated). You can send **several messages**, then `done`, or upload a `.tsv` / `.csv` / `.txt` file.  
-   Required: **Name**, **Alter**. Optional: description, death date (`28.02.2026` or `YYYY-MM-DD`).
-
-3. **Optional silent check**
-
-   ```
-   !check
-   ```
-
-   Same catch-up as step 4’s first phase. Summary by DM.
-
-4. **Go live** (auto-reconciles even if you skipped `!check`):
-
-   ```
-   !go
-   ```
-
-   Runs a full-year silent reconcile, seeds all-deaths so history is not dumped, then turns announcements on.
-
-### During the year
-
-The bot polls recent Wikipedia months on an interval. Force a live poll with `!check`.
-
-Year end: `!new-year confirm [YYYY-MM-DD]` writes a backup package, then starts a fresh season in setup mode.
+Optional: `!check` before `!go`. Resume review anytime with `!review`.
 
 ---
 
@@ -91,82 +55,62 @@ Year end: `!new-year confirm [YYYY-MM-DD]` writes a backup package, then starts 
 
 | Command | What it does |
 |---------|----------------|
-| `!liste` / `!mylist` | Your picks (prefers DM) |
+| `!liste` / `!mylist` | Your picks |
 | `!scores` | Leaderboard |
-| `!celeb Name` | Lookup (shows AKA / blacklist / exclude) |
-| `!help` | Command list |
+| `!celeb Name` | Lookup |
+| `!help` | Help |
 
 ### Admin — season & lists
 
 | Command | What it does |
 |---------|----------------|
-| `!import @User` | Replace that user’s list (multi-paste or file) |
-| `!check` | Setup: silent reconcile. Live: poll now |
-| `!go` | Silent reconcile → seed all-deaths → live |
-| `!season` / `!season YYYY-MM-DD` | Status / set start date |
-| `!new-year confirm [date]` | Backup + new season (setup) |
-| `!unlink @User` | Clear that user’s picks for the active season |
+| `!import @User` | Replace list (multi-message until `done`, or file) + queue review |
+| `!review` | Resume wiki/age review queue |
+| `!wiki Name <url\|none>` | Set/replace Wikipedia link, or manual-only |
+| `!age Name N` | Override age (blocked if death awards already exist) |
+| `!check` / `!go` / `!season` / `!new-year` / `!unlink` | As before |
 
 ### Admin — false positives
 
 | Command | What it does |
 |---------|----------------|
-| `!aka Name Alias…` / `!aka list Name` / `!unaka …` | Aliases for matching |
-| `!blacklist Name term…` / `!blacklist list Name` / `!unblacklist …` | Block match when all term words appear |
-| `!exclude Name` / `!include Name` | Stop / resume auto wiki matching |
+| `!aka` / `!unaka` / `!blacklist` / `!unblacklist` | Aliases / block terms |
+| `!exclude` / `!include` | Stop / resume auto match |
 
-Without blacklist/exclude, a bad match can be `!resurrect`ed and then killed again on the next poll.
+### Admin — scoring
 
-### Admin — scoring & misc
-
-| Command | What it does |
-|---------|----------------|
-| `!kill Name` / `!resurrect Name` | Manual death / undo (reverses points) |
-| `!add-points` / `!set-points` | Adjust base points |
-| `!bonus list` / `define` / `award` / `revoke` | Bonus definitions and awards |
-| `!players` | List players |
-| `!restore` / `!restore confirm file.zip` | Restore a backup package |
-
-Admin commands work in a server channel or in a DM with the bot.
+`!kill` / `!resurrect` / `!add-points` / `!set-points` / `!bonus` / `!players` / `!restore`
 
 ---
 
-## Backups and restore
+## Phrases
 
-- Automatic backups under `data/backups/`
-- `!new-year` also writes a season package there
-- Restore: put a `.zip` in `data/restore/` (or use a backups name), then `!restore confirm filename.zip`
+Built-in bank is dark first-person Death humor (German).  
+For lines too vicious to keep in the image, use:
 
----
+- `data/custom_phrases.txt` (one line per phrase)  
+- `CUSTOM_PHRASES=only` (or `mix`)
 
-## Custom phrases
-
-Optional: `data/custom_phrases.txt` (one line per phrase).  
 Placeholders: `{name}` `{age}` `{score}` `{winners}` `{losers}`
 
-`CUSTOM_PHRASES`: `no` (default) · `mix` · `only`
-
 ---
 
-## Settings (`environment` in compose)
+## Settings
 
 | Setting | Purpose |
 |---------|---------|
-| `TOKEN` | Bot token |
-| `ADMIN_ID` | Admin Discord user id |
-| `CHANNEL_DEATHPOOL` | Deathpool announcements |
-| `CHANNEL_ALL_DEATHS` | Optional all-deaths (empty = off) |
-| `PREFIX` | Default `!` |
-| `WIKI_POLLER_MINUTES` | Default `30` |
-| `DAILY_SUMMARY_HOUR` | Default `9` |
-| `DEATH_CONFIRM_DAYS` | Days a live hit stays retractable if it leaves wiki lists (default `7`) |
+| `TOKEN` / `ADMIN_ID` / `CHANNEL_DEATHPOOL` | Required |
+| `CHANNEL_ALL_DEATHS` | Optional all-deaths |
+| `WIKI_POLLER_MINUTES` | Recent-month poll interval (default `30`) |
+| `NIGHTLY_FULL_SCRAPE_HOUR` | Full-year scrape hour (default `3`) |
+| `DAILY_SUMMARY_HOUR` | Daily digest hour (default `9`) |
+| `DEATH_CONFIRM_DAYS` | Retract window if off wiki lists (default `7`) |
 | `CUSTOM_PHRASES` | `no` / `mix` / `only` |
-| `TZ` | Timezone for the daily summary |
-| `DATA_DIR` | Default `/app/data` |
+| `TZ` | Timezone for cron jobs |
 
 ---
 
-## Scoring note
+## Scoring
 
-Points always use **age at season start**: `max(1, 100 − age)`.  
-If two imports disagree on age, the **first** stored age wins (admin gets a warning). Wikipedia’s age at death is comparison-only in messages.
+`max(1, 100 − age_at_pick)`.  
+After wiki confirm, age comes from birth date + season start when available. Sheet “Punkte” ignored. Manual-only celebs never auto-kill — use `!kill` or sheet death dates.

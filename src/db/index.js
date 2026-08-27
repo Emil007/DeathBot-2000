@@ -99,6 +99,17 @@ function upsertPlayer({ displayName, discordUserId }) {
 function findOrCreateCeleb({ name, age, description }) {
   const key = nameKey(name);
   let celeb = db.prepare("SELECT * FROM celebs WHERE name_key = ?").get(key);
+  if (!celeb) {
+    celeb =
+      db
+        .prepare(
+          `SELECT c.* FROM celebs c
+           INNER JOIN celeb_aka a ON a.celeb_id = c.id
+           WHERE lower(a.alias) = lower(?) LIMIT 1`
+        )
+        .get(name) || null;
+  }
+
   if (celeb) {
     let ageConflict = null;
     if (
@@ -108,27 +119,164 @@ function findOrCreateCeleb({ name, age, description }) {
     ) {
       ageConflict = { existing: celeb.age_at_pick, incoming: Number(age) };
     }
-    // Keep first non-null age (season-global); never overwrite with later import
     db.prepare(
       `UPDATE celebs SET
         name = COALESCE(?, name),
+        sheet_age_hint = COALESCE(?, sheet_age_hint),
         age_at_pick = COALESCE(age_at_pick, ?),
         description = COALESCE(?, description)
        WHERE id = ?`
-    ).run(name, age ?? null, description || null, celeb.id);
+    ).run(name, age ?? null, age ?? null, description || null, celeb.id);
+    if (nameKey(name) !== celeb.name_key) {
+      db.prepare("INSERT OR IGNORE INTO celeb_aka (celeb_id, alias) VALUES (?, ?)").run(
+        celeb.id,
+        name
+      );
+    }
     celeb = db.prepare("SELECT * FROM celebs WHERE id = ?").get(celeb.id);
-    return { celeb, ageConflict };
+    return { celeb, ageConflict, created: false };
   }
+
   const info = db
     .prepare(
-      `INSERT INTO celebs (name, name_key, age_at_pick, description, is_alive)
-       VALUES (?, ?, ?, ?, 1)`
+      `INSERT INTO celebs (
+         name, name_key, age_at_pick, sheet_age_hint, description, is_alive,
+         wiki_confirmed, manual_only, exclude_from_auto
+       ) VALUES (?, ?, ?, ?, ?, 1, 0, 0, 1)`
     )
-    .run(name, key, age ?? null, description || null);
+    .run(name, key, age ?? null, age ?? null, description || null);
   return {
     celeb: db.prepare("SELECT * FROM celebs WHERE id = ?").get(info.lastInsertRowid),
     ageConflict: null,
+    created: true,
   };
+}
+
+function findCelebByWikiNorm(norm) {
+  if (!norm) return null;
+  return db.prepare("SELECT * FROM celebs WHERE wiki_url_norm = ?").get(norm);
+}
+
+function enqueueReview(celebId, proposal) {
+  db.prepare(
+    `INSERT INTO celeb_review_queue (celeb_id, proposed_wiki_url, proposed_age, proposed_lang, status, updated_at)
+     VALUES (?, ?, ?, ?, 'pending', datetime('now'))
+     ON CONFLICT(celeb_id) DO UPDATE SET
+       proposed_wiki_url = excluded.proposed_wiki_url,
+       proposed_age = excluded.proposed_age,
+       proposed_lang = excluded.proposed_lang,
+       status = 'pending',
+       updated_at = datetime('now')`
+  ).run(
+    celebId,
+    proposal?.wikiUrl || null,
+    proposal?.proposedAge ?? null,
+    proposal?.lang || null
+  );
+  db.prepare(
+    `UPDATE celebs SET exclude_from_auto = 1, wiki_confirmed = 0 WHERE id = ? AND manual_only = 0`
+  ).run(celebId);
+}
+
+function nextPendingReview() {
+  return db
+    .prepare(
+      `SELECT q.*, c.name AS celeb_name, c.sheet_age_hint, c.age_at_pick, c.wiki_url, c.manual_only
+       FROM celeb_review_queue q
+       INNER JOIN celebs c ON c.id = q.celeb_id
+       WHERE q.status = 'pending'
+       ORDER BY q.id ASC
+       LIMIT 1`
+    )
+    .get();
+}
+
+function countPendingReviews() {
+  return db
+    .prepare(`SELECT COUNT(*) AS c FROM celeb_review_queue WHERE status = 'pending'`)
+    .get().c;
+}
+
+function markReviewStatus(celebId, status) {
+  db.prepare(
+    `UPDATE celeb_review_queue SET status = ?, updated_at = datetime('now') WHERE celeb_id = ?`
+  ).run(status, celebId);
+}
+
+function mergeCelebs(canonicalId, duplicateId) {
+  if (canonicalId === duplicateId) return canonicalId;
+  const tx = db.transaction(() => {
+    db.prepare(
+      `INSERT OR IGNORE INTO picks (player_id, celeb_id, season_id)
+       SELECT player_id, ?, season_id FROM picks WHERE celeb_id = ?`
+    ).run(canonicalId, duplicateId);
+    db.prepare(`DELETE FROM picks WHERE celeb_id = ?`).run(duplicateId);
+    db.prepare(
+      `INSERT OR IGNORE INTO celeb_aka (celeb_id, alias)
+       SELECT ?, alias FROM celeb_aka WHERE celeb_id = ?`
+    ).run(canonicalId, duplicateId);
+    const dup = db.prepare("SELECT name FROM celebs WHERE id = ?").get(duplicateId);
+    if (dup?.name) {
+      db.prepare("INSERT OR IGNORE INTO celeb_aka (celeb_id, alias) VALUES (?, ?)").run(
+        canonicalId,
+        dup.name
+      );
+    }
+    db.prepare(
+      `INSERT OR IGNORE INTO death_awards (celeb_id, player_id, points, awarded_at)
+       SELECT ?, player_id, points, awarded_at FROM death_awards WHERE celeb_id = ?`
+    ).run(canonicalId, duplicateId);
+    db.prepare(`DELETE FROM death_awards WHERE celeb_id = ?`).run(duplicateId);
+    db.prepare(`DELETE FROM celeb_review_queue WHERE celeb_id = ?`).run(duplicateId);
+    db.prepare(`DELETE FROM celebs WHERE id = ?`).run(duplicateId);
+  });
+  tx();
+  return canonicalId;
+}
+
+function applyWikiConfirm(celebId, { wikiUrl, wikiNorm, wikiUrlDe, age, manualOnly }) {
+  const existing = wikiNorm ? findCelebByWikiNorm(wikiNorm) : null;
+  if (existing && existing.id !== celebId) {
+    celebId = mergeCelebs(existing.id, celebId);
+  }
+
+  if (manualOnly) {
+    db.prepare(
+      `UPDATE celebs SET
+         manual_only = 1,
+         wiki_confirmed = 1,
+         exclude_from_auto = 1,
+         wiki_url = NULL,
+         wiki_url_norm = NULL,
+         age_at_pick = COALESCE(?, age_at_pick, sheet_age_hint)
+       WHERE id = ?`
+    ).run(age ?? null, celebId);
+  } else {
+    db.prepare(
+      `UPDATE celebs SET
+         manual_only = 0,
+         wiki_confirmed = 1,
+         exclude_from_auto = 0,
+         wiki_url = ?,
+         wiki_url_norm = ?,
+         wiki_url_de = COALESCE(?, wiki_url_de),
+         age_at_pick = COALESCE(?, age_at_pick, sheet_age_hint)
+       WHERE id = ?`
+    ).run(wikiUrl || null, wikiNorm || null, wikiUrlDe || null, age ?? null, celebId);
+  }
+  markReviewStatus(celebId, "done");
+  return db.prepare("SELECT * FROM celebs WHERE id = ?").get(celebId);
+}
+
+function setCelebAge(celebId, age) {
+  const awards = db
+    .prepare("SELECT COUNT(*) AS c FROM death_awards WHERE celeb_id = ?")
+    .get(celebId).c;
+  if (awards > 0) {
+    return { ok: false, reason: "awards_exist", awards };
+  }
+  db.prepare("UPDATE celebs SET age_at_pick = ? WHERE id = ?").run(age, celebId);
+  return { ok: true, celeb: db.prepare("SELECT * FROM celebs WHERE id = ?").get(celebId) };
 }
 
 function clearPicksForPlayer(playerId, seasonId) {
@@ -239,7 +387,13 @@ function setPick(playerId, celebId, seasonId) {
 
 function getAliveCelebsForAuto() {
   return db
-    .prepare(`SELECT * FROM celebs WHERE is_alive = 1 AND exclude_from_auto = 0`)
+    .prepare(
+      `SELECT * FROM celebs
+       WHERE is_alive = 1
+         AND exclude_from_auto = 0
+         AND manual_only = 0
+         AND wiki_confirmed = 1`
+    )
     .all();
 }
 
@@ -432,8 +586,8 @@ function getPlayerPicks(discordUserId) {
 
 function findCelebByName(query) {
   const key = nameKey(query);
-  let celeb = db.prepare("SELECT * FROM celebs WHERE name_key = ?").get(key);
-  if (celeb) return [celeb];
+  const exact = db.prepare("SELECT * FROM celebs WHERE name_key = ?").all(key);
+  if (exact.length) return exact;
   return db
     .prepare(`SELECT * FROM celebs WHERE name_key LIKE ? ORDER BY name COLLATE NOCASE LIMIT 10`)
     .all(`%${key}%`);
@@ -531,6 +685,14 @@ module.exports = {
   scoreForAge,
   upsertPlayer,
   findOrCreateCeleb,
+  findCelebByWikiNorm,
+  enqueueReview,
+  nextPendingReview,
+  countPendingReviews,
+  markReviewStatus,
+  mergeCelebs,
+  applyWikiConfirm,
+  setCelebAge,
   clearPicksForPlayer,
   setPick,
   getAliveCelebsForAuto,

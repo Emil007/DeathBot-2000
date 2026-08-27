@@ -41,8 +41,19 @@ function entryMatchesCeleb(entry, celeb, akas, blacklist) {
     }
   }
 
-  // Prefer wiki link title equality when available
+  // Prefer stored wiki identity: death-list link title vs confirmed wiki path
   const linkTitle = titleFromWikiPath(entry.wikiPath).toLowerCase();
+  if (celeb.wiki_url && linkTitle) {
+    try {
+      const storedPath = new URL(celeb.wiki_url).pathname.replace(/^\/wiki\//, "").replace(/_/g, " ").toLowerCase();
+      const storedKey = db.nameKey(storedPath);
+      const titleKey = db.nameKey(linkTitle);
+      if (storedKey && titleKey && storedKey === titleKey) return true;
+    } catch {
+      /* ignore */
+    }
+  }
+
   if (linkTitle) {
     const celebKey = db.nameKey(celeb.name);
     const titleKey = db.nameKey(linkTitle);
@@ -60,13 +71,10 @@ function entryMatchesCeleb(entry, celeb, akas, blacklist) {
     return false;
   }
 
-  // Full name substring (strong)
   if (nameLower.length >= 5 && text.includes(nameLower)) return true;
 
-  // Significant tokens (particles stripped) — all must appear
   const tokens = significantTokens(celeb.name);
   if (tokens.length === 0) return false;
-  // Require at least 2 significant tokens for AND match, or 1 if that's all they have
   if (tokens.length === 1 && tokens[0].length < 4) return false;
   return tokens.every((t) => text.includes(t));
 }
