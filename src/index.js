@@ -2,6 +2,7 @@ const {
   Client,
   GatewayIntentBits,
   Partials,
+  MessageFlags,
 } = require("discord.js");
 const { loadConfig } = require("./config");
 const db = require("./db");
@@ -18,6 +19,12 @@ const { suggestCommands } = require("./discord/usage");
 const { startWikiPoller } = require("./jobs/wiki-poll");
 const { startDailySummary } = require("./jobs/daily-summary");
 const { startAutoBackup } = require("./backup");
+
+const EPHEMERAL = { flags: MessageFlags.Ephemeral };
+
+function isUnknownInteraction(err) {
+  return err?.code === 10062 || err?.rawError?.code === 10062;
+}
 
 async function runCommand(ctx, cmd, args, msg) {
   await cmd.run(ctx, args, msg);
@@ -47,7 +54,8 @@ async function main() {
     } catch (e) {
       console.error("[slash] registration failed:", e);
     }
-    startWikiPoller(client, config);
+    // Let the gateway settle before the heavy startup seed (avoids missed 3s slash acks)
+    setTimeout(() => startWikiPoller(client, config), 1500);
     startDailySummary(client, config);
     startAutoBackup(config);
   });
@@ -61,30 +69,36 @@ async function main() {
 
       const cmd = commands.get(interaction.commandName);
       if (!cmd || cmd._aliasOf) {
-        await interaction.reply({ content: "Unbekannter Befehl. `/help`", ephemeral: true });
+        await interaction.reply({ content: "Unbekannter Befehl. `/help`", ...EPHEMERAL });
         return;
       }
 
       if (cmd.admin && interaction.user.id !== config.adminId) {
-        await interaction.reply({ content: "Nope. Nur Admin.", ephemeral: true });
+        await interaction.reply({ content: "Nope. Nur Admin.", ...EPHEMERAL });
         return;
       }
 
+      // Ack within Discord's ~3s window before any wiki/DB work
       // Admin slash in guild channels: ephemeral so sheet/go/restore stay private.
-      // Player commands stay public. DMs are already private.
       const ephemeral = Boolean(cmd.admin && interaction.guildId);
-      await interaction.deferReply({ ephemeral });
+      await interaction.deferReply(ephemeral ? EPHEMERAL : {});
       const msg = fromInteraction(interaction);
       const args = typeof cmd.parseSlash === "function" ? cmd.parseSlash(interaction) : [];
       await runCommand(ctx, cmd, args, msg);
     } catch (e) {
+      if (isUnknownInteraction(e)) {
+        console.warn(
+          "[interaction] Discord ack too late (Unknown interaction) — usually right after restart or during a heavy wiki scrape. Retry the command."
+        );
+        return;
+      }
       console.error("[interaction]", e);
       const text = `Fehler: ${e.message}`;
       if (interaction.isRepliable()) {
         if (interaction.deferred || interaction.replied) {
-          await interaction.followUp({ content: text, ephemeral: true }).catch(() => {});
+          await interaction.followUp({ content: text, ...EPHEMERAL }).catch(() => {});
         } else {
-          await interaction.reply({ content: text, ephemeral: true }).catch(() => {});
+          await interaction.reply({ content: text, ...EPHEMERAL }).catch(() => {});
         }
       }
     }
