@@ -8,6 +8,18 @@ function emojiBanner(config) {
   return Array(config.alertEmojiRepeat).fill(config.alertEmoji).join(" ");
 }
 
+/** Format "8. Oktober 2026" from entry.{day,month,year} — month from entry or now. */
+function formatDeathDate(entry) {
+  if (entry.day == null) return null;
+  const month = entry.month != null ? entry.month : new Date().getMonth();
+  const year = entry.year || new Date().getFullYear();
+  const MONTHS_DE = [
+    "Januar", "Februar", "März", "April", "Mai", "Juni",
+    "Juli", "August", "September", "Oktober", "November", "Dezember",
+  ];
+  return `${entry.day}. ${MONTHS_DE[month] || ""} ${year}`;
+}
+
 /**
  * Apply death + optional public announce.
  * Uses age_at_pick for scoring (100 - age), not wiki age.
@@ -134,6 +146,9 @@ async function announceAllDeath(client, config, entry, { isDeOnly = false } = {}
 
   const name = brief.name || entry.text.split(",")[0].trim();
   const detailLines = [];
+  // Death date from the monthly page's day heading (H3) + month/year flags.
+  const deathDateStr = formatDeathDate(entry);
+  if (deathDateStr) detailLines.push(`Gestorben: **${deathDateStr}**`);
   if (brief.lifespan || brief.age != null) {
     detailLines.push(
       [

@@ -9,6 +9,27 @@ function createClient(userAgent) {
   });
 }
 
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+/** Polite GET with retry/backoff on 429 + small jitter (Wikidata is rate-limit heavy). */
+async function getRetry(client, url, params, { tries = 3 } = {}) {
+  for (let i = 0; i < tries; i++) {
+    try {
+      const r = await client.get(url, { params });
+      if (r.status === 429) throw { response: { status: 429 } };
+      return r;
+    } catch (e) {
+      const code = e?.response?.status;
+      if (code === 429 && i < tries - 1) {
+        await sleep(600 * (i + 1) + Math.random() * 400);
+        continue;
+      }
+      throw e;
+    }
+  }
+  throw new Error("unreachable");
+}
+
 function parseWikiUrl(url) {
   try {
     const u = new URL(url);
@@ -68,8 +89,11 @@ function firstSentences(text, maxChars = 280) {
   if (!text) return null;
   let t = String(text).replace(/\s+/g, " ").trim();
   if (!t) return null;
-  // Drop pronunciation / IPA clutter at start
-  t = t.replace(/^\([^)]{0,80}\)\s*/, "");
+  // Drop pronunciation / IPA clutter that follows the name, e.g.
+  // "Hubert Colin de Verdière (French: [ybˈɛʁ …]) was…" -> keep what's useful
+  t = t.replace(/^\([^)]{0,120}\)\s*/g, "");
+  t = t.replace(/\s*\((?:French|German|English|Spanish|Italian|Russian|Dutch|Portuguese|Polish|Hungarian|Czech|Turkish|Arabic|Hebrew|Chinese|Japanese|Korean|Danish|Swedish|Norwegian|Finnish):\s*\[[^)]{0,120}\]\)/, "")
+     .replace(/\s*\((?:French|German|English|Spanish|Italian|Russian|Dutch|Portuguese|Polish|Hungarian|Czech|Turkish|Arabic|Hebrew|Chinese|Japanese|Korean|Danish|Swedish|Norwegian|Finnish)\s*/i, " ");
   const parts = t.split(/(?<=[.!?])\s+/);
   let out = "";
   for (const p of parts) {
@@ -81,6 +105,18 @@ function firstSentences(text, maxChars = 280) {
   }
   if (out.length > maxChars) out = out.slice(0, maxChars - 1).trim() + "…";
   return out || null;
+}
+
+/** Wikidata P18 filename -> Commons thumbnail URL via Special:FilePath. */
+function commonsThumbUrl(filename, width = 400) {
+  if (!filename) return null;
+  const safe = String(filename).replace(/ /g, "_");
+  return `https://commons.wikimedia.org/wiki/Special:FilePath/${encodeURIComponent(safe)}?width=${width}`;
+}
+
+function wikidataP18(claims) {
+  const c = claims?.P18?.[0]?.mainsnak?.datavalue?.value;
+  return typeof c === "string" && c.trim() ? c.trim() : null;
 }
 
 async function labelEntities(client, ids, langPrefer = "en") {
@@ -144,22 +180,20 @@ async function fetchDeathBrief(pageUrl, userAgent, { listText = null } = {}) {
   const client = createClient(userAgent);
   try {
     const api = `https://${parsed.lang}.wikipedia.org/w/api.php`;
-    const { data, status } = await client.get(api, {
-      params: {
-        action: "query",
-        titles: parsed.title,
-        prop: "extracts|pageprops|pageimages|description|info",
-        exintro: 1,
-        explaintext: 1,
-        exchars: 400,
-        pithumbsize: 500,
-        piprop: "thumbnail",
-        pilicense: "any",
-        inprop: "url",
-        redirects: 1,
-        format: "json",
-        origin: "*",
-      },
+    const { data, status } = await getRetry(client, api, {
+      action: "query",
+      titles: parsed.title,
+      prop: "extracts|pageprops|pageimages|description|info",
+      exintro: 1,
+      explaintext: 1,
+      exchars: 400,
+      pithumbsize: 500,
+      piprop: "thumbnail",
+      pilicense: "any",
+      inprop: "url",
+      redirects: 1,
+      format: "json",
+      origin: "*",
     });
     if (status !== 200) return fallback;
 
@@ -177,19 +211,20 @@ async function fetchDeathBrief(pageUrl, userAgent, { listText = null } = {}) {
     let death = null;
     let occupations = [];
     let wdDesc = null;
+    let p18File = null;
 
     if (qid) {
-      const { data: wd } = await client.get("https://www.wikidata.org/w/api.php", {
-        params: {
-          action: "wbgetentities",
-          ids: qid,
-          props: "claims|descriptions",
-          languages: `${parsed.lang}|en|de`,
-          format: "json",
-          origin: "*",
-        },
+      const { data: wd } = await getRetry(client, "https://www.wikidata.org/w/api.php", {
+        action: "wbgetentities",
+        ids: qid,
+        props: "claims|descriptions",
+        languages: `${parsed.lang}|en|de`,
+        format: "json",
+        origin: "*",
       });
       const entity = wd?.entities?.[qid];
+      // Wikidata portrait as image fallback when the article has no lead image
+      p18File = wikidataP18(entity?.claims);
       birth = parseWikidataTime(entity?.claims?.P569?.[0]?.mainsnak?.datavalue?.value?.time);
       death = parseWikidataTime(entity?.claims?.P570?.[0]?.mainsnak?.datavalue?.value?.time);
       const occIds = (entity?.claims?.P106 || [])
@@ -214,8 +249,14 @@ async function fetchDeathBrief(pageUrl, userAgent, { listText = null } = {}) {
     else if (deathYear) lifespan = `† ${deathYear}`;
     else if (birthYear) lifespan = `* ${birthYear}`;
 
+    const imgUrl = commonsThumbUrl(p18File);
+
     const knownFor =
-      (occupations.length ? occupations.join(", ") : null) || pageDesc || wdDesc || null;
+      (occupations.length ? occupations.join(", ") : null) ||
+      pageDesc ||
+      wdDesc ||
+      (extract ? firstSentences(extract, 160) : null) ||
+      null;
 
     // Prefer a short factual line that isn't just repeating the name
     let summary = wdDesc || pageDesc || extract;
@@ -231,7 +272,7 @@ async function fetchDeathBrief(pageUrl, userAgent, { listText = null } = {}) {
       birthYear,
       deathYear,
       lifespan,
-      thumb,
+      thumb: thumb || imgUrl,
       url: fullUrl,
     };
   } catch (e) {

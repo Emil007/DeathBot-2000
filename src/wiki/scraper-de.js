@@ -52,6 +52,8 @@ function extractFromLists($, lang) {
       .replace(/^\d+\.\s+\w+\.?\s+/, "");
     if (text.length < 5) return;
     if (/^Nekrolog\b/i.test(text)) return;
+    // Drop CSS/markup fragments leaked into list items
+    if (/(color:inherit|\{[^}]{2,}\}|^\.[a-z-]+\s*\{|^#\w+\s*\{)/i.test(text)) return;
 
     const id = `${lang}:${wikiPath}`;
     if (seen.has(id)) return;
@@ -108,6 +110,10 @@ function extractFromTables($, lang) {
     const tag = tds.eq(0).text().trim();
     const text = [nameText, age && `${age}`, beruf, tag].filter(Boolean).join(", ");
 
+    // Day-of-death: DE month tables put "8. Oktober" in the first column
+    // (with or without a year for entries from a different year).
+    const deathDate = parseDeDate(tag);
+
     const id = `${lang}:${wikiPath}`;
     if (seen.has(id)) return;
     seen.add(id);
@@ -117,9 +123,29 @@ function extractFromTables($, lang) {
       text,
       url: `https://${lang}.wikipedia.org${wikiPath}`,
       lang,
+      ...(deathDate ? { ...deathDate } : {}),
     });
   });
   return entries;
+}
+
+const MONTHS_DE_IDX = [
+  "Januar", "Februar", "März", "April", "Mai", "Juni",
+  "Juli", "August", "September", "Oktober", "November", "Dezember",
+];
+
+/** Parse "8. Oktober" (optionally "8. Oktober 2026") into {day,month[,year]}. */
+function parseDeDate(tag) {
+  if (!tag) return null;
+  const m = String(tag).match(/(\d{1,2})\s*\.\s*([A-Za-zäöüÄÖÜ]+)\s*(\d{4})?/);
+  if (!m) return null;
+  const month = MONTHS_DE_IDX.indexOf(m[2]);
+  if (month === -1) return null;
+  const day = parseInt(m[1], 10);
+  if (!(day >= 1 && day <= 31)) return null;
+  const out = { day, month };
+  if (m[3]) out.year = parseInt(m[3], 10);
+  return out;
 }
 
 async function scrapeUrl(client, url) {
