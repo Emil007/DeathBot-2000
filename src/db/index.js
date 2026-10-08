@@ -13,6 +13,16 @@ function openDb(config) {
   db.exec(SCHEMA);
   migrate(db);
   ensureActiveSeason();
+  try {
+    repairAnnouncedBursts();
+  } catch (e) {
+    console.warn("[db] announced-burst repair skipped:", e.message);
+  }
+  try {
+    pruneJunkAnnouncements();
+  } catch (e) {
+    console.warn("[db] junk-announcement prune skipped:", e.message);
+  }
   return db;
 }
 
@@ -839,19 +849,38 @@ function markWikiSeen(entry) {
   ).run(entry.id, entry.lang || null, entry.text || null, entry.url || null);
 }
 
-function markWikiAnnounced(entryId) {
-  db.prepare(`UPDATE wiki_seen SET announced_at = datetime('now') WHERE entry_id = ?`).run(entryId);
+/** Non-recent marker for entries handled by a seed (never actually posted). */
+const ANNOUNCED_EPOCH = "1970-01-01 00:00:00";
+
+function markWikiAnnounced(entryId, at = null) {
+  // Stamp only the FIRST successful announce. Re-scrapes (restart seed, re-poll)
+  // must never refresh announced_at, otherwise the daily summary counts every
+  // known entry as "new since yesterday" after every container restart.
+  const existing = db
+    .prepare("SELECT announced_at FROM wiki_seen WHERE entry_id = ?")
+    .get(entryId);
+  if (existing?.announced_at) return;
+  const ts = at || db.prepare("SELECT datetime('now') AS t").get().t;
+  db.prepare(`UPDATE wiki_seen SET announced_at = ? WHERE entry_id = ?`).run(ts, entryId);
   db.prepare(
-    `INSERT OR REPLACE INTO announced_deaths (entry_id, name, url, lang, announced_at)
-     SELECT entry_id, text, url, lang, datetime('now') FROM wiki_seen WHERE entry_id = ?`
-  ).run(entryId);
+    `INSERT OR IGNORE INTO announced_deaths (entry_id, name, url, lang, announced_at)
+     SELECT entry_id, text, url, lang, ? FROM wiki_seen WHERE entry_id = ?`
+  ).run(ts, entryId);
 }
 
 function seedAllWikiSeen(entries) {
   const tx = db.transaction((list) => {
     for (const e of list) {
       markWikiSeen(e);
-      markWikiAnnounced(e.id);
+      // Stamp every entry WITHOUT an announced_at with an EPOCH date rather than
+      // "now": a seed means "these entries already existed before live mode,
+      // don't re-post them". They must never show up in the daily summary as
+      // new, and never be re-announced. Entries that already have an
+      // announced_at (e.g. a failed live announce kept it NULL) are left alone.
+      const row = db
+        .prepare("SELECT announced_at FROM wiki_seen WHERE entry_id = ?")
+        .get(e.id);
+      if (!row?.announced_at) markWikiAnnounced(e.id, ANNOUNCED_EPOCH);
     }
   });
   tx(entries);
@@ -865,6 +894,73 @@ function deathsSinceHours(hours) {
        ORDER BY announced_at ASC`
     )
     .all(`-${hours} hours`);
+}
+
+/**
+ * One-time startup repair: pre-fix restart seeds stamped announced_at=now() for
+ * every row en-masse, which flooded the daily summary with thousands of "new"
+ * entries after each restart. Real Discord announces cannot exceed ~5/s (rate
+ * limit), so a same-second group larger than `limit` is a safe seed-pollution
+ * marker. Restamp those rows to the EPOCH marker (still marked "announced", so
+ * never re-posted, but permanently outside the 26h summary window).
+ */
+function repairAnnouncedBursts(limit = 20) {
+  const bursts = db
+    .prepare(
+      `SELECT announced_at AS ts, COUNT(*) AS c
+       FROM announced_deaths
+       WHERE announced_at IS NOT NULL
+       GROUP BY announced_at
+       HAVING COUNT(*) > ?`
+    )
+    .all(limit);
+  if (!bursts.length) return 0;
+  let fixed = 0;
+  for (const b of bursts) {
+    db.prepare(`UPDATE announced_deaths SET announced_at = ? WHERE announced_at = ?`).run(
+      ANNOUNCED_EPOCH,
+      b.ts
+    );
+    db.prepare(`UPDATE wiki_seen SET announced_at = ? WHERE announced_at = ?`).run(
+      ANNOUNCED_EPOCH,
+      b.ts
+    );
+    fixed += b.c;
+  }
+  console.log(new Date().toISOString(), `[db] repaired ${fixed} seed-burst announced rows`);
+  return fixed;
+}
+
+/**
+ * Drop announced entries that point to Wikipedia LIST/NAV pages (the Oct 2026 EN
+ * wiki split exposed them: "Previous months" div-col, footer navboxes, "List of
+ * days of the year" etc.). Those are never real person biographies and were
+ * mistakenly announced during the 08-Oct junk storm. Safe to hard-delete both
+ * tables: if a page is ever scraped again it is re-seeded to EPOCH, never
+ * re-announced.
+ */
+function pruneJunkAnnouncements() {
+  // entry_id format is "<lang>:/wiki/<path>" (e.g. en:/wiki/Deaths_in_1977).
+  const junkRE =
+    /^[a-z]{2}:\/wiki\/(Deaths_in_|Nekrolog|List_of_days|List_of_deaths|Lists_of_deaths|List_of_births|Lists_of_births|Category:|Template:|Help:|Wikipedia:|Portal:)/i;
+  const ids = db
+    .prepare(`SELECT entry_id FROM announced_deaths`)
+    .all()
+    .map((r) => r.entry_id)
+    .filter((id) => junkRE.test(id));
+  if (!ids.length) return 0;
+  const del = db.transaction((list) => {
+    for (const id of list) {
+      db.prepare(`DELETE FROM announced_deaths WHERE entry_id = ?`).run(id);
+      db.prepare(`DELETE FROM wiki_seen WHERE entry_id = ?`).run(id);
+    }
+  });
+  del(ids);
+  console.log(
+    new Date().toISOString(),
+    `[db] pruned ${ids.length} junk list-page announcements`
+  );
+  return ids.length;
 }
 
 function recordPhraseUse(hash) {
@@ -1055,6 +1151,8 @@ module.exports = {
   markWikiSeen,
   markWikiAnnounced,
   seedAllWikiSeen,
+  repairAnnouncedBursts,
+  pruneJunkAnnouncements,
   deathsSinceHours,
   recordPhraseUse,
   recentPhraseHashes,

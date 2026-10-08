@@ -236,10 +236,13 @@ async function announceDailySummary(client, config) {
   const en = rows.filter((r) => r.lang === "en");
   const de = rows.filter((r) => r.lang !== "en");
   let msg = `📋 **Tagesbericht** — ${rows.length} neue Einträge seit gestern\n\n`;
+  // URLs in <> suppress Discord's link preview/embed on every summary line.
+  const link = (e) =>
+    `[${(e.name || e.entry_id).split(",")[0]}](<${e.url}>)`;
   if (en.length) {
     msg += `🌍 **International:**\n`;
     en.slice(0, 20).forEach((e) => {
-      msg += `• [${(e.name || e.entry_id).split(",")[0]}](${e.url})\n`;
+      msg += `• ${link(e)}\n`;
     });
     if (en.length > 20) msg += `… +${en.length - 20}\n`;
     msg += "\n";
@@ -247,7 +250,7 @@ async function announceDailySummary(client, config) {
   if (de.length) {
     msg += `🇩🇪 **Nur DE / Regional:**\n`;
     de.slice(0, 15).forEach((e) => {
-      msg += `• [${(e.name || e.entry_id).split(",")[0]}](${e.url})\n`;
+      msg += `• ${link(e)}\n`;
     });
     if (de.length > 15) msg += `… +${de.length - 15}\n`;
   }
