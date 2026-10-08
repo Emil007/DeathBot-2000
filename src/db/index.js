@@ -876,7 +876,7 @@ function seedAllWikiSeen(entries) {
       // "now": a seed means "these entries already existed before live mode,
       // don't re-post them". They must never show up in the daily summary as
       // new, and never be re-announced. Entries that already have an
-      // announced_at (e.g. a failed live announce kept it NULL) are left alone.
+      // announced_at keep it untouched.
       const row = db
         .prepare("SELECT announced_at FROM wiki_seen WHERE entry_id = ?")
         .get(e.id);

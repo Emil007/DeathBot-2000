@@ -100,7 +100,15 @@ async function runWikiPollInner(client, config, { mode = "live" } = {}) {
   const newEn = [];
 
   for (const e of enEntries) {
-    if (db.isWikiSeen(e.id)) continue;
+    // Retry entries whose announce failed on an earlier poll: isWikiSeen alone
+    // isn't enough — a row stays "seen" without announced_at when the Discord
+    // send throws, and it would otherwise be silently skipped forever. Mirror
+    // the DE / bridged handling below (check announced_at, not just seen).
+    const row = db
+      .getDb()
+      .prepare("SELECT announced_at FROM wiki_seen WHERE entry_id = ?")
+      .get(e.id);
+    if (row?.announced_at) continue;
     db.markWikiSeen(e);
     newEn.push(e);
   }
@@ -306,7 +314,13 @@ function startWikiPoller(client, config) {
     }
   };
 
-  tick("seed").finally(() => {
+  // Boot: only seed when the pool is not yet live (fresh setup / pre-live). For
+  // an already-live bot a full seed here would stamp everything without
+  // announced_at to EPOCH — including deaths that appeared while the container
+  // was down — silently swallowing them as "already announced" and losing real
+  // posts. tick() without an argument already branches on db.isLive(), so a
+  // live restart now drains new deaths through a normal live poll instead.
+  tick().finally(() => {
     const ms = config.wikiPollerMinutes * 60 * 1000;
     setInterval(() => tick(), ms);
   });
