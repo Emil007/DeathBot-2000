@@ -18,5 +18,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 COPY --from=deps /app/node_modules ./node_modules
 COPY package.json package-lock.json ./
 COPY src ./src
-VOLUME ["/app/data"]
+# NOTE: no inline VOLUME for /app/data. Declaring it here auto-creates an
+# anonymous volume that shadows bind mounts declared in docker-compose on
+# older Docker daemons (20.10), so the bot would start with a fresh empty DB.
+# Data persistence belongs in the compose file (volume: ./data:/app/data).
 CMD ["node", "src/index.js"]
