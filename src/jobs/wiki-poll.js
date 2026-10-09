@@ -13,10 +13,46 @@ const {
 } = require("../discord/announce");
 const ops = require("../ops/status");
 
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+/**
+ * Retry a language scrape that returned 0 entries or threw (e.g. an
+ * ENETUNREACH / connect failure mid-poll), so a transient network hiccup
+ * doesn't silently empty one language until the next poll. 2 extra tries with
+ * backoff + warn-log every retry.
+ */
+async function scrapeLangRetry(fn, label, { tries = 3 } = {}) {
+  for (let attempt = 1; attempt <= tries; attempt++) {
+    let result;
+    try {
+      result = await fn();
+    } catch (e) {
+      console.warn(`[wiki] ${label} attempt ${attempt}/${tries} error: ${e.message}`);
+      if (attempt < tries) {
+        await sleep(700 * attempt + Math.random() * 500);
+        continue;
+      }
+      throw e;
+    }
+    const count = Array.isArray(result) ? result.length : (result?.entries || []).length;
+    if (count === 0 && attempt < tries) {
+      console.warn(
+        `[wiki] ${label} lieferte 0 Einträge (attempt ${attempt}/${tries}) – Retry mit Backoff`
+      );
+      await sleep(700 * attempt + Math.random() * 500);
+      continue;
+    }
+    if (count > 0 && attempt > 1) {
+      console.log(`[wiki] ${label} nach Retry wieder ${count} Einträge`);
+    }
+    return result;
+  }
+}
+
 async function scrapeAll(config, scope = "full") {
   const [enEntries, deData] = await Promise.all([
-    scrapeEn(config.userAgent, { scope }),
-    scrapeDe(config.userAgent, { scope }),
+    scrapeLangRetry(() => scrapeEn(config.userAgent, { scope }), "en"),
+    scrapeLangRetry(() => scrapeDe(config.userAgent, { scope }), "de"),
   ]);
   return { enEntries, deData, poolEntries: [...enEntries, ...deData.entries] };
 }

@@ -2,7 +2,7 @@ const { EmbedBuilder } = require("discord.js");
 const db = require("../db");
 const { pickPhrase } = require("../phrases");
 const { fetchBestImage } = require("../wiki/page-image");
-const { fetchDeathBrief, resolveDeathImage } = require("../wiki/death-brief");
+const { fetchDeathBrief, resolveDeathImage, personNameFromText, normalizeName, parseDeathDateText } = require("../wiki/death-brief");
 
 function emojiBanner(config) {
   return Array(config.alertEmojiRepeat).fill(config.alertEmoji).join(" ");
@@ -144,10 +144,19 @@ async function announceAllDeath(client, config, entry, { isDeOnly = false } = {}
     listText: entry.text,
   });
 
-  const name = brief.name || entry.text.split(",")[0].trim();
+  // If the linked article is NOT a person (band/org, e.g. "Died Pretty" for
+  // Chris Welsh), keep the human name from the death-list line as card title.
+  const listName = personNameFromText(entry.text);
+  const name =
+    brief.isHuman === false && listName
+      ? listName
+      : brief.name || listName;
+
   const detailLines = [];
-  // Death date from the monthly page's day heading (H3) + month/year flags.
-  const deathDateStr = formatDeathDate(entry);
+  // Death date always goes into the Kurzinfo: use the scraped day/month/year
+  // flags first, else parse the death-line text itself ("…, 8. Oktober").
+  const deathDateStr =
+    formatDeathDate(entry) || formatDeathDate(parseDeathDateText(entry.text));
   if (deathDateStr) detailLines.push(`Gestorben: **${deathDateStr}**`);
   if (brief.lifespan || brief.age != null) {
     detailLines.push(
@@ -233,12 +242,29 @@ async function announceDailySummary(client, config) {
     return;
   }
 
-  const en = rows.filter((r) => r.lang === "en");
-  const de = rows.filter((r) => r.lang !== "en");
-  let msg = `📋 **Tagesbericht** — ${rows.length} neue Einträge seit gestern\n\n`;
+  // Jede Person genau 1×: EN zuerst, DE nur wenn keine EN-Variante vorliegt.
+  // Namen werden bereinigt (Sonderzeichen am Ende) + akzent-insensitiv
+  // normalisiert, damit EN- und DE-Artikel derselben Person (z.B. Verne
+  // Allison) nicht doppelt auftauchen.
+  const listName = (e) => personNameFromText(e.name) || e.entry_id;
+  const normName = (e) => normalizeName(listName(e));
+  const en = [];
+  const enSeen = new Set();
+  for (const r of rows) {
+    if (r.lang !== "en") continue;
+    const k = normName(r);
+    if (enSeen.has(k)) continue;
+    enSeen.add(k);
+    en.push(r);
+  }
+  const deOnly = rows.filter((r) => {
+    if (r.lang === "en") return false;
+    return !enSeen.has(normName(r));
+  });
+  const uniqueTotal = en.length + deOnly.length;
+  let msg = `📋 **Tagesbericht** — ${uniqueTotal} neue Einträge seit gestern\n\n`;
   // URLs in <> suppress Discord's link preview/embed on every summary line.
-  const link = (e) =>
-    `[${(e.name || e.entry_id).split(",")[0]}](<${e.url}>)`;
+  const link = (e) => `[${listName(e)}](<${e.url}>)`;
   if (en.length) {
     msg += `🌍 **International:**\n`;
     en.slice(0, 20).forEach((e) => {
@@ -247,12 +273,12 @@ async function announceDailySummary(client, config) {
     if (en.length > 20) msg += `… +${en.length - 20}\n`;
     msg += "\n";
   }
-  if (de.length) {
+  if (deOnly.length) {
     msg += `🇩🇪 **Nur DE / Regional:**\n`;
-    de.slice(0, 15).forEach((e) => {
+    deOnly.slice(0, 15).forEach((e) => {
       msg += `• ${link(e)}\n`;
     });
-    if (de.length > 15) msg += `… +${de.length - 15}\n`;
+    if (deOnly.length > 15) msg += `… +${deOnly.length - 15}\n`;
   }
 
   await channel.send({

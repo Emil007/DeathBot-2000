@@ -85,6 +85,71 @@ function escapeRegExp(s) {
   return String(s).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
+const DE_MONTH_NAMES = [
+  "Januar", "Februar", "März", "April", "Mai", "Juni",
+  "Juli", "August", "September", "Oktober", "November", "Dezember",
+];
+const EN_MONTH_NAMES = [
+  "January", "February", "March", "April", "May", "June",
+  "July", "August", "September", "October", "November", "December",
+];
+
+/**
+ * Recognize "8. Oktober" / "8 Oktober" / "8 October 2026" inside entry text
+ * (DE death lines carry the day-of-death tag at the end: "…, 8. Oktober").
+ * @returns {{day:number, month:number, year?:number}|null}
+ */
+function parseDeathDateText(text) {
+  if (!text) return null;
+  const t = String(text);
+  for (const months of [DE_MONTH_NAMES, EN_MONTH_NAMES]) {
+    for (let i = 0; i < months.length; i++) {
+      const re = new RegExp(
+        `\\b(\\d{1,2})\\s*\\.?\\s*${months[i]}(?:\\s+(\\d{4}))?\\b`,
+        "i"
+      );
+      const m = t.match(re);
+      if (m) {
+        const day = parseInt(m[1], 10);
+        if (day >= 1 && day <= 31) {
+          const out = { day, month: i };
+          if (m[2]) out.year = parseInt(m[2], 10);
+          return out;
+        }
+      }
+    }
+  }
+  return null;
+}
+
+/**
+ * Main name of a death-list line (the person, before any ", age,") with
+ * trailing artifact junk stripped: orphaned combining diacritics and stray
+ * trailing punctuation/symbols (the "Sonderzeichen am Namensende"). A
+ * "(...)" disambiguation suffix is dropped.
+ */
+function personNameFromText(text) {
+  if (!text) return "";
+  return String(text)
+    .trim()
+    .replace(/[\u200b-\u200f\u00ad\ufeff]/g, "") // zero-width / format chars
+    .replace(/\[\d+\]/g, "")
+    .split(",")[0]
+    .split("(")[0]
+    .replace(/[\u0300-\u036f]+$/g, "") // orphan combining marks at end
+    .replace(/[*†‡"'+]+$/g, "") // stray symbol artifacts at end
+    .trim();
+}
+
+/** Accent-insensitive, alphanumeric-only key for cross-language dedup. */
+function normalizeName(s) {
+  return String(s || "")
+    .toLowerCase()
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .replace(/[^a-z0-9]/g, "");
+}
+
 function firstSentences(text, maxChars = 280) {
   if (!text) return null;
   let t = String(text).replace(/\s+/g, " ").trim();
@@ -160,7 +225,7 @@ async function labelEntities(client, ids, langPrefer = "en") {
 async function fetchDeathBrief(pageUrl, userAgent, { listText = null } = {}) {
   const parsed = parseWikiUrl(pageUrl);
   const nameGuess = listText
-    ? String(listText).split(",")[0].trim()
+    ? personNameFromText(listText)
     : parsed?.title || "Unbekannt";
 
   const fallback = {
@@ -173,6 +238,7 @@ async function fetchDeathBrief(pageUrl, userAgent, { listText = null } = {}) {
     lifespan: null,
     thumb: null,
     url: pageUrl,
+    isHuman: null,
   };
 
   if (!parsed) return fallback;
@@ -212,6 +278,7 @@ async function fetchDeathBrief(pageUrl, userAgent, { listText = null } = {}) {
     let occupations = [];
     let wdDesc = null;
     let p18File = null;
+    let isHuman = null;
 
     if (qid) {
       const { data: wd } = await getRetry(client, "https://www.wikidata.org/w/api.php", {
@@ -227,6 +294,12 @@ async function fetchDeathBrief(pageUrl, userAgent, { listText = null } = {}) {
       p18File = wikidataP18(entity?.claims);
       birth = parseWikidataTime(entity?.claims?.P569?.[0]?.mainsnak?.datavalue?.value?.time);
       death = parseWikidataTime(entity?.claims?.P570?.[0]?.mainsnak?.datavalue?.value?.time);
+      // Person check (instance-of human). A band/organization article linked from
+      // a death line must not supply the card name (Chris Welsh / "Died Pretty").
+      const p31 = (entity?.claims?.P31 || [])
+        .map((c) => c?.mainsnak?.datavalue?.value?.id)
+        .filter(Boolean);
+      isHuman = p31.includes("Q5") ? true : p31.length ? false : null;
       const occIds = (entity?.claims?.P106 || [])
         .map((c) => c?.mainsnak?.datavalue?.value?.id)
         .filter(Boolean)
@@ -237,13 +310,28 @@ async function fetchDeathBrief(pageUrl, userAgent, { listText = null } = {}) {
         descs[parsed.lang]?.value || descs.en?.value || descs.de?.value || null;
     }
 
-    const age =
-      ageBetween(birth?.iso, death?.iso) ??
+    let age =
+      (birth && death && ageBetween(birth.iso, death.iso)) ??
       ageFromListText(listText, name) ??
       fallback.age;
 
-    const birthYear = birth?.year ?? null;
+    let birthYear = birth?.year ?? null;
     const deathYear = death?.year ?? null;
+
+    // Plausibilize the Wikidata birth year (P569) so a bad value can never
+    // render as "* 2000 · gestorben mit 84". With a death year the birth must
+    // be sane (<= death year, span <= 115). Without one, derive from the age.
+    if (deathYear != null) {
+      if (birthYear != null && (birthYear > deathYear || deathYear - birthYear > 115)) {
+        birthYear = null;
+      }
+    } else if (birthYear != null && age != null && age > 0) {
+      const implied = new Date().getUTCFullYear() - age;
+      if (Math.abs(implied - birthYear) > 15) {
+        birthYear = implied >= 1900 ? implied : null;
+      }
+    }
+
     let lifespan = null;
     if (birthYear && deathYear) lifespan = `${birthYear}–${deathYear}`;
     else if (deathYear) lifespan = `† ${deathYear}`;
@@ -274,6 +362,7 @@ async function fetchDeathBrief(pageUrl, userAgent, { listText = null } = {}) {
       lifespan,
       thumb: thumb || imgUrl,
       url: fullUrl,
+      isHuman,
     };
   } catch (e) {
     console.warn("[death-brief]", e.message);
@@ -298,4 +387,7 @@ module.exports = {
   resolveDeathImage,
   ageFromListText,
   firstSentences,
+  personNameFromText,
+  normalizeName,
+  parseDeathDateText,
 };
