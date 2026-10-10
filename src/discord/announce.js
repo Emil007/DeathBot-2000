@@ -268,27 +268,47 @@ async function announceDailySummary(client, config) {
     deOnly.push(r);
   }
   const uniqueTotal = en.length + deOnly.length;
-  let msg = `📋 **Tagesbericht** — ${uniqueTotal} neue Einträge seit gestern\n\n`;
   // URLs in <> suppress Discord's link preview/embed on every summary line.
   const link = (e) => `[${listName(e)}](<${e.url}>)`;
+
+  // Assemble the summary as FULL LINES. Discord's hard cap is 2000 chars;
+  // we cut only at line boundaries so a markdown link is never left open
+  // mid-URL (previously slice(0,1900) severed the last line, which read as
+  // a stray symbol at the end of the report).
+  const lines = [];
+  lines.push(`📋 **Tagesbericht** — ${uniqueTotal} neue Einträge seit gestern`);
   if (en.length) {
-    msg += `🌍 **International:**\n`;
-    en.slice(0, 20).forEach((e) => {
-      msg += `• ${link(e)}\n`;
-    });
-    if (en.length > 20) msg += `… +${en.length - 20}\n`;
-    msg += "\n";
+    lines.push("");
+    lines.push("🌍 **International:**");
+    en.slice(0, 20).forEach((e) => lines.push(`• ${link(e)}`));
+    if (en.length > 20) lines.push(`… +${en.length - 20}`);
   }
   if (deOnly.length) {
-    msg += `🇩🇪 **Nur DE / Regional:**\n`;
-    deOnly.slice(0, 15).forEach((e) => {
-      msg += `• ${link(e)}\n`;
-    });
-    if (deOnly.length > 15) msg += `… +${deOnly.length - 15}\n`;
+    lines.push("");
+    lines.push("🇩🇪 **Nur DE / Regional:**");
+    deOnly.slice(0, 15).forEach((e) => lines.push(`• ${link(e)}`));
+    if (deOnly.length > 15) lines.push(`… +${deOnly.length - 15}`);
+  }
+
+  const MAX = 1900;
+  let body = "";
+  let omitted = 0;
+  for (let i = 0; i < lines.length; i++) {
+    const next = body === "" ? lines[i] : `${body}\n${lines[i]}`;
+    if (next.length > MAX) {
+      for (let j = i; j < lines.length; j++) {
+        if (lines[j].startsWith("• ")) omitted++;
+      }
+      break;
+    }
+    body = next;
+  }
+  if (omitted > 0) {
+    body += `\n\n… +${omitted} Einträge ausgeblendet (Zeichenlimit)`;
   }
 
   await channel.send({
-    content: msg.slice(0, 1900),
+    content: body,
     allowedMentions: { parse: [] },
   });
 }
