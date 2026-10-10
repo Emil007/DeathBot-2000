@@ -283,14 +283,28 @@ async function findPoolDeathsByCategory(userAgent, { delayMs = 350, seasonStartD
 
 /**
  * True if celeb still has a death category (for retract safety).
+ * Returns { dead, error? }: a transient wiki/API failure yields dead:false with
+ * an error so callers can defer retraction instead of pulling points on a
+ * false "alive" signal.
  */
 async function celebStillMarkedDead(userAgent, celeb) {
   const urls = [celeb.wiki_url, celeb.wiki_url_de].filter(Boolean);
+  let lastError = null;
   for (const url of urls) {
-    const r = await checkUrlDead(userAgent, url);
-    if (r.dead) return true;
+    try {
+      const r = await checkUrlDead(userAgent, url);
+      if (r.error) {
+        lastError = r.error;
+        continue;
+      }
+      if (r.dead) return { dead: true };
+    } catch (e) {
+      lastError = e.message;
+    }
   }
-  return false;
+  return lastError
+    ? { dead: false, error: lastError }
+    : { dead: false };
 }
 
 module.exports = {

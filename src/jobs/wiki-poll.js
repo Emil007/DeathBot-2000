@@ -16,6 +16,24 @@ const ops = require("../ops/status");
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 /**
+ * Global poll serialization: runWikiPoll is called both from the scheduled
+ * poller tick and directly from admin commands (/check, /go, /ungo). Without a
+ * shared lock, a command-triggered poll could overlap the running poller and
+ * double-post announcements. enqueuePoll chains every poll behind the previous
+ * one so two polls never run concurrently.
+ */
+let pollQueue = Promise.resolve();
+
+function enqueuePoll(task) {
+  const run = pollQueue.then(task);
+  pollQueue = run.then(
+    () => {},
+    () => {}
+  );
+  return run;
+}
+
+/**
  * Retry a language scrape that returned 0 entries or threw (e.g. an
  * ENETUNREACH / connect failure mid-poll), so a transient network hiccup
  * doesn't silently empty one language until the next poll. 2 extra tries with
@@ -67,8 +85,30 @@ async function processRetractions(client, config, poolEntries) {
   for (const celeb of pending) {
     const detected = celeb.death_detected_at ? Date.parse(celeb.death_detected_at) : now;
 
-    // Prefer category check (same signal as detection); fall back to death-list match
-    let stillDead = await celebStillMarkedDead(config.userAgent, celeb);
+    // Prefer category check (same signal as detection); fall back to death-list
+    // match. A transient wiki/API error must NEVER count as "confirmed alive":
+    // treat it as unknown and defer retraction to the next nightly instead of
+    // pulling points back on a false signal.
+    let stillDead = null;
+    let catError = null;
+    try {
+      const cat = await celebStillMarkedDead(config.userAgent, celeb);
+      if (cat.error) catError = cat.error;
+      else stillDead = cat.dead;
+    } catch (e) {
+      catError = e.message;
+    }
+
+    if (stillDead == null && catError) {
+      console.log(
+        new Date().toISOString(),
+        "[retract] category check uncertain — deferring",
+        celeb.name,
+        catError
+      );
+      continue;
+    }
+
     if (!stillDead && poolEntries?.length) {
       stillDead = poolEntries.some((entry) => {
         const akas = db.getAkas(celeb.id);
@@ -107,6 +147,11 @@ function mergeHits(categoryHits, listHits) {
  * @param {'seed'|'reconcile'|'live'|'nightly'} mode
  */
 async function runWikiPoll(client, config, { mode = "live" } = {}) {
+  // All entry points (poller tick + admin commands) funnel through the lock.
+  return enqueuePoll(() => runWikiPollUnlocked(client, config, { mode }));
+}
+
+async function runWikiPollUnlocked(client, config, { mode = "live" } = {}) {
   const t0 = Date.now();
   ops.markPollStart(mode);
   console.log(new Date().toISOString(), `[poll] mode=${mode}`);
@@ -154,6 +199,15 @@ async function runWikiPollInner(client, config, { mode = "live" } = {}) {
   }
 
   const newDeOnly = [];
+
+  // DE entries that map to an EN article (already scraped this poll, or bridged
+  // via interwiki) must NOT be stamped announced until their EN entry is
+  // confirmed announced. Otherwise a failed EN post (transient Discord/network
+  // error) would silently drop the person: DE is marked announced, never
+  // retried, while the EN row stays un-announced.
+  const deferredDeEn = [];
+  const deferDeForEn = (deEntry, enId) => deferredDeEn.push({ deId: deEntry.id, enId });
+
   if (mode !== "seed") {
     for (const d of deData.entries) {
       const row = db
@@ -163,10 +217,23 @@ async function runWikiPollInner(client, config, { mode = "live" } = {}) {
       if (row?.announced_at) continue;
 
       let enUrl = null;
+      let enResolveError = null;
       try {
         enUrl = await deData.resolveEnglish(d.url);
-      } catch {
-        /* ignore */
+      } catch (e) {
+        enResolveError = e;
+      }
+      if (enResolveError) {
+        // Transient resolver failure ≠ "no EN variant": deferring keeps the
+        // EN-first rule intact (a hiccup must not push a DE entry to DE-only).
+        // Not stamped → retried on the next poll.
+        console.log(
+          new Date().toISOString(),
+          "[poll] en-resolve failed — deferring DE",
+          d.id,
+          enResolveError.message
+        );
+        continue;
       }
       if (enUrl) {
         const pathPart = enUrl.includes("wikipedia.org")
@@ -181,13 +248,28 @@ async function runWikiPollInner(client, config, { mode = "live" } = {}) {
             wikiPath = null;
           }
         }
-        if (wikiPath && enIds.has(wikiPath)) {
-          db.markWikiAnnounced(d.id);
-          continue;
-        }
         if (wikiPath) {
+          const enId = `en:${wikiPath}`;
+          const enRow = db
+            .getDb()
+            .prepare("SELECT announced_at FROM wiki_seen WHERE entry_id = ?")
+            .get(enId);
+          if (enIds.has(wikiPath)) {
+            if (enRow?.announced_at) {
+              // EN was announced on an earlier poll → DE is safe to stamp now.
+              db.markWikiAnnounced(d.id);
+            } else if (mode === "reconcile") {
+              db.markWikiAnnounced(d.id);
+            } else {
+              // EN is being announced THIS poll → stamp DE only after EN really
+              // sent (survives a failed EN post: both stay un-announced, retried
+              // next poll instead of silently dropping the person).
+              deferDeForEn(d, enId);
+            }
+            continue;
+          }
           const bridged = {
-            id: `en:${wikiPath}`,
+            id: enId,
             wikiPath,
             text: d.text + " 🌍",
             url: enUrl.startsWith("http") ? enUrl : `https:${enUrl}`,
@@ -201,10 +283,16 @@ async function runWikiPollInner(client, config, { mode = "live" } = {}) {
           if (!db.isWikiSeen(bridged.id)) {
             db.markWikiSeen(bridged);
             newEn.push(bridged);
+            if (mode === "reconcile") db.markWikiAnnounced(d.id);
+            else deferDeForEn(d, enId);
           } else if (!bridgedRow?.announced_at) {
             newEn.push(bridged);
+            if (mode === "reconcile") db.markWikiAnnounced(d.id);
+            else deferDeForEn(d, enId);
+          } else {
+            // bridged EN already announced earlier → DE safe to stamp now.
+            db.markWikiAnnounced(d.id);
           }
-          db.markWikiAnnounced(d.id);
           continue;
         }
       }
@@ -212,13 +300,26 @@ async function runWikiPollInner(client, config, { mode = "live" } = {}) {
     }
   }
 
+  // Dedup queued EN cards by id: the same interwiki target can be resolved from
+  // several DE rows in one poll (shared EN article), which previously posted the
+  // same card multiple times.
+  const uniqueNewEn = [];
+  {
+    const seenEnIds = new Set();
+    for (const e of newEn) {
+      if (seenEnIds.has(e.id)) continue;
+      seenEnIds.add(e.id);
+      uniqueNewEn.push(e);
+    }
+  }
+
   console.log(
     new Date().toISOString(),
-    `[poll] new EN=${newEn.length} DE-only=${newDeOnly.length} scraped EN=${enEntries.length} DE=${deData.entries.length}`
+    `[poll] new EN=${uniqueNewEn.length} DE-only=${newDeOnly.length} scraped EN=${enEntries.length} DE=${deData.entries.length}`
   );
 
   if (mode === "seed") {
-    db.seedAllWikiSeen([...enEntries, ...deData.entries, ...newEn]);
+    db.seedAllWikiSeen([...enEntries, ...deData.entries, ...uniqueNewEn]);
     return {
       hits: [],
       seeded: true,
@@ -233,7 +334,7 @@ async function runWikiPollInner(client, config, { mode = "live" } = {}) {
   }
 
   if ((mode === "live" || mode === "nightly") && config.channelAllDeaths) {
-    for (const e of newEn) {
+    for (const e of uniqueNewEn) {
       try {
         await announceAllDeath(client, config, e, { isDeOnly: false });
         db.markWikiAnnounced(e.id);
@@ -249,8 +350,19 @@ async function runWikiPollInner(client, config, { mode = "live" } = {}) {
         console.error("[poll] all-death DE", err.message);
       }
     }
+    // Stamp DE only after its EN counterpart is really announced — survives EN
+    // send failures (both stay un-announced → retried next poll).
+    for (const t of deferredDeEn) {
+      const enRow = db
+        .getDb()
+        .prepare("SELECT announced_at FROM wiki_seen WHERE entry_id = ?")
+        .get(t.enId);
+      if (enRow?.announced_at) db.markWikiAnnounced(t.deId);
+    }
   } else {
-    for (const e of [...newEn, ...newDeOnly]) db.markWikiAnnounced(e.id);
+    for (const e of [...uniqueNewEn, ...newDeOnly]) db.markWikiAnnounced(e.id);
+    // Non-announce modes stamp deferred DE too (their EN is treated as announced).
+    for (const t of deferredDeEn) db.markWikiAnnounced(t.deId);
   }
 
   // Primary: per-celeb death-category check (proven approach from deathlist_checker.py)
@@ -301,7 +413,7 @@ async function runWikiPollInner(client, config, { mode = "live" } = {}) {
     stats: {
       scrapedEn: enEntries.length,
       scrapedDe: deData.entries.length,
-      newEn: newEn.length,
+      newEn: uniqueNewEn.length,
       newDe: newDeOnly.length,
       categoryHits: categoryHits.length,
       listHits: listHits.length,

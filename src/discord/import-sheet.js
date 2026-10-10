@@ -15,7 +15,10 @@ function parseDeathDate(raw) {
     const d = us[2].padStart(2, "0");
     return `${us[3]}-${m}-${d}`;
   }
-  return s;
+  // Unknown format → invalid. Returning the raw text made import.js treat ANY
+  // non-empty string as a real death date, so a malformed cell (e.g. "???") was
+  // enough to apply a death. strict parseDeathDate keeps import honest.
+  return null;
 }
 
 function parseSheetTable(text) {

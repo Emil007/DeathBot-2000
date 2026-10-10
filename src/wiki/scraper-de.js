@@ -15,19 +15,20 @@ function createClient(userAgent) {
 }
 
 async function resolveEnglish(client, germanUrl) {
-  try {
-    const response = await client.get(germanUrl);
-    const $ = cheerio.load(response.data);
-    const href =
-      $('li.interlanguage-link.interwiki-en a').attr("href") ||
-      $('a[lang="en"][hreflang="en"]').attr("href") ||
-      $('a[lang="en"]').attr("href") ||
-      $(".interlanguage-link-en a").attr("href") ||
-      null;
-    return href || null;
-  } catch {
-    return null;
-  }
+  // Network/HTTP failures must NOT be treated as "no EN variant": they are
+  // transient, and posting the DE entry as DE-only would violate the EN-first
+  // rule. Only a successfully loaded page WITHOUT an EN interwiki link means
+  // "no EN". Let HTTP/network errors propagate so the poller can defer the DE
+  // entry (retry next poll) instead of misrouting it to DE-only.
+  const response = await client.get(germanUrl);
+  const $ = cheerio.load(response.data);
+  const href =
+    $('li.interlanguage-link.interwiki-en a').attr("href") ||
+    $('a[lang="en"][hreflang="en"]').attr("href") ||
+    $('a[lang="en"]').attr("href") ||
+    $(".interlanguage-link-en a").attr("href") ||
+    null;
+  return href || null;
 }
 
 function extractFromLists($, lang) {

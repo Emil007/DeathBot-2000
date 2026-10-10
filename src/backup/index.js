@@ -89,16 +89,61 @@ function restorePackage(config, fileName) {
   // Safety backup of current DB first
   const safety = createPackage(config, { reason: "pre-restore" });
 
+  const written = path.join(path.dirname(config.dbPath), `.restore.tmp.${process.pid}.sqlite`);
+  // Write to a sibling temp file first: if writing/parsing fails the live DB is
+  // never touched.
+  fs.writeFileSync(written, entry.getData());
+
+  // Validate BEFORE touching the live DB: the package could be corrupt or not a
+  // real SQLite file at all. Opening it read-only fails fast on garbage; we
+  // never swap a broken file over a working database. This is the difference
+  // between "restore failed" (live DB untouched) and "restore destroyed the
+  // live DB then failed" (the pre-fix behaviour).
+  const Database = require("better-sqlite3");
+  let sanity = null;
+  try {
+    sanity = new Database(written, { readonly: true });
+    sanity.prepare("SELECT COUNT(*) AS c FROM sqlite_master").get();
+  } catch (e) {
+    try {
+      fs.unlinkSync(written);
+    } catch {
+      /* ignore */
+    }
+    throw new Error(`Restore invalid (not a usable database): ${e.message}`);
+  } finally {
+    if (sanity) {
+      try {
+        sanity.close();
+      } catch {
+        /* ignore */
+      }
+    }
+  }
+
   db.closeDb();
   try {
-    fs.writeFileSync(config.dbPath, entry.getData());
+    fs.renameSync(written, config.dbPath);
     // remove sidecars
     for (const side of ["-wal", "-shm"]) {
       const p = config.dbPath + side;
       if (fs.existsSync(p)) fs.unlinkSync(p);
     }
   } finally {
-    db.reopenDb(config);
+    // reopen is best-effort (itself retries once internally); if it still fails,
+    // the bot must not silently run on a stale/closed DB.
+    try {
+      db.reopenDb(config);
+    } catch (e) {
+      console.error("[backup] restore reopen failed — DB unavailable:", e.message);
+      throw new Error(`Restore reopened DB failed: ${e.message}`);
+    }
+  }
+  // cleanup temp if it somehow still exists
+  try {
+    if (fs.existsSync(written)) fs.unlinkSync(written);
+  } catch {
+    /* ignore */
   }
 
   return { manifest, safety: safety.name, restored: fileName };

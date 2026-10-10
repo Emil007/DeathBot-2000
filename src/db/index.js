@@ -18,11 +18,10 @@ function openDb(config) {
   } catch (e) {
     console.warn("[db] announced-burst repair skipped:", e.message);
   }
-  try {
-    pruneJunkAnnouncements();
-  } catch (e) {
-    console.warn("[db] junk-announcement prune skipped:", e.message);
-  }
+  // NOTE: pruneJunkAnnouncements() is deliberately NOT part of startup anymore.
+  // It is destructive (hard-deletes rows) and was running on every boot.
+  // Cleanup is now an explicit opt-in script with a dry-run default:
+  //   node scripts/prune-junk-announcements.js [--apply] [--force]
   return db;
 }
 
@@ -40,7 +39,14 @@ function closeDb() {
 
 function reopenDb(config) {
   closeDb();
-  return openDb(config);
+  try {
+    return openDb(config);
+  } catch (e) {
+    // One best-effort retry before giving up — a transient FS hiccup right
+    // after (re)storing a DB should not leave the bot without a database.
+    console.warn("[db] reopen failed, retrying once:", e.message);
+    return openDb(config);
+  }
 }
 
 function ensureActiveSeason() {
@@ -903,6 +909,11 @@ function deathsSinceHours(hours) {
  * limit), so a same-second group larger than `limit` is a safe seed-pollution
  * marker. Restamp those rows to the EPOCH marker (still marked "announced", so
  * never re-posted, but permanently outside the 26h summary window).
+ *
+ * The EPOCH marker itself is excluded from the burst scan: seed rows share the
+ * EPOCH timestamp by design, so counting them every boot just re-stamps the
+ * same value (churn) and risks touching genuinely legitimate data. Only real
+ * same-second timestamps that exceed the limit are treated as pollution.
  */
 function repairAnnouncedBursts(limit = 20) {
   const bursts = db
@@ -910,10 +921,11 @@ function repairAnnouncedBursts(limit = 20) {
       `SELECT announced_at AS ts, COUNT(*) AS c
        FROM announced_deaths
        WHERE announced_at IS NOT NULL
+         AND announced_at != ?
        GROUP BY announced_at
        HAVING COUNT(*) > ?`
     )
-    .all(limit);
+    .all(ANNOUNCED_EPOCH, limit);
   if (!bursts.length) return 0;
   let fixed = 0;
   for (const b of bursts) {
@@ -932,22 +944,39 @@ function repairAnnouncedBursts(limit = 20) {
 }
 
 /**
- * Drop announced entries that point to Wikipedia LIST/NAV pages (the Oct 2026 EN
- * wiki split exposed them: "Previous months" div-col, footer navboxes, "List of
- * days of the year" etc.). Those are never real person biographies and were
- * mistakenly announced during the 08-Oct junk storm. Safe to hard-delete both
- * tables: if a page is ever scraped again it is re-seeded to EPOCH, never
- * re-announced.
+ * Announcements that point to Wikipedia LIST/NAV pages (the Oct 2026 EN wiki
+ * split exposed them: "Previous months" div-col, footer navboxes, "List of days
+ * of the year" etc.). Those are never real person biographies and were
+ * mistakenly announced during the 08-Oct junk storm.
+ *
+ * Opt-in cleanup via `scripts/prune-junk-announcements.js` — intentionally NOT
+ * on the startup path (destructive: deletes rows on every boot).
  */
-function pruneJunkAnnouncements() {
-  // entry_id format is "<lang>:/wiki/<path>" (e.g. en:/wiki/Deaths_in_1977).
-  const junkRE =
-    /^[a-z]{2}:\/wiki\/(Deaths_in_|Nekrolog|List_of_days|List_of_deaths|Lists_of_deaths|List_of_births|Lists_of_births|Category:|Template:|Help:|Wikipedia:|Portal:)/i;
-  const ids = db
+// entry_id format is "<lang>:/wiki/<path>" (e.g. en:/wiki/Deaths_in_1977).
+const junkRE =
+  /^[a-z]{2}:\/wiki\/(Deaths_in_|Nekrolog|List_of_days|List_of_deaths|Lists_of_deaths|List_of_births|Lists_of_births|Category:|Template:|Help:|Wikipedia:|Portal:)/i;
+
+function junkAnnouncementIds() {
+  return db
     .prepare(`SELECT entry_id FROM announced_deaths`)
     .all()
     .map((r) => r.entry_id)
     .filter((id) => junkRE.test(id));
+}
+
+/** Dry-run counter — how many junk announcements exist (no write). */
+function countJunkAnnouncements() {
+  return junkAnnouncementIds().length;
+}
+
+/**
+ * Delete junk list-page announcements (both announced_deaths + wiki_seen rows).
+ * Records a meta marker so the opt-in script won't silently re-run; `--force`
+ * in the script bypasses that guard. Safe: a re-scraped list page is re-seeded
+ * to EPOCH (announced marker) and never re-announced.
+ */
+function pruneJunkAnnouncements() {
+  const ids = junkAnnouncementIds();
   if (!ids.length) return 0;
   const del = db.transaction((list) => {
     for (const id of list) {
@@ -956,6 +985,7 @@ function pruneJunkAnnouncements() {
     }
   });
   del(ids);
+  setMeta("junk_prune_last_run", new Date().toISOString());
   console.log(
     new Date().toISOString(),
     `[db] pruned ${ids.length} junk list-page announcements`
@@ -1152,6 +1182,7 @@ module.exports = {
   markWikiAnnounced,
   seedAllWikiSeen,
   repairAnnouncedBursts,
+  countJunkAnnouncements,
   pruneJunkAnnouncements,
   deathsSinceHours,
   recordPhraseUse,
