@@ -147,7 +147,10 @@ function normalizeName(s) {
     .toLowerCase()
     .normalize("NFD")
     .replace(/[\u0300-\u036f]/g, "")
-    .replace(/[^a-z0-9]/g, "");
+    // Unicode-aware: keep letters/numbers from ALL scripts (Cyrillic,
+    // CJK, …) so e.g. a Chinese name doesn't collapse to an empty key
+    // and falsely collide with unrelated entries.
+    .replace(/[^\p{L}\p{N}]/gu, "");
 }
 
 function firstSentences(text, maxChars = 280) {

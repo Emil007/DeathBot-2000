@@ -257,10 +257,16 @@ async function announceDailySummary(client, config) {
     enSeen.add(k);
     en.push(r);
   }
-  const deOnly = rows.filter((r) => {
-    if (r.lang === "en") return false;
-    return !enSeen.has(normName(r));
-  });
+  const deOnly = [];
+  const deSeen = new Set();
+  for (const r of rows) {
+    if (r.lang === "en") continue;
+    const k = normName(r);
+    if (enSeen.has(k)) continue; // EN-Variante existiert → DE weglassen
+    if (deSeen.has(k)) continue; // gleiche DE-Variante schon drin
+    deSeen.add(k);
+    deOnly.push(r);
+  }
   const uniqueTotal = en.length + deOnly.length;
   let msg = `📋 **Tagesbericht** — ${uniqueTotal} neue Einträge seit gestern\n\n`;
   // URLs in <> suppress Discord's link preview/embed on every summary line.
