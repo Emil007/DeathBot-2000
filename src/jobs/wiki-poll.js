@@ -218,10 +218,15 @@ async function runWikiPollInner(client, config, { mode = "live" } = {}) {
 
       let enUrl = null;
       let enResolveError = null;
-      try {
-        enUrl = await deData.resolveEnglish(d.url);
-      } catch (e) {
-        enResolveError = e;
+      if (d.redName) {
+        // No own article: pageUrl is only a research target (band/party/occupation).
+        // A DE→EN bridge from it would wrongly announce the band as the person.
+      } else {
+        try {
+          enUrl = await deData.resolveEnglish(d.url);
+        } catch (e) {
+          enResolveError = e;
+        }
       }
       if (enResolveError) {
         // Transient resolver failure ≠ "no EN variant": deferring keeps the

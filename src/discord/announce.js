@@ -147,9 +147,15 @@ async function announceAllDeath(client, config, entry, { isDeOnly = false } = {}
   const channel = await client.channels.fetch(config.channelAllDeaths).catch(() => null);
   if (!channel?.isTextBased()) return;
 
+  // redName: the person has no own article — pageUrl only produced the image.
+  // The card is built from the death-list entry; description shows the beruf
+  // (the most useful line we have) and Kurzinfo must not repeat it.
+  const redName = !!(entry && entry.redName);
+
   const brief = await fetchDeathBrief(entry.url, config.userAgent, {
     listText: entry.text,
     beruf: entry.beruf || null,
+    redName: !!entry.redName,
   });
 
   // If the linked article is NOT a person (band/org, e.g. "Died Pretty" for
@@ -181,7 +187,9 @@ async function announceAllDeath(client, config, entry, { isDeOnly = false } = {}
   } else if (brief.age != null) {
     detailLines.push(`Alter: **${brief.age}**`);
   }
-  if (brief.knownFor) detailLines.push(`Bekannt für: ${brief.knownFor}`);
+  if (brief.knownFor && !(redName && !brief.summary)) {
+    detailLines.push(`Bekannt für: ${brief.knownFor}`);
+  }
 
   // Death-list blurb minus leading "Name, age," — extra context (country, role).
   // Strip the death-line name first: the article title (card name) can differ.
@@ -215,6 +223,7 @@ async function announceAllDeath(client, config, entry, { isDeOnly = false } = {}
 
   const description =
     brief.summary ||
+    (redName ? brief.knownFor : null) ||
     listNote ||
     "_Neuer Eintrag auf der Wikipedia-Todesliste._";
 

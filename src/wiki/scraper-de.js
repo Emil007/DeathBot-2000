@@ -89,14 +89,22 @@ function extractFromTables($, lang) {
 
     let wikiPath = null;
     let nameText = "";
-    // Only the Name column (usually 2nd td) may supply the article. A red-linked
-    // or unlinked name skips the row: any other link in the row belongs to the
-    // Beruf column (SPD, Schauspieler) and would post a card for the wrong thing.
+    let redName = false;
+    // The person is always the person: only the Name column (usually 2nd td)
+    // supplies the displayed name. A red-linked (no article) or unlinked name is
+    // still a real person — keep the row, mark it redName, and use the best
+    // other link in the row (band / party / occupation) only as a research
+    // target for the image. The card itself is then built from the death-list
+    // entry (fetchDeathBrief + announce handle redName).
     const tds = $el.find("td");
     const nameCell = tds.eq(1).length ? tds.eq(1) : $el;
     nameCell.find("a").each((__, a) => {
       const $a = $(a);
-      if (isRedLink($a)) return false;
+      if (isRedLink($a)) {
+        redName = true;
+        nameText = $a.text().trim();
+        return false;
+      }
       const path = wikiPathFromHref($a.attr("href"), lang);
       if (path) {
         wikiPath = path;
@@ -104,6 +112,26 @@ function extractFromTables($, lang) {
         return false;
       }
     });
+    if (!nameText) {
+      // unlinked name cell: person is valid, only a research link is missing
+      nameText = nameCell.text().trim();
+      redName = true;
+    }
+    if (!wikiPath && redName) {
+      // No article for the person: first non-red link of the row becomes the
+      // research target (band/party/occupation). The name stays from the row.
+      $el.find("a").each((__, a) => {
+        if (wikiPath) return false;
+        const $a = $(a);
+        if (isRedLink($a)) return true;
+        const path = wikiPathFromHref($a.attr("href"), lang);
+        if (path) {
+          wikiPath = path;
+          return false;
+        }
+      });
+    }
+    if (!nameText.trim()) return;
     if (!wikiPath) return;
     // Skip links to other nekrolog index pages
     if (/^\/wiki\/Nekrolog/i.test(wikiPath)) return;
@@ -119,7 +147,10 @@ function extractFromTables($, lang) {
     // (with or without a year for entries from a different year).
     const deathDate = parseDeDate(tag);
 
-    const id = `${lang}:${wikiPath}`;
+    // redName entries share no article URL (the research link is per-row), so
+    // dedup on the name instead of the research target — two red "deutscher
+    // Schauspieler" rows must not collapse into one entry.
+    const id = redName ? `${lang}:red:${nameText}` : `${lang}:${wikiPath}`;
     if (seen.has(id)) return;
     seen.add(id);
     entries.push({
@@ -128,6 +159,7 @@ function extractFromTables($, lang) {
       text,
       url: `https://${lang}.wikipedia.org${wikiPath}`,
       lang,
+      ...(redName ? { redName: true } : {}),
       ...(beruf ? { beruf } : {}),
       ...(deathDate ? { ...deathDate } : {}),
     });

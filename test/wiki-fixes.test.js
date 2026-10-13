@@ -110,18 +110,35 @@ const TABLE_HTML = `<div class="mw-parser-output"><table class="wikitable"><tbod
 <tr><td>7. Oktober</td><td><a href="/wiki/Eva_Beispiel">Eva Beispiel</a></td><td>deutsche Sängerin</td><td>?</td><td></td></tr>
 </tbody></table></div>`;
 
-test("extractFromTables: beruf field, red-linked/unlinked names skipped, refs/ranges in age", () => {
+test("extractFromTables: beruf field, red/unlinked names → redName+research link, refs/ranges in age", () => {
   const entries = extractFromTables(cheerio.load(TABLE_HTML), "de");
   assert.deepStrictEqual(
     entries.map((e) => e.wikiPath),
-    ["/wiki/Albert_Houssiau", "/wiki/Max_Muster", "/wiki/Eva_Beispiel"],
-    "red-linked / unlinked names must not fall back to Beruf-column links"
+    [
+      "/wiki/Albert_Houssiau",
+      "/wiki/Perkussionist", // red name → research link from Beruf column
+      "/wiki/Sozialdemokratische_Partei_Deutschlands",
+      "/wiki/Schauspieler",
+      "/wiki/Max_Muster",
+      "/wiki/Eva_Beispiel",
+    ]
   );
-  const [albert, max, eva] = entries;
+  assert.deepStrictEqual(
+    entries.map((e) => (e.redName ? true : false)),
+    [false, true, true, true, false, false],
+    "BE only the dead person keeps a red/unlinked name flagged, normal articles not"
+  );
+  const [albert, dorai, rot, erika, max, eva] = entries;
   assert.strictEqual(albert.beruf, "belgischer Bischof");
   assert.strictEqual(albert.text, "Albert Houssiau, 101, belgischer Bischof, 13. Oktober");
   assert.strictEqual(albert.day, 13);
   assert.strictEqual(albert.month, 9);
+  assert.strictEqual(dorai.redName, true);
+  assert.strictEqual(dorai.text, "Guruvayur Dorai, 91, indischer Perkussionist, 10. Oktober");
+  assert.strictEqual(rot.redName, true);
+  assert.strictEqual(rot.text, "Hans Rot, 77, deutscher Politiker (SPD), 9. Oktober");
+  assert.strictEqual(erika.redName, true);
+  assert.strictEqual(erika.text, "Erika Ohnelink, 88, deutsche Schauspielerin, 9. Oktober");
   assert.strictEqual(max.text, "Max Muster, 85, deutscher Schauspieler, 8. Oktober", "85–86 → 85");
   assert.strictEqual(eva.text, "Eva Beispiel, deutsche Sängerin, 7. Oktober", "'?' age → no age");
 });
@@ -344,4 +361,91 @@ test("listNote strips the death-line name even when the article title differs", 
   assert.strictEqual(embed.title, "🌍 Christopher Welsh");
   assert.strictEqual(embed.description, "Australian rock drummer");
   assert.strictEqual(field(embed, "Wikipedia-Liste").value, "Australian drummer (Died Pretty), cancer.");
+});
+
+// --- redName: person without own article (band member) -----------------------
+
+test("redName brief: non-person page → card from death-list entry only", async () => {
+  // The research target is the BAND (Die Ärzte), not the dead person.
+  mockApi({
+    page: {
+      title: "Die Ärzte",
+      extract: "Die Ärzte ist eine deutsche Rockband aus Berlin.",
+      description: "deutsche Rockband aus Berlin",
+      thumbnail: { source: "https://upload.example/band.jpg" },
+      pageprops: { wikibase_item: "Q200" },
+      fullurl: "https://de.wikipedia.org/wiki/Die_%C3%84rzte",
+    },
+    entity: { claims: { P31: [item("Q215380")] }, descriptions: {} }, // Q215380 = Band
+  });
+  const b = await fetchDeathBrief("https://de.wikipedia.org/wiki/Die_%C3%84rzte", "test", {
+    listText: "Karl Muster, 60, deutscher Gitarrist (Die Ärzte), 8. Oktober",
+    beruf: "deutscher Gitarrist (Die Ärzte)",
+    redName: true,
+  });
+  assert.strictEqual(b.name, "Karl Muster", "name comes from the death-list entry, not the band");
+  assert.strictEqual(b.summary, null);
+  assert.strictEqual(b.knownFor, "deutscher Gitarrist (Die Ärzte)");
+  assert.strictEqual(b.age, 60);
+  assert.strictEqual(b.lifespan, null);
+  assert.strictEqual(b.birthYear, null, "no Wikipedia lifespan data for the band");
+  assert.strictEqual(b.thumb, "https://upload.example/band.jpg", "image from the band page is fine");
+  assert.strictEqual(b.url, "https://de.wikipedia.org/wiki/Die_%C3%84rzte");
+  assert.strictEqual(b.isHuman, false);
+});
+
+test("redName brief: page happens to BE the person (isHuman true) → normal card", async () => {
+  mockApi({
+    page: {
+      title: "Karl Muster",
+      extract: "Karl Muster (* 1966) war ein deutscher Gitarrist der Band Die Ärzte.",
+      description: "deutscher Gitarrist",
+      thumbnail: { source: "https://upload.example/km.jpg" },
+      pageprops: { wikibase_item: "Q7" },
+    },
+    entity: { claims: { P31: [item("Q5")], P570: [time("+2026-10-08T00:00:00Z")] }, descriptions: {} },
+  });
+  const b = await fetchDeathBrief("https://de.wikipedia.org/wiki/Karl_Muster", "test", {
+    listText: "Karl Muster, 60, deutscher Gitarrist (Die Ärzte), 8. Oktober",
+    beruf: "deutscher Gitarrist (Die Ärzte)",
+    redName: true,
+  });
+  assert.strictEqual(b.name, "Karl Muster");
+  assert.strictEqual(b.knownFor, "deutscher Gitarrist (Die Ärzte)");
+  assert.strictEqual(b.summary, "deutscher Gitarrist", "person found → normal card keeps its short summary");
+  assert.strictEqual(b.birthYear, null);
+  assert.strictEqual(b.deathYear, 2026, "real person → kept Wikipedia death year");
+  assert.strictEqual(b.isHuman, true);
+});
+
+test("announce redName card: title=person, description=beruf, image, no Bekannt-für dup", async () => {
+  mockApi({
+    page: {
+      title: "Die Ärzte",
+      extract: "Die Ärzte ist eine deutsche Rockband aus Berlin.",
+      description: "deutsche Rockband aus Berlin",
+      thumbnail: { source: "https://upload.example/band.jpg" },
+      pageprops: { wikibase_item: "Q200" },
+    },
+    entity: { claims: { P31: [item("Q215380")] }, descriptions: {} },
+  });
+  const { client, sent } = fakeDiscord();
+  await announceAllDeath(client, CONFIG, {
+    id: "de:red:Karl Muster",
+    url: "https://de.wikipedia.org/wiki/Die_%C3%84rzte",
+    text: "Karl Muster, 60, deutscher Gitarrist (Die Ärzte), 8. Oktober",
+    beruf: "deutscher Gitarrist (Die Ärzte)",
+    lang: "de",
+    redName: true,
+    day: 8,
+    month: 9,
+    year: 2026,
+  }, { isDeOnly: true });
+  const embed = sent[0].embeds[0].toJSON();
+  assert.strictEqual(embed.title, "🇩🇪 Karl Muster", "the dead person, not the band");
+  assert.strictEqual(embed.description, "deutscher Gitarrist (Die Ärzte)", "beruf as the description line");
+  assert.strictEqual(embed.thumbnail.url, "https://upload.example/band.jpg", "band image still shown");
+  const kurz = field(embed, "Kurzinfo").value;
+  assert.match(kurz, /Gestorben: \*\*8\. Oktober 2026\*\*/);
+  assert.doesNotMatch(kurz, /Bekannt für/, "no duplicate knownFor when it is the description");
 });

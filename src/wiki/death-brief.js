@@ -303,10 +303,13 @@ async function labelEntities(client, ids, langPrefer = "en", { female = false } 
  *   thumb: string|null,
  *   url: string,
  * }>}
- * @param {{ listText?: string|null, beruf?: string|null }} [opts]
+ * @param {{ listText?: string|null, beruf?: string|null, redName?: boolean }} [opts]
  *   beruf: DE table "Beruf, bekannt als" cell — preferred knownFor on DE cards.
+ *   redName: person has NO own article (red/unlinked name). pageUrl is only a
+ *   research target (band/party/occupation) for the image — the card content
+ *   must come from the death-list entry, never from the target article.
  */
-async function fetchDeathBrief(pageUrl, userAgent, { listText = null, beruf = null } = {}) {
+async function fetchDeathBrief(pageUrl, userAgent, { listText = null, beruf = null, redName = false } = {}) {
   const parsed = parseWikiUrl(pageUrl);
   const isDe = parsed?.lang === "de";
   const berufShort = isDe ? shortBeruf(beruf) : null;
@@ -438,6 +441,25 @@ async function fetchDeathBrief(pageUrl, userAgent, { listText = null, beruf = nu
     else if (birthYear) lifespan = `* ${birthYear}`;
 
     const imgUrl = commonsThumbUrl(p18File);
+
+    // A red/unlinked name means the person has NO own article: pageUrl points
+    // at a band/party/occupation used only for the image. Unless that page is
+    // confirmed to BE the person (isHuman===true, e.g. article under a slightly
+    // different title), build the card purely from the death-list entry.
+    if (redName && isHuman !== true) {
+      return {
+        name: nameGuess,
+        summary: null,
+        knownFor: berufShort,
+        age: ageFromListText(listText, nameGuess) ?? fallback.age,
+        birthYear: null,
+        deathYear: null,
+        lifespan: null,
+        thumb: thumb || imgUrl || null,
+        url: fullUrl || pageUrl,
+        isHuman,
+      };
+    }
 
     // DE cards never fall back to the long intro sentence.
     const knownFor =
