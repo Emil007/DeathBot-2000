@@ -16,7 +16,9 @@ async function getRetry(client, url, params, { tries = 3 } = {}) {
   for (let i = 0; i < tries; i++) {
     try {
       const r = await client.get(url, { params });
-      if (r.status === 429) throw { response: { status: 429 } };
+      if (r.status === 429) {
+        throw Object.assign(new Error("HTTP 429 (rate-limited)"), { response: { status: 429 } });
+      }
       return r;
     } catch (e) {
       const code = e?.response?.status;
@@ -94,32 +96,43 @@ const EN_MONTH_NAMES = [
   "July", "August", "September", "October", "November", "December",
 ];
 
+const MONTH_ALTERNATION = [...DE_MONTH_NAMES, ...EN_MONTH_NAMES].join("|");
+const MONTH_INDEX = new Map(
+  [...DE_MONTH_NAMES, ...EN_MONTH_NAMES].map((m, i) => [m.toLowerCase(), i % 12])
+);
+const DATE_RE = new RegExp(
+  `\\b(\\d{1,2})\\s*\\.?\\s*(${MONTH_ALTERNATION})(?:\\s+(\\d{4}))?\\b`,
+  "gi"
+);
+// Trailing "…, 8. Oktober" tag; a bridged entry's " 🌍" marker is kept.
+const TRAILING_DATE_RE = new RegExp(
+  `[,;]?\\s*\\b\\d{1,2}\\s*\\.?\\s*(?:${MONTH_ALTERNATION})(?:\\s+\\d{4})?\\s*(\\s🌍)?\\s*$`,
+  "i"
+);
+
 /**
  * Recognize "8. Oktober" / "8 Oktober" / "8 October 2026" inside entry text
  * (DE death lines carry the day-of-death tag at the end: "…, 8. Oktober").
+ * Takes the LAST date by position: a line can mention the birth date first
+ * ("… 3. Mai 1940 … † 8. Oktober").
  * @returns {{day:number, month:number, year?:number}|null}
  */
 function parseDeathDateText(text) {
   if (!text) return null;
-  const t = String(text);
-  for (const months of [DE_MONTH_NAMES, EN_MONTH_NAMES]) {
-    for (let i = 0; i < months.length; i++) {
-      const re = new RegExp(
-        `\\b(\\d{1,2})\\s*\\.?\\s*${months[i]}(?:\\s+(\\d{4}))?\\b`,
-        "i"
-      );
-      const m = t.match(re);
-      if (m) {
-        const day = parseInt(m[1], 10);
-        if (day >= 1 && day <= 31) {
-          const out = { day, month: i };
-          if (m[2]) out.year = parseInt(m[2], 10);
-          return out;
-        }
-      }
-    }
+  let out = null;
+  for (const m of String(text).matchAll(DATE_RE)) {
+    const day = parseInt(m[1], 10);
+    if (!(day >= 1 && day <= 31)) continue;
+    out = { day, month: MONTH_INDEX.get(m[2].toLowerCase()) };
+    if (m[3]) out.year = parseInt(m[3], 10);
   }
-  return null;
+  return out;
+}
+
+/** Drop a trailing death-date tag ("…, 8. Oktober") from a death-list blurb. */
+function stripTrailingDeathDate(text) {
+  if (!text) return text;
+  return String(text).replace(TRAILING_DATE_RE, "$1").trim();
 }
 
 /**
@@ -175,6 +188,46 @@ function firstSentences(text, maxChars = 280) {
   return out || null;
 }
 
+/**
+ * Short known-for phrase from an intro sentence: "… (* 3. Mai 1940; † 8. Oktober
+ * 2026) war ein deutscher Schauspieler, der …" → "deutscher Schauspieler".
+ * Stops at the sentence end or a relative clause. A dot right after a digit is
+ * an ordinal ("Mitglied des 12. Deutschen Bundestages"), not a sentence end.
+ */
+function shortFromExtract(text, maxChars = 100) {
+  if (!text) return null;
+  const t = String(text).replace(/\s+/g, " ");
+  const m = t.match(
+    /\b(?:war|ist|was|is)\s+(?:eine?r?|an?)\s+((?:[^.;]|(?<=\d)\.)+?)(?=(?<!\d)\.|;|,\s+(?:der|die|das|dessen|deren|welche[rs]?|bekannt|who|whose|which|best|known)\b|$)/i
+  );
+  if (!m) return null;
+  let out = m[1].replace(/(?:…|\.\.\.)$/, "").trim();
+  // A dot inside "(u. a. …)" cuts the phrase mid-parenthesis: drop the stub
+  const open = (out.match(/\(/g) || []).length;
+  const close = (out.match(/\)/g) || []).length;
+  if (open > close) out = out.slice(0, out.lastIndexOf("(")).trim();
+  out = out.replace(/[\s,:–-]+$/, "");
+  if (out.length > maxChars) out = out.slice(0, maxChars - 1).replace(/\s+\S*$/, "") + "…";
+  return out.length >= 3 ? out : null;
+}
+
+const MAX_BERUF_CHARS = 80;
+
+/** DE table "Beruf, bekannt als" cell if short enough for "Bekannt für", else null. */
+function shortBeruf(beruf) {
+  const b = String(beruf || "").replace(/\[\d+\]/g, "").replace(/\s+/g, " ").trim();
+  return b && b.length <= MAX_BERUF_CHARS ? b : null;
+}
+
+/** "Peter Müller (Politiker, 1940)" → "Peter Müller": the disambiguator is for Wikipedia only. */
+function stripDisambiguator(title) {
+  return String(title || "").replace(/\s*\([^)]*\)$/, "").trim();
+}
+
+function sameText(a, b) {
+  return String(a || "").trim().toLowerCase() === String(b || "").trim().toLowerCase();
+}
+
 /** Wikidata P18 filename -> Commons thumbnail URL via Special:FilePath. */
 function commonsThumbUrl(filename, width = 400) {
   if (!filename) return null;
@@ -182,29 +235,55 @@ function commonsThumbUrl(filename, width = 400) {
   return `https://commons.wikimedia.org/wiki/Special:FilePath/${encodeURIComponent(safe)}?width=${width}`;
 }
 
+// P21 values: female, trans woman
+const FEMALE_GENDER_QIDS = new Set(["Q6581072", "Q1052281"]);
+
 function wikidataP18(claims) {
   const c = claims?.P18?.[0]?.mainsnak?.datavalue?.value;
   return typeof c === "string" && c.trim() ? c.trim() : null;
 }
 
-async function labelEntities(client, ids, langPrefer = "en") {
+/** P2521 "female form of label" in `lang` ("Schauspielerin"), or null. */
+function femaleLabel(entity, lang) {
+  for (const c of entity?.claims?.P2521 || []) {
+    const v = c?.mainsnak?.datavalue?.value;
+    if (v?.language === lang && typeof v.text === "string" && v.text.trim()) {
+      return v.text.trim();
+    }
+  }
+  return null;
+}
+
+/**
+ * Labels for occupation items. `female` asks for the female form (P2521, needs
+ * the much larger claims payload) — best effort: on any failure the plain
+ * labels are fetched instead.
+ */
+async function labelEntities(client, ids, langPrefer = "en", { female = false } = {}) {
   const unique = [...new Set(ids.filter(Boolean))].slice(0, 8);
   if (!unique.length) return [];
-  const { data, status } = await client.get("https://www.wikidata.org/w/api.php", {
-    params: {
+  let res;
+  try {
+    res = await getRetry(client, "https://www.wikidata.org/w/api.php", {
       action: "wbgetentities",
       ids: unique.join("|"),
-      props: "labels",
+      props: female ? "labels|claims" : "labels",
       languages: `${langPrefer}|en|de`,
       format: "json",
       origin: "*",
-    },
-  });
-  if (status !== 200) return [];
+    });
+  } catch (e) {
+    if (!female) throw e;
+    return labelEntities(client, unique, langPrefer);
+  }
+  const { data, status } = res;
+  if (status !== 200) return female ? labelEntities(client, unique, langPrefer) : [];
   const out = [];
   for (const id of unique) {
-    const labels = data?.entities?.[id]?.labels || {};
+    const entity = data?.entities?.[id];
+    const labels = entity?.labels || {};
     const label =
+      (female && femaleLabel(entity, langPrefer)) ||
       labels[langPrefer]?.value || labels.en?.value || labels.de?.value || null;
     if (label) out.push(label);
   }
@@ -224,17 +303,21 @@ async function labelEntities(client, ids, langPrefer = "en") {
  *   thumb: string|null,
  *   url: string,
  * }>}
+ * @param {{ listText?: string|null, beruf?: string|null }} [opts]
+ *   beruf: DE table "Beruf, bekannt als" cell — preferred knownFor on DE cards.
  */
-async function fetchDeathBrief(pageUrl, userAgent, { listText = null } = {}) {
+async function fetchDeathBrief(pageUrl, userAgent, { listText = null, beruf = null } = {}) {
   const parsed = parseWikiUrl(pageUrl);
+  const isDe = parsed?.lang === "de";
+  const berufShort = isDe ? shortBeruf(beruf) : null;
   const nameGuess = listText
     ? personNameFromText(listText)
-    : parsed?.title || "Unbekannt";
+    : stripDisambiguator(parsed?.title) || "Unbekannt";
 
   const fallback = {
     name: nameGuess,
     summary: null,
-    knownFor: null,
+    knownFor: berufShort,
     age: ageFromListText(listText, nameGuess),
     birthYear: null,
     deathYear: null,
@@ -269,8 +352,9 @@ async function fetchDeathBrief(pageUrl, userAgent, { listText = null } = {}) {
     const page = Object.values(data?.query?.pages || {})[0];
     if (!page || page.missing != null) return fallback;
 
-    const name = page.title || nameGuess;
+    const name = stripDisambiguator(page.title) || nameGuess;
     const extract = firstSentences(page.extract);
+    const shortExtract = shortFromExtract(page.extract);
     const pageDesc = page.description || null;
     const thumb = page.thumbnail?.source || null;
     const qid = page.pageprops?.wikibase_item || null;
@@ -284,33 +368,46 @@ async function fetchDeathBrief(pageUrl, userAgent, { listText = null } = {}) {
     let isHuman = null;
 
     if (qid) {
-      const { data: wd } = await getRetry(client, "https://www.wikidata.org/w/api.php", {
-        action: "wbgetentities",
-        ids: qid,
-        props: "claims|descriptions",
-        languages: `${parsed.lang}|en|de`,
-        format: "json",
-        origin: "*",
-      });
-      const entity = wd?.entities?.[qid];
-      // Wikidata portrait as image fallback when the article has no lead image
-      p18File = wikidataP18(entity?.claims);
-      birth = parseWikidataTime(entity?.claims?.P569?.[0]?.mainsnak?.datavalue?.value?.time);
-      death = parseWikidataTime(entity?.claims?.P570?.[0]?.mainsnak?.datavalue?.value?.time);
-      // Person check (instance-of human). A band/organization article linked from
-      // a death line must not supply the card name (Chris Welsh / "Died Pretty").
-      const p31 = (entity?.claims?.P31 || [])
-        .map((c) => c?.mainsnak?.datavalue?.value?.id)
-        .filter(Boolean);
-      isHuman = p31.includes("Q5") ? true : p31.length ? false : null;
-      const occIds = (entity?.claims?.P106 || [])
-        .map((c) => c?.mainsnak?.datavalue?.value?.id)
-        .filter(Boolean)
-        .slice(0, 4);
-      occupations = await labelEntities(client, occIds, parsed.lang === "de" ? "de" : "en");
-      const descs = entity?.descriptions || {};
-      wdDesc =
-        descs[parsed.lang]?.value || descs.en?.value || descs.de?.value || null;
+      // Wikidata only enriches the card: a WD failure (429 after retries,
+      // timeout, 5xx) must not throw away the Wikipedia data loaded above.
+      try {
+        const { data: wd } = await getRetry(client, "https://www.wikidata.org/w/api.php", {
+          action: "wbgetentities",
+          ids: qid,
+          props: "claims|descriptions",
+          languages: `${parsed.lang}|en|de`,
+          format: "json",
+          origin: "*",
+        });
+        const entity = wd?.entities?.[qid];
+        // Wikidata portrait as image fallback when the article has no lead image
+        p18File = wikidataP18(entity?.claims);
+        birth = parseWikidataTime(entity?.claims?.P569?.[0]?.mainsnak?.datavalue?.value?.time);
+        death = parseWikidataTime(entity?.claims?.P570?.[0]?.mainsnak?.datavalue?.value?.time);
+        // Person check (instance-of human). A band/organization article linked from
+        // a death line must not supply the card name (Chris Welsh / "Died Pretty").
+        const p31 = (entity?.claims?.P31 || [])
+          .map((c) => c?.mainsnak?.datavalue?.value?.id)
+          .filter(Boolean);
+        isHuman = p31.includes("Q5") ? true : p31.length ? false : null;
+        const descs = entity?.descriptions || {};
+        wdDesc =
+          descs[parsed.lang]?.value || descs.en?.value || descs.de?.value || null;
+        const occIds = (entity?.claims?.P106 || [])
+          .map((c) => c?.mainsnak?.datavalue?.value?.id)
+          .filter(Boolean)
+          .slice(0, 4);
+        // German occupation labels are masculine ("Schauspieler"): for women
+        // (P21) prefer the female form of the label.
+        const female = (entity?.claims?.P21 || []).some((c) =>
+          FEMALE_GENDER_QIDS.has(c?.mainsnak?.datavalue?.value?.id)
+        );
+        occupations = await labelEntities(client, occIds, isDe ? "de" : "en", {
+          female: isDe && female,
+        });
+      } catch (e) {
+        console.warn("[death-brief] wikidata", qid, e?.message || e);
+      }
     }
 
     let age =
@@ -342,17 +439,21 @@ async function fetchDeathBrief(pageUrl, userAgent, { listText = null } = {}) {
 
     const imgUrl = commonsThumbUrl(p18File);
 
+    // DE cards never fall back to the long intro sentence.
     const knownFor =
+      berufShort ||
       (occupations.length ? occupations.join(", ") : null) ||
       pageDesc ||
       wdDesc ||
-      (extract ? firstSentences(extract, 160) : null) ||
+      shortExtract ||
+      (!isDe && extract ? firstSentences(extract, 160) : null) ||
       null;
 
-    // Prefer a short factual line that isn't just repeating the name
-    let summary = wdDesc || pageDesc || extract;
-    if (summary && knownFor && summary.toLowerCase() === knownFor.toLowerCase()) {
-      summary = extract && extract.toLowerCase() !== knownFor.toLowerCase() ? extract : summary;
+    // Prefer a short factual line that isn't just repeating knownFor. On a tie
+    // only another SHORT description may stand in — never the long extract.
+    let summary = wdDesc || pageDesc || (isDe ? shortExtract : extract) || null;
+    if (summary && knownFor && sameText(summary, knownFor)) {
+      summary = [wdDesc, pageDesc, shortExtract].find((s) => s && !sameText(s, knownFor)) || null;
     }
 
     return {
@@ -393,4 +494,6 @@ module.exports = {
   personNameFromText,
   normalizeName,
   parseDeathDateText,
+  stripTrailingDeathDate,
+  shortFromExtract,
 };

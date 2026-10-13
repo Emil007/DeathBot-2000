@@ -2,7 +2,14 @@ const { EmbedBuilder } = require("discord.js");
 const db = require("../db");
 const { pickPhrase } = require("../phrases");
 const { fetchBestImage } = require("../wiki/page-image");
-const { fetchDeathBrief, resolveDeathImage, personNameFromText, normalizeName, parseDeathDateText } = require("../wiki/death-brief");
+const {
+  fetchDeathBrief,
+  resolveDeathImage,
+  personNameFromText,
+  normalizeName,
+  parseDeathDateText,
+  stripTrailingDeathDate,
+} = require("../wiki/death-brief");
 
 function emojiBanner(config) {
   return Array(config.alertEmojiRepeat).fill(config.alertEmoji).join(" ");
@@ -10,7 +17,7 @@ function emojiBanner(config) {
 
 /** Format "8. Oktober 2026" from entry.{day,month,year} — month from entry or now. */
 function formatDeathDate(entry) {
-  if (entry.day == null) return null;
+  if (!entry || entry.day == null) return null;
   const month = entry.month != null ? entry.month : new Date().getMonth();
   const year = entry.year || new Date().getFullYear();
   const MONTHS_DE = [
@@ -142,6 +149,7 @@ async function announceAllDeath(client, config, entry, { isDeOnly = false } = {}
 
   const brief = await fetchDeathBrief(entry.url, config.userAgent, {
     listText: entry.text,
+    beruf: entry.beruf || null,
   });
 
   // If the linked article is NOT a person (band/org, e.g. "Died Pretty" for
@@ -154,9 +162,12 @@ async function announceAllDeath(client, config, entry, { isDeOnly = false } = {}
 
   const detailLines = [];
   // Death date always goes into the Kurzinfo: use the scraped day/month/year
-  // flags first, else parse the death-line text itself ("…, 8. Oktober").
+  // flags first, else parse the death-line text itself ("…, 8. Oktober") with
+  // the page-URL year as default.
+  const textDate = parseDeathDateText(entry.text);
   const deathDateStr =
-    formatDeathDate(entry) || formatDeathDate(parseDeathDateText(entry.text));
+    formatDeathDate(entry) ||
+    (textDate ? formatDeathDate({ year: entry.year, ...textDate }) : null);
   if (deathDateStr) detailLines.push(`Gestorben: **${deathDateStr}**`);
   if (brief.lifespan || brief.age != null) {
     detailLines.push(
@@ -172,17 +183,32 @@ async function announceAllDeath(client, config, entry, { isDeOnly = false } = {}
   }
   if (brief.knownFor) detailLines.push(`Bekannt für: ${brief.knownFor}`);
 
-  // Death-list blurb minus leading "Name, age," — extra context (country, role)
+  // Death-list blurb minus leading "Name, age," — extra context (country, role).
+  // Strip the death-line name first: the article title (card name) can differ.
   let listNote = null;
   if (entry.text) {
-    let rest = String(entry.text).replace(/\[\d+\]/g, "").trim();
-    const nameRe = new RegExp(
-      `^\\s*${name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\s*`,
-      "i"
-    );
-    rest = rest.replace(nameRe, "").replace(/^[,:\-–]\s*/, "");
+    let rest = String(entry.text)
+      .replace(/\[\d+\]/g, "")
+      .replace(/[\u200b-\u200f\u00ad\ufeff]/g, "")
+      .trim();
+    for (const n of [listName, name]) {
+      if (!n) continue;
+      // listName has trailing artifacts (†, ", orphan diacritics) removed
+      const nameRe = new RegExp(
+        `^\\s*${n.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}[\\u0300-\\u036f*†‡"'+]*\\s*`,
+        "i"
+      );
+      if (nameRe.test(rest)) {
+        rest = rest.replace(nameRe, "");
+        break;
+      }
+    }
+    rest = rest.replace(/^[,:\-–]\s*/, "");
     rest = rest.replace(/^\(?\s*\d{2,3}\s*\)?\s*[,;]?\s*/, "").trim();
-    if (rest.length >= 12 && rest.toLowerCase() !== (brief.summary || "").toLowerCase()) {
+    // The Gestorben line already shows the date: no trailing "…, 8. Oktober".
+    if (deathDateStr) rest = stripTrailingDeathDate(rest);
+    const sameAs = (s) => rest.toLowerCase() === String(s || "").toLowerCase();
+    if (rest.length >= 12 && !sameAs(brief.summary) && !sameAs(brief.knownFor)) {
       listNote = rest.length > 220 ? rest.slice(0, 219).trim() + "…" : rest;
     }
   }

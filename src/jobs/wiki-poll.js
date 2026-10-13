@@ -275,6 +275,10 @@ async function runWikiPollInner(client, config, { mode = "live" } = {}) {
             url: enUrl.startsWith("http") ? enUrl : `https:${enUrl}`,
             lang: "en",
             fromDe: true,
+            // DE death date + Nekrolog-URL year, else the EN card shows the current year
+            ...(d.day != null ? { day: d.day } : {}),
+            ...(d.month != null ? { month: d.month } : {}),
+            ...(d.year != null ? { year: d.year } : {}),
           };
           const bridgedRow = db
             .getDb()
