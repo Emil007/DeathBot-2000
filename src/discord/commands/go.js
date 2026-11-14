@@ -39,7 +39,8 @@ const cmd = {
     }
 
     const force = args.some((a) => String(a).toLowerCase() === "force");
-    const pendingReviews = db.countPendingReviews();
+    // Nur die aktive Saison (+ legacy NULL) blockieren; eine 2027er-Queue darf 2026 nicht aufhalten.
+    const pendingReviews = db.countPendingReviews({ blockingLive: true });
     const unconfirmed = db.countUnconfirmedSeasonCelebs();
     if ((pendingReviews > 0 || unconfirmed > 0) && !force) {
       await msg.reply(

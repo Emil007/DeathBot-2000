@@ -41,6 +41,13 @@ const cmd = {
       return;
     }
 
+    if (db.getAnnouncedSeason()) {
+      await msg.reply(
+        "Die laufende Saison bleibt live, solange eine kommende Runde angekündigt ist (`/announce-season`). `live` nimmt erst `/new-year activate:true` am Saisonstart der announced-Saison."
+      );
+      return;
+    }
+
     const wasLive = db.isLive();
     if (wasLive) {
       db.setSeasonLive(false);

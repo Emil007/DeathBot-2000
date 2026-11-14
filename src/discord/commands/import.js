@@ -8,8 +8,16 @@ const { logEvent } = require("../log");
 const pending = new Map();
 const DONE = /^(done|fertig|end)$/i;
 
-function applyImportRows(player, rows) {
+/** Importiert immer in die AKTIVE Saison; announced/legacy als Ziel ist ein Fehler. */
+function seasonForImport() {
   const season = db.getActiveSeason();
+  if (!season || season.active !== 1) throw new Error("Keine aktive Saison für den Import.");
+  if (season.phase === "announced") throw new Error("Announced-Saison ist kein Import-Ziel (Anmeldung läuft über den Bot).");
+  return season;
+}
+
+function applyImportRows(player, rows) {
+  const season = seasonForImport();
   let added = 0;
   let deadAwarded = 0;
   const errors = [];

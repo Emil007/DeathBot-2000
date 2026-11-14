@@ -110,9 +110,9 @@ function buildCandidateSelect(celebId, candidates) {
   return new ActionRowBuilder().addComponents(menu);
 }
 
-async function sendNextReview(ctx, channelOrUser) {
-  const pending = db.countPendingReviews();
-  const row = db.nextPendingReview();
+async function sendNextReview(ctx, channelOrUser, { season, seasonId } = {}) {
+  const pending = db.countPendingReviews({ seasonId });
+  const row = db.nextPendingReview(seasonId);
   if (!row) {
     if (typeof channelOrUser.send === "function") {
       await channelOrUser.send("Review-Warteschlange leer.");
@@ -122,7 +122,7 @@ async function sendNextReview(ctx, channelOrUser) {
     return null;
   }
 
-  const season = db.getActiveSeason();
+  const effSeason = season || db.getActiveSeason();
   let proposal = {
     wikiUrl: row.proposed_wiki_url,
     proposedAge: row.proposed_age,
@@ -134,10 +134,12 @@ async function sendNextReview(ctx, channelOrUser) {
       proposal = await proposeWikiForName(
         ctx.config.userAgent,
         row.celeb_name,
-        season.start_date,
+        effSeason.start_date,
         row.sheet_age_hint
       );
-      db.enqueueReview(row.celeb_id, proposal);
+      db.enqueueReview(row.celeb_id, proposal, {
+        seasonId: seasonId ?? row.season_id ?? db.getActiveSeason().id,
+      });
     } catch (e) {
       console.error("[review] propose", e.message);
     }
@@ -170,8 +172,9 @@ async function sendNextReview(ctx, channelOrUser) {
   return channelOrUser.reply(payload);
 }
 
-async function queueCelebsForReview(ctx, celebIds, notifyTarget) {
-  const season = db.getActiveSeason();
+async function queueCelebsForReview(ctx, celebIds, notifyTarget, { season } = {}) {
+  const effSeason = season || db.getActiveSeason();
+  const effSeasonId = effSeason.id;
   let queued = 0;
   for (const id of celebIds) {
     const celeb = db.getDb().prepare("SELECT * FROM celebs WHERE id = ?").get(id);
@@ -184,7 +187,7 @@ async function queueCelebsForReview(ctx, celebIds, notifyTarget) {
       proposal = await proposeWikiForName(
         ctx.config.userAgent,
         celeb.name,
-        season.start_date,
+        effSeason.start_date,
         celeb.sheet_age_hint
       );
     } catch (e) {
@@ -207,15 +210,15 @@ async function queueCelebsForReview(ctx, celebIds, notifyTarget) {
       }
     }
 
-    db.enqueueReview(celeb.id, proposal);
-    queued++;
+    const r = db.enqueueReview(celeb.id, proposal, { seasonId: effSeasonId });
+    if (r.queued) queued++;
   }
 
   if (notifyTarget && queued > 0) {
     await notifyTarget.send?.(
       `**${queued}** Celebs in Wiki-/Alter-Review. Buttons unten oder \`/review\`.`
     );
-    await sendNextReview(ctx, notifyTarget);
+    await sendNextReview(ctx, notifyTarget, { season: effSeason, seasonId: effSeasonId });
   }
   return queued;
 }
@@ -252,6 +255,9 @@ async function handleReviewInteraction(ctx, interaction) {
   ) {
     return false;
   }
+  // Fremde Custom-IDs (z.B. pka: des Pick-Assistenten) NICHT hier abfangen:
+  // das Admin-Gate darunter würde den Nicht-Admin-Button verschlucken.
+  if (!String(interaction.customId || "").startsWith("crev:")) return false;
   if (interaction.user.id !== ctx.config.adminId) {
     if (interaction.isRepliable()) {
       await interaction.reply({ content: "Nur Admin.", ephemeral: true });

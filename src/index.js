@@ -9,6 +9,7 @@ const db = require("./db");
 const { loadCommands } = require("./discord/commands");
 const importCmd = require("./discord/commands/import");
 const helpCmd = require("./discord/commands/help");
+const { handlePickInteraction, tryConsumePickMessage } = require("./discord/pick-assistant");
 const {
   handleReviewInteraction,
   tryConsumeReviewUrl,
@@ -66,6 +67,7 @@ async function main() {
   client.on("interactionCreate", async (interaction) => {
     try {
       if (await helpCmd.handleButton?.(ctx, interaction)) return;
+      if (await handlePickInteraction(ctx, interaction)) return;
       if (await handleReviewInteraction(ctx, interaction)) return;
 
       if (!interaction.isChatInputCommand()) return;
@@ -126,6 +128,13 @@ async function main() {
     } catch (e) {
       console.error("[import paste]", e);
       await logError(client, config, e, { where: "tryConsumePaste", userId: msg.author?.id });
+    }
+
+    try {
+      if (await tryConsumePickMessage(ctx, msg)) return;
+    } catch (e) {
+      console.error("[pick message]", e);
+      await logError(client, config, e, { where: "tryConsumePickMessage", userId: msg.author?.id });
     }
 
     if (!msg.content.startsWith(config.prefix)) return;
