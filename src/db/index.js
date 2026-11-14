@@ -49,6 +49,12 @@ function reopenDb(config) {
   }
 }
 
+function setSeasonLive(live) {
+  const s = getActiveSeason();
+  db.prepare("UPDATE seasons SET live = ? WHERE id = ?").run(live ? 1 : 0, s.id);
+  return getActiveSeason();
+}
+
 function ensureActiveSeason() {
   const active = db.prepare("SELECT id FROM seasons WHERE active = 1 LIMIT 1").get();
   if (active) return active.id;
@@ -56,7 +62,7 @@ function ensureActiveSeason() {
   const start = `${year}-01-01`;
   const info = db
     .prepare(
-      `INSERT INTO seasons (year, active, start_date, live) VALUES (?, 1, ?, 0)`
+      `INSERT INTO seasons (year, active, start_date, live, phase) VALUES (?, 1, ?, 0, 'setup')`
     )
     .run(year, start);
   return info.lastInsertRowid;
@@ -82,6 +88,122 @@ function setSeasonLive(live) {
   const s = getActiveSeason();
   db.prepare("UPDATE seasons SET live = ? WHERE id = ?").run(live ? 1 : 0, s.id);
   return getActiveSeason();
+}
+
+// ---- M3: Zwei-Saison-API ----
+
+function getAnnouncedSeason() {
+  return db
+    .prepare(
+      `SELECT * FROM seasons WHERE phase = 'announced' ORDER BY year DESC, id DESC LIMIT 1`
+    )
+    .get() || null;
+}
+
+function openAnnouncedSeason({ year, startDate, channelId, note }) {
+  const run = db.transaction(() => {
+    const announced = getAnnouncedSeason();
+    if (announced) {
+      if (Number(announced.year) === Number(year)) {
+        db.prepare(
+          `UPDATE seasons SET announce_channel_id = ?, announce_note = ?, start_date = ? WHERE id = ?`
+        ).run(channelId, note || null, startDate || `${year}-01-01`, announced.id);
+        return { season: getAnnouncedSeason(), created: false };
+      }
+      throw new Error("Es existiert bereits eine angekündigte Saison (anderes Jahr).");
+    }
+    const clash = db
+      .prepare(`SELECT id FROM seasons WHERE year = ? AND phase IN ('running','setup','archived') LIMIT 1`)
+      .get(year);
+    if (clash) throw new Error(`Jahr ${year} ist bereits belegt (phase läuft/archiviert).`);
+    const info = db
+      .prepare(
+        `INSERT INTO seasons (year, active, start_date, live, phase, announce_channel_id, announce_note)
+         VALUES (?, 0, ?, 0, 'announced', ?, ?)`
+      )
+      .run(year, startDate || `${year}-01-01`, channelId || null, note || null);
+    return {
+      season: db.prepare("SELECT * FROM seasons WHERE id = ?").get(info.lastInsertRowid),
+      created: true,
+    };
+  });
+  return run();
+}
+
+function setSeasonAnnounce(seasonId, { channelId, note }) {
+  const row = db.prepare("SELECT * FROM seasons WHERE id = ?").get(seasonId);
+  if (!row || row.phase !== "announced") throw new Error("Nur eine announced-Saison darf Kanal/Note tragen.");
+  db.prepare("UPDATE seasons SET announce_channel_id = ?, announce_note = ? WHERE id = ?").run(
+    channelId || null,
+    note ?? row.announce_note,
+    seasonId
+  );
+  return db.prepare("SELECT * FROM seasons WHERE id = ?").get(seasonId);
+}
+
+function archiveRunningSeason(seasonId) {
+  const info = db
+    .prepare(
+      `UPDATE seasons SET active = 0, live = 0, phase = 'archived' WHERE id = ? AND active = 1 AND phase = 'running'`
+    )
+    .run(seasonId);
+  if (info.changes !== 1) throw new Error("Saison kann nicht archiviert werden (nicht running/active).");
+  return db.prepare("SELECT * FROM seasons WHERE id = ?").get(seasonId);
+}
+
+function activateAnnouncedSeason() {
+  return db.transaction(() => {
+    const announced = getAnnouncedSeason();
+    if (!announced) throw new Error("Keine announced-Saison vorhanden.");
+    const running = getActiveSeason();
+    if (!running) throw new Error("Keine aktive Saison vorhanden.");
+    if (running.id === announced.id) throw new Error("Announced und aktiv sind dieselbe Saison.");
+    if (running.phase !== "running") throw new Error("Aktive Saison ist nicht running — Wechsel verweigert.");
+
+    // Snapshot des 2026er-Kontostands pro Spieler
+    const players = db.prepare("SELECT * FROM players").all();
+    const insSnap = db.prepare(
+      `INSERT INTO season_point_snapshots (season_id, player_id, base_points, bonus_points, total)
+       VALUES (?, ?, ?, ?, ?)`
+    );
+    for (const p of players) {
+      const bonusPoints = db
+        .prepare(
+          `SELECT COALESCE(SUM(b.points * pb.times), 0) AS s FROM player_bonuses pb
+           INNER JOIN bonuses b ON b.id = pb.bonus_id WHERE pb.player_id = ?`
+        )
+        .get(p.id).s;
+      insSnap.run(running.id, p.id, p.base_points, bonusPoints, p.base_points + bonusPoints);
+    }
+
+    archiveRunningSeason(running.id);
+
+    const info = db
+      .prepare(
+        `UPDATE seasons SET active = 1, live = 1, phase = 'running' WHERE id = ? AND phase = 'announced' AND active = 0 AND live = 0`
+      )
+      .run(announced.id);
+    if (info.changes !== 1) throw new Error("Announced-Saison konnte nicht aktiviert werden.");
+
+    // 2027-only-Celebs (bestätigt, nicht manuell, Pick in announced, KEIN Pick in archivierter Saison) freigeben
+    db.exec(`
+      UPDATE celebs
+      SET exclude_from_auto = 0
+      WHERE wiki_confirmed = 1
+        AND manual_only = 0
+        AND exclude_from_auto = 1
+        AND id IN (SELECT celeb_id FROM picks WHERE season_id = ${announced.id})
+        AND id NOT IN (SELECT celeb_id FROM picks WHERE season_id = ${running.id});
+    `);
+
+    db.prepare("UPDATE players SET base_points = 0").run();
+    db.prepare("DELETE FROM player_bonuses").run();
+
+    return {
+      archived: db.prepare("SELECT * FROM seasons WHERE id = ?").get(running.id),
+      activated: db.prepare("SELECT * FROM seasons WHERE id = ?").get(announced.id),
+    };
+  })();
 }
 
 function nameKey(name) {
@@ -193,48 +315,137 @@ function findCelebByWikidataId(qid) {
   return db.prepare("SELECT * FROM celebs WHERE wikidata_id = ?").get(qid);
 }
 
-function enqueueReview(celebId, proposal) {
+function enqueueReview(celebId, proposal, { seasonId } = {}) {
+  const celeb = db.prepare("SELECT * FROM celebs WHERE id = ?").get(celebId);
+  // Running-Celeb-Schutz: bestätigte oder in der aktiven (running) Saison
+  // gepickte Celebs werden nicht entvalidiert und nicht eingereiht.
+  if (celeb && (celeb.wiki_confirmed === 1 || celebHasRunningPick(celebId))) {
+    return { queued: false, reason: "running-celeb" };
+  }
   const candidatesJson = proposal?.candidates
     ? JSON.stringify(proposal.candidates.slice(0, 5))
     : null;
-  db.prepare(
-    `INSERT INTO celeb_review_queue (
-       celeb_id, proposed_wiki_url, proposed_age, proposed_lang, proposed_candidates, status, updated_at
-     ) VALUES (?, ?, ?, ?, ?, 'pending', datetime('now'))
-     ON CONFLICT(celeb_id) DO UPDATE SET
-       proposed_wiki_url = excluded.proposed_wiki_url,
-       proposed_age = excluded.proposed_age,
-       proposed_lang = excluded.proposed_lang,
-       proposed_candidates = COALESCE(excluded.proposed_candidates, celeb_review_queue.proposed_candidates),
-       status = 'pending',
-       updated_at = datetime('now')`
-  ).run(
-    celebId,
-    proposal?.wikiUrl || null,
-    proposal?.proposedAge ?? null,
-    proposal?.lang || null,
-    candidatesJson
-  );
-  db.prepare(
-    `UPDATE celebs SET exclude_from_auto = 1, wiki_confirmed = 0 WHERE id = ? AND manual_only = 0`
-  ).run(celebId);
+  const activeId = getActiveSeason().id;
+  const effSeasonId = seasonId == null ? activeId : seasonId;
+
+  // ON CONFLICT: vorhandene Zeile nur übernehmen, wenn (a) gleiche Saison oder
+  // (b) Legacy-NULL-Zeile und neue ID ist die aktive Saison.
+  const existing = db
+    .prepare("SELECT season_id FROM celeb_review_queue WHERE celeb_id = ?")
+    .get(celebId);
+  let qSeason = existing?.season_id ?? null;
+  let allow = true;
+  if (existing) {
+    if (qSeason === effSeasonId) allow = true;
+    else if (qSeason == null && effSeasonId === activeId) allow = true;
+    else allow = false;
+  }
+  if (!allow) return { queued: false, reason: "other-season" };
+
+  if (seasonId != null && effSeasonId !== activeId) {
+    // announced-Queue: eigene Insert-Form mit season_id
+    db.prepare(
+      `INSERT INTO celeb_review_queue (
+         celeb_id, proposed_wiki_url, proposed_age, proposed_lang, proposed_candidates, status, season_id, updated_at
+       ) VALUES (?, ?, ?, ?, ?, 'pending', ?, datetime('now'))
+       ON CONFLICT(celeb_id) DO UPDATE SET
+         proposed_wiki_url = excluded.proposed_wiki_url,
+         proposed_age = excluded.proposed_age,
+         proposed_lang = excluded.proposed_lang,
+         proposed_candidates = COALESCE(excluded.proposed_candidates, celeb_review_queue.proposed_candidates),
+         status = 'pending',
+         season_id = excluded.season_id,
+         updated_at = datetime('now')`
+    ).run(
+      celebId,
+      proposal?.wikiUrl || null,
+      proposal?.proposedAge ?? null,
+      proposal?.lang || null,
+      candidatesJson,
+      effSeasonId
+    );
+  } else {
+    db.prepare(
+      `INSERT INTO celeb_review_queue (
+         celeb_id, proposed_wiki_url, proposed_age, proposed_lang, proposed_candidates, status, updated_at
+       ) VALUES (?, ?, ?, ?, ?, 'pending', datetime('now'))
+       ON CONFLICT(celeb_id) DO UPDATE SET
+         proposed_wiki_url = excluded.proposed_wiki_url,
+         proposed_age = excluded.proposed_age,
+         proposed_lang = excluded.proposed_lang,
+         proposed_candidates = COALESCE(excluded.proposed_candidates, celeb_review_queue.proposed_candidates),
+         status = 'pending',
+         updated_at = datetime('now')`
+    ).run(
+      celebId,
+      proposal?.wikiUrl || null,
+      proposal?.proposedAge ?? null,
+      proposal?.lang || null,
+      candidatesJson
+    );
+  }
+  // Flags nur im wirklich neuen/aktualisierten Fall setzen (nicht der
+  // running-celeb-Schutz gegriffen hat):
+  const row = db.prepare("SELECT * FROM celebs WHERE id = ?").get(celebId);
+  if (row && !celebHasRunningPick(celebId) && row.wiki_confirmed !== 1) {
+    db.prepare(
+      `UPDATE celebs SET exclude_from_auto = 1, wiki_confirmed = 0 WHERE id = ? AND manual_only = 0`
+    ).run(celebId);
+  }
+  return { queued: true };
 }
 
-function nextPendingReview() {
+/** Hat der Celeb einen Pick in der aktiven Saison? */
+function celebHasRunningPick(celebId) {
+  const activeId = getActiveSeason().id;
+  const row = db
+    .prepare("SELECT 1 AS x FROM picks WHERE celeb_id = ? AND season_id = ? LIMIT 1")
+    .get(celebId, activeId);
+  return !!row;
+}
+
+function nextPendingReview(seasonId) {
+  if (seasonId == null) {
+    const activeId = getActiveSeason().id;
+    return db
+      .prepare(
+        `SELECT q.*, c.name AS celeb_name, c.sheet_age_hint, c.age_at_pick, c.wiki_url, c.manual_only,
+                c.wikidata_id
+         FROM celeb_review_queue q
+         INNER JOIN celebs c ON c.id = q.celeb_id
+         WHERE q.status = 'pending' AND (q.season_id IS NULL OR q.season_id = ?)
+         ORDER BY q.id ASC
+         LIMIT 1`
+      )
+      .get(activeId);
+  }
   return db
     .prepare(
       `SELECT q.*, c.name AS celeb_name, c.sheet_age_hint, c.age_at_pick, c.wiki_url, c.manual_only,
               c.wikidata_id
        FROM celeb_review_queue q
        INNER JOIN celebs c ON c.id = q.celeb_id
-       WHERE q.status = 'pending'
+       WHERE q.status = 'pending' AND q.season_id = ?
        ORDER BY q.id ASC
        LIMIT 1`
     )
-    .get();
+    .get(seasonId);
 }
 
-function countPendingReviews() {
+function countPendingReviews({ seasonId, blockingLive } = {}) {
+  if (blockingLive) {
+    return db
+      .prepare(
+        `SELECT COUNT(*) AS c FROM celeb_review_queue
+         WHERE status = 'pending' AND (season_id IS NULL OR season_id = (SELECT id FROM seasons WHERE active = 1))`
+      )
+      .get().c;
+  }
+  if (seasonId != null) {
+    return db
+      .prepare(`SELECT COUNT(*) AS c FROM celeb_review_queue WHERE status = 'pending' AND season_id = ?`)
+      .get(seasonId).c;
+  }
   return db
     .prepare(`SELECT COUNT(*) AS c FROM celeb_review_queue WHERE status = 'pending'`)
     .get().c;
@@ -297,15 +508,16 @@ function mergeCelebs(canonicalId, duplicateId) {
         dup.name
       );
     }
-    // Copy awards only when canonical lacks that player (unique celeb+player)
+    // Copy awards only when canonical lacks that player (unique celeb+player+season)
     db.prepare(
-      `INSERT OR IGNORE INTO death_awards (celeb_id, player_id, points, awarded_at)
-       SELECT ?, d.player_id, d.points, d.awarded_at
+      `INSERT OR IGNORE INTO death_awards (celeb_id, player_id, points, awarded_at, season_id)
+       SELECT ?, d.player_id, d.points, d.awarded_at, d.season_id
        FROM death_awards d
        WHERE d.celeb_id = ?
          AND NOT EXISTS (
            SELECT 1 FROM death_awards x
-           WHERE x.celeb_id = ? AND x.player_id = d.player_id
+           WHERE x.celeb_id = ? AND x.player_id = d.player_id AND
+                 (x.season_id IS d.season_id OR x.season_id = d.season_id)
          )`
     ).run(canonicalId, duplicateId, canonicalId);
     db.prepare(`DELETE FROM death_awards WHERE celeb_id = ?`).run(duplicateId);
@@ -342,6 +554,15 @@ function mergeCelebs(canonicalId, duplicateId) {
 }
 
 function applyWikiConfirm(celebId, { wikiUrl, wikiNorm, wikiUrlDe, wikidataId, age, manualOnly }) {
+  // Announce-Queue-Erkennung: Queue-Zeile gehört einer announced-Saison?
+  const q = db
+    .prepare("SELECT season_id FROM celeb_review_queue WHERE celeb_id = ?")
+    .get(celebId);
+  const isAnnounced = !!(
+    q?.season_id &&
+    db.prepare("SELECT phase FROM seasons WHERE id = ?").get(q.season_id)?.phase === "announced"
+  );
+
   // Identity: Wikidata QID first, then wiki_url_norm
   if (wikidataId) {
     const byQ = findCelebByWikidataId(wikidataId);
@@ -355,17 +576,30 @@ function applyWikiConfirm(celebId, { wikiUrl, wikiNorm, wikiUrlDe, wikidataId, a
   }
 
   if (manualOnly) {
-    db.prepare(
-      `UPDATE celebs SET
-         manual_only = 1,
-         wiki_confirmed = 1,
-         exclude_from_auto = 1,
-         wiki_url = NULL,
-         wiki_url_norm = NULL,
-         wikidata_id = NULL,
-         age_at_pick = COALESCE(?, age_at_pick, sheet_age_hint)
-       WHERE id = ?`
-    ).run(age ?? null, celebId);
+    if (isAnnounced) {
+      db.prepare(
+        `UPDATE celebs SET
+           manual_only = 1,
+           wiki_confirmed = 1,
+           exclude_from_auto = 1,
+           wiki_url = NULL,
+           wiki_url_norm = NULL,
+           wikidata_id = NULL
+         WHERE id = ?`
+      ).run(celebId);
+    } else {
+      db.prepare(
+        `UPDATE celebs SET
+           manual_only = 1,
+           wiki_confirmed = 1,
+           exclude_from_auto = 1,
+           wiki_url = NULL,
+           wiki_url_norm = NULL,
+           wikidata_id = NULL,
+           age_at_pick = COALESCE(?, age_at_pick, sheet_age_hint)
+         WHERE id = ?`
+      ).run(age ?? null, celebId);
+    }
   } else {
     const row = db.prepare("SELECT * FROM celebs WHERE id = ?").get(celebId);
     let finalUrl = wikiUrl || null;
@@ -380,25 +614,41 @@ function applyWikiConfirm(celebId, { wikiUrl, wikiNorm, wikiUrlDe, wikidataId, a
     } else if (wikiNorm?.startsWith("en:") && row?.wiki_url_norm?.startsWith("de:") && !finalDe) {
       finalDe = row.wiki_url;
     }
-    db.prepare(
-      `UPDATE celebs SET
-         manual_only = 0,
-         wiki_confirmed = 1,
-         exclude_from_auto = 0,
-         wiki_url = ?,
-         wiki_url_norm = ?,
-         wiki_url_de = COALESCE(?, wiki_url_de),
-         wikidata_id = COALESCE(?, wikidata_id),
-         age_at_pick = COALESCE(?, age_at_pick, sheet_age_hint)
-       WHERE id = ?`
-    ).run(
-      finalUrl,
-      finalNorm,
-      finalDe,
-      wikidataId || null,
-      age ?? null,
-      celebId
-    );
+    if (isAnnounced) {
+      // announced-Queue: bestätigt, bleibt außerhalb des 2026er-Auto-Match,
+      // Celeb-Alter wird NICHT überschrieben (2027-Alter liegt auf picks.age_at_pick).
+      db.prepare(
+        `UPDATE celebs SET
+           manual_only = 0,
+           wiki_confirmed = 1,
+           exclude_from_auto = 1,
+           wiki_url = ?,
+           wiki_url_norm = ?,
+           wiki_url_de = COALESCE(?, wiki_url_de),
+           wikidata_id = COALESCE(?, wikidata_id)
+         WHERE id = ?`
+      ).run(finalUrl, finalNorm, finalDe, wikidataId || null, celebId);
+    } else {
+      db.prepare(
+        `UPDATE celebs SET
+           manual_only = 0,
+           wiki_confirmed = 1,
+           exclude_from_auto = 0,
+           wiki_url = ?,
+           wiki_url_norm = ?,
+           wiki_url_de = COALESCE(?, wiki_url_de),
+           wikidata_id = COALESCE(?, wikidata_id),
+           age_at_pick = COALESCE(?, age_at_pick, sheet_age_hint)
+         WHERE id = ?`
+      ).run(
+        finalUrl,
+        finalNorm,
+        finalDe,
+        wikidataId || null,
+        age ?? null,
+        celebId
+      );
+    }
   }
   markReviewStatus(celebId, "done");
   clearUrlWaitForCeleb(celebId);
@@ -560,6 +810,166 @@ function setPick(playerId, celebId, seasonId) {
   ).run(playerId, celebId, seasonId);
 }
 
+/** Setze picks.age_at_pick (nur wenn vorhandene Zeile). */
+function setPickAgeAtPick(playerId, celebId, seasonId, age) {
+  db.prepare(
+    `UPDATE picks SET age_at_pick = COALESCE(?, age_at_pick) WHERE player_id = ? AND celeb_id = ? AND season_id = ?`
+  ).run(age ?? null, playerId, celebId, seasonId);
+}
+
+// ---- M3: Draft-API (2027er Tipp-Assistent) ----
+
+function assertAnnouncedSeason(seasonId) {
+  const s = db.prepare("SELECT phase, live FROM seasons WHERE id = ?").get(seasonId);
+  if (!s || s.phase !== "announced" || s.live !== 0) {
+    throw new Error("Draft-Operation nur auf der announced-Saison erlaubt.");
+  }
+  return s;
+}
+
+function getOrCreateDraft(playerId, seasonId) {
+  assertAnnouncedSeason(seasonId);
+  const existing = db
+    .prepare("SELECT * FROM pick_drafts WHERE player_id = ? AND season_id = ?")
+    .get(playerId, seasonId);
+  if (existing) {
+    if (existing.status !== "draft") return existing; // finalized bleibt geschlossen
+    return existing;
+  }
+  const info = db
+    .prepare(
+      `INSERT INTO pick_drafts (player_id, season_id, status, updated_at)
+       VALUES (?, ?, 'draft', datetime('now'))`
+    )
+    .run(playerId, seasonId);
+  return db.prepare("SELECT * FROM pick_drafts WHERE id = ?").get(info.lastInsertRowid);
+}
+
+function addDraftNames(draftId, names) {
+  const draft = db.prepare("SELECT * FROM pick_drafts WHERE id = ?").get(draftId);
+  if (!draft) throw new Error("Draft nicht gefunden.");
+  if (draft.status !== "draft") throw new Error("Draft bereits finalisiert.");
+  const maxPos = db
+    .prepare("SELECT COALESCE(MAX(position), 0) AS m FROM pick_draft_entries WHERE draft_id = ?")
+    .get(draftId).m;
+  const stmt = db.prepare(
+    `INSERT INTO pick_draft_entries (draft_id, position, raw_name, link_status)
+     VALUES (?, ?, ?, 'pending')`
+  );
+  let pos = maxPos;
+  for (const name of names) {
+    pos += 1;
+    stmt.run(draftId, pos, name);
+  }
+  db.prepare("UPDATE pick_drafts SET updated_at = datetime('now') WHERE id = ?").run(draftId);
+  return pos - maxPos;
+}
+
+function removeDraftEntry(entryId) {
+  const info = db.prepare("DELETE FROM pick_draft_entries WHERE id = ?").run(entryId);
+  return info.changes > 0;
+}
+
+function replaceDraftEntryName(entryId, rawName) {
+  const info = db
+    .prepare(
+      `UPDATE pick_draft_entries SET raw_name = ?, link_status = 'pending', wiki_url = NULL,
+       wiki_norm = NULL, qid = NULL, proposed_age = NULL, candidates_json = NULL, position = position
+       WHERE id = ?`
+    )
+    .run(rawName, entryId);
+  return info.changes > 0;
+}
+
+function setDraftEntryLinked(entryId, { wikiUrl, wikiNorm, qid, proposedAge, linkStatus }) {
+  db.prepare(
+    `UPDATE pick_draft_entries SET
+       wiki_url = COALESCE(?, wiki_url),
+       wiki_norm = COALESCE(?, wiki_norm),
+       qid = COALESCE(?, qid),
+       proposed_age = COALESCE(?, proposed_age),
+       link_status = COALESCE(?, link_status)
+     WHERE id = ?`
+  ).run(wikiUrl ?? null, wikiNorm ?? null, qid ?? null, proposedAge ?? null, linkStatus ?? null, entryId);
+}
+
+function listDraftEntries(draftId) {
+  return db
+    .prepare("SELECT * FROM pick_draft_entries WHERE draft_id = ? ORDER BY position ASC")
+    .all(draftId);
+}
+
+function getDraftForPlayer(playerId, seasonId) {
+  return db
+    .prepare("SELECT * FROM pick_drafts WHERE player_id = ? AND season_id = ?")
+    .get(playerId, seasonId) || null;
+}
+
+/**
+ * Celeb für eine announced-Saison verknüpfen: bestehende bestätigte/running-Pick-
+ * Zeile wiederverwenden ohne Flags/Alter zu ändern; sonst neue/offene Zeile.
+ */
+function linkCelebForAnnouncedSeason({ name, age, qid, wikiNorm }) {
+  if (qid) {
+    const byQ = findCelebByWikidataId(qid);
+    if (byQ) return { celeb: byQ, reuse: true };
+  }
+  if (wikiNorm) {
+    const byN = findCelebByWikiNorm(wikiNorm);
+    if (byN) return { celeb: byN, reuse: true };
+  }
+  const found = findOrCreateCeleb({ name, age });
+  // Wenn diese Zeile schon bestätigt ist ODER einen running-Pick hat: reuse
+  if (found.celeb.wiki_confirmed === 1 || celebHasRunningPick(found.celeb.id)) {
+    return { celeb: found.celeb, reuse: true };
+  }
+  return { celeb: found.celeb, reuse: found.celeb.wiki_confirmed === 1 && found.celeb.exclude_from_auto === 0 };
+}
+
+function finalizeDraft(playerId, seasonId) {
+  assertAnnouncedSeason(seasonId);
+  return db.transaction(() => {
+    const draft = db
+      .prepare("SELECT * FROM pick_drafts WHERE player_id = ? AND season_id = ?")
+      .get(playerId, seasonId);
+    if (!draft) throw new Error("Kein Draft vorhanden.");
+    if (draft.status === "finalized") return { locked: true };
+
+    const entries = listDraftEntries(draft.id);
+    for (const e of entries) {
+      if (e.link_status === "ambiguous" || e.link_status === "pending") {
+        return { blocked: true, entryId: e.id };
+      }
+    }
+    if (!entries.length) return { blocked: true, entryId: null, reason: "empty" };
+
+    clearPicksForPlayer(playerId, seasonId);
+    const reviewIds = [];
+    let added = 0;
+    for (const e of entries) {
+      const { celeb, reuse } = linkCelebForAnnouncedSeason({
+        name: e.raw_name,
+        age: e.proposed_age ?? null,
+        qid: e.qid || null,
+        wikiNorm: e.wiki_norm || null,
+      });
+      setPick(playerId, celeb.id, seasonId);
+      if (e.proposed_age != null) {
+        db.prepare(
+          `UPDATE picks SET age_at_pick = ? WHERE player_id = ? AND celeb_id = ? AND season_id = ?`
+        ).run(e.proposed_age, playerId, celeb.id, seasonId);
+      }
+      added++;
+      if (!reuse && celeb.wiki_confirmed === 0) {
+        if (!celebHasRunningPick(celeb.id)) reviewIds.push(celeb.id);
+      }
+    }
+    db.prepare("UPDATE pick_drafts SET status = 'finalized', updated_at = datetime('now') WHERE id = ?")
+      .run(draft.id);
+    return { reviewIds: [...new Set(reviewIds)], added };
+  })();
+}
+
 function getAliveCelebsForAuto() {
   return db
     .prepare(
@@ -602,8 +1012,6 @@ function applyDeath(celebId, opts = {}) {
   if (!celeb || !celeb.is_alive) return { celeb, awards: [], score: 0 };
 
   const season = getActiveSeason();
-  const age = celeb.age_at_pick;
-  const score = scoreForAge(age);
   const winners = getWinnersForCeleb(celebId, season.id);
   const now = new Date().toISOString();
   const diedAt = opts.diedAt || now.slice(0, 10);
@@ -650,16 +1058,30 @@ function applyDeath(celebId, opts = {}) {
   }
 
   const awards = [];
+  let firstScore = 0;
+  let effAge = celeb.age_at_pick;
   for (const w of winners) {
+    // Alter: Pick-Alter (2027-Ziel) zuerst, sonst Celeb-Alter (2026/legacy)
+    const pick = db
+      .prepare("SELECT age_at_pick FROM picks WHERE celeb_id = ? AND player_id = ? AND season_id = ?")
+      .get(celebId, w.id, season.id);
+    const age = pick?.age_at_pick ?? celeb.age_at_pick;
+    const score = scoreForAge(age);
+    if (awards.length === 0) {
+      firstScore = score;
+      effAge = age;
+    }
     if (score > 0) {
       const existing = db
-        .prepare(`SELECT id FROM death_awards WHERE celeb_id = ? AND player_id = ?`)
-        .get(celebId, w.id);
+        .prepare(
+          `SELECT id FROM death_awards WHERE celeb_id = ? AND player_id = ? AND season_id = ?`
+        )
+        .get(celebId, w.id, season.id);
       if (!existing) {
         db.prepare("UPDATE players SET base_points = base_points + ? WHERE id = ?").run(score, w.id);
         db.prepare(
-          `INSERT INTO death_awards (celeb_id, player_id, points) VALUES (?, ?, ?)`
-        ).run(celebId, w.id, score);
+          `INSERT INTO death_awards (celeb_id, player_id, points, season_id) VALUES (?, ?, ?, ?)`
+        ).run(celebId, w.id, score, season.id);
       }
     }
     awards.push({
@@ -672,8 +1094,8 @@ function applyDeath(celebId, opts = {}) {
   return {
     celeb: db.prepare("SELECT * FROM celebs WHERE id = ?").get(celebId),
     awards,
-    score,
-    age,
+    score: firstScore,
+    age: effAge,
   };
 }
 
@@ -1129,6 +1551,24 @@ module.exports = {
   isLive,
   setSeasonStartDate,
   setSeasonLive,
+  // M3 Zwei-Saison
+  getAnnouncedSeason,
+  openAnnouncedSeason,
+  setSeasonAnnounce,
+  archiveRunningSeason,
+  activateAnnouncedSeason,
+  assertAnnouncedSeason,
+  getOrCreateDraft,
+  addDraftNames,
+  removeDraftEntry,
+  replaceDraftEntryName,
+  setDraftEntryLinked,
+  listDraftEntries,
+  getDraftForPlayer,
+  linkCelebForAnnouncedSeason,
+  finalizeDraft,
+  setPickAgeAtPick,
+  celebHasRunningPick,
   nameKey,
   scoreForAge,
   upsertPlayer,

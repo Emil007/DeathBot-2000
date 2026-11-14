@@ -8,6 +8,9 @@ CREATE TABLE IF NOT EXISTS seasons (
   active INTEGER NOT NULL DEFAULT 0,
   start_date TEXT,
   live INTEGER NOT NULL DEFAULT 0,
+  phase TEXT,
+  announce_channel_id TEXT,
+  announce_note TEXT,
   created_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
@@ -54,15 +57,20 @@ CREATE TABLE IF NOT EXISTS celeb_review_queue (
   proposed_lang TEXT,
   proposed_candidates TEXT,
   status TEXT NOT NULL DEFAULT 'pending',
+  season_id INTEGER,
   created_at TEXT NOT NULL DEFAULT (datetime('now')),
   updated_at TEXT NOT NULL DEFAULT (datetime('now')),
   FOREIGN KEY (celeb_id) REFERENCES celebs(id) ON DELETE CASCADE
 );
 
+CREATE INDEX IF NOT EXISTS idx_review_season_status
+  ON celeb_review_queue(season_id, status);
+
 CREATE TABLE IF NOT EXISTS picks (
   player_id INTEGER NOT NULL,
   celeb_id INTEGER NOT NULL,
   season_id INTEGER NOT NULL,
+  age_at_pick INTEGER,
   PRIMARY KEY (player_id, celeb_id, season_id),
   FOREIGN KEY (player_id) REFERENCES players(id) ON DELETE CASCADE,
   FOREIGN KEY (celeb_id) REFERENCES celebs(id) ON DELETE CASCADE,
@@ -104,19 +112,57 @@ CREATE TABLE IF NOT EXISTS death_awards (
   celeb_id INTEGER NOT NULL,
   player_id INTEGER NOT NULL,
   points INTEGER NOT NULL,
+  season_id INTEGER,
   awarded_at TEXT NOT NULL DEFAULT (datetime('now')),
   FOREIGN KEY (celeb_id) REFERENCES celebs(id) ON DELETE CASCADE,
   FOREIGN KEY (player_id) REFERENCES players(id) ON DELETE CASCADE
 );
 
-CREATE UNIQUE INDEX IF NOT EXISTS idx_death_awards_celeb_player
-  ON death_awards(celeb_id, player_id);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_death_awards_celeb_player_season
+  ON death_awards(celeb_id, player_id, season_id);
 
 CREATE TABLE IF NOT EXISTS celeb_url_wait (
   admin_user_id TEXT PRIMARY KEY,
   celeb_id INTEGER NOT NULL,
   expires_at TEXT NOT NULL,
   FOREIGN KEY (celeb_id) REFERENCES celebs(id) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS pick_drafts (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  player_id INTEGER NOT NULL,
+  season_id INTEGER NOT NULL,
+  status TEXT NOT NULL DEFAULT 'draft',
+  updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+  UNIQUE (player_id, season_id),
+  FOREIGN KEY (player_id) REFERENCES players(id) ON DELETE CASCADE,
+  FOREIGN KEY (season_id) REFERENCES seasons(id) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS pick_draft_entries (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  draft_id INTEGER NOT NULL,
+  position INTEGER NOT NULL,
+  raw_name TEXT NOT NULL,
+  wiki_url TEXT,
+  wiki_norm TEXT,
+  qid TEXT,
+  proposed_age INTEGER,
+  candidates_json TEXT,
+  link_status TEXT NOT NULL DEFAULT 'pending',
+  FOREIGN KEY (draft_id) REFERENCES pick_drafts(id) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS season_point_snapshots (
+  season_id INTEGER NOT NULL,
+  player_id INTEGER NOT NULL,
+  base_points INTEGER NOT NULL DEFAULT 0,
+  bonus_points INTEGER NOT NULL DEFAULT 0,
+  total INTEGER NOT NULL DEFAULT 0,
+  snapshotted_at TEXT NOT NULL DEFAULT (datetime('now')),
+  PRIMARY KEY (season_id, player_id),
+  FOREIGN KEY (season_id) REFERENCES seasons(id) ON DELETE CASCADE,
+  FOREIGN KEY (player_id) REFERENCES players(id) ON DELETE CASCADE
 );
 
 CREATE TABLE IF NOT EXISTS wiki_seen (
@@ -154,6 +200,20 @@ function migrate(db) {
   const seasonCols = cols("seasons");
   if (!seasonCols.has("start_date")) db.exec(`ALTER TABLE seasons ADD COLUMN start_date TEXT`);
   if (!seasonCols.has("live")) db.exec(`ALTER TABLE seasons ADD COLUMN live INTEGER NOT NULL DEFAULT 0`);
+  if (!seasonCols.has("announce_channel_id"))
+    db.exec(`ALTER TABLE seasons ADD COLUMN announce_channel_id TEXT`);
+  if (!seasonCols.has("announce_note"))
+    db.exec(`ALTER TABLE seasons ADD COLUMN announce_note TEXT`);
+  if (!seasonCols.has("phase")) {
+    db.exec(`ALTER TABLE seasons ADD COLUMN phase TEXT`);
+    // Einmaliger Backfill im selben Lauf, der die Spalte anlegt. Nur Zeilen,
+    // deren neue Spalte noch NULL ist (zweiter Lauf schreibt nichts neu).
+    db.exec(`
+      UPDATE seasons SET phase = 'running'  WHERE phase IS NULL AND active = 1 AND live = 1;
+      UPDATE seasons SET phase = 'setup'    WHERE phase IS NULL AND active = 1 AND live = 0;
+      UPDATE seasons SET phase = 'archived' WHERE phase IS NULL AND active = 0;
+    `);
+  }
 
   const celebCols = cols("celebs");
   const addCeleb = (name, ddl) => {
@@ -226,6 +286,32 @@ function migrate(db) {
   if (reviewCols.size && !reviewCols.has("proposed_candidates")) {
     db.exec(`ALTER TABLE celeb_review_queue ADD COLUMN proposed_candidates TEXT`);
   }
+  if (reviewCols.size && !reviewCols.has("season_id")) {
+    db.exec(`ALTER TABLE celeb_review_queue ADD COLUMN season_id INTEGER`);
+  }
+
+  const pickCols = cols("picks");
+  if (pickCols.size && !pickCols.has("age_at_pick")) {
+    db.exec(`ALTER TABLE picks ADD COLUMN age_at_pick INTEGER`);
+  }
+
+  const awardCols = cols("death_awards");
+  if (awardCols.size && !awardCols.has("season_id")) {
+    db.exec(`ALTER TABLE death_awards ADD COLUMN season_id INTEGER`);
+    // Bestandszeilen: die damals aktive Saison eintragen, nur im Anlege-Lauf.
+    db.exec(`
+      UPDATE death_awards SET season_id = (SELECT id FROM seasons WHERE active = 1 LIMIT 1)
+      WHERE season_id IS NULL;
+    `);
+    // Unique-Index auf (celeb_id, player_id) würde 2027 die zweite Gutschrift
+    // derselben Person blockieren -> saisonweiter Index, NULL-gestückter Altbestand
+    // ist damit verloren, applyDeath schreibt ab diesem Release immer season_id mit.
+    db.exec(`DROP INDEX IF EXISTS idx_death_awards_celeb_player`);
+    db.exec(`
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_death_awards_celeb_player_season
+        ON death_awards(celeb_id, player_id, season_id);
+    `);
+  }
 
   // Dedupe death_awards before unique index
   db.exec(`
@@ -273,6 +359,46 @@ function migrate(db) {
       celeb_id INTEGER NOT NULL,
       expires_at TEXT NOT NULL,
       FOREIGN KEY (celeb_id) REFERENCES celebs(id) ON DELETE CASCADE
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_review_season_status
+      ON celeb_review_queue(season_id, status);
+
+    CREATE TABLE IF NOT EXISTS pick_drafts (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      player_id INTEGER NOT NULL,
+      season_id INTEGER NOT NULL,
+      status TEXT NOT NULL DEFAULT 'draft',
+      updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+      UNIQUE (player_id, season_id),
+      FOREIGN KEY (player_id) REFERENCES players(id) ON DELETE CASCADE,
+      FOREIGN KEY (season_id) REFERENCES seasons(id) ON DELETE CASCADE
+    );
+
+    CREATE TABLE IF NOT EXISTS pick_draft_entries (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      draft_id INTEGER NOT NULL,
+      position INTEGER NOT NULL,
+      raw_name TEXT NOT NULL,
+      wiki_url TEXT,
+      wiki_norm TEXT,
+      qid TEXT,
+      proposed_age INTEGER,
+      candidates_json TEXT,
+      link_status TEXT NOT NULL DEFAULT 'pending',
+      FOREIGN KEY (draft_id) REFERENCES pick_drafts(id) ON DELETE CASCADE
+    );
+
+    CREATE TABLE IF NOT EXISTS season_point_snapshots (
+      season_id INTEGER NOT NULL,
+      player_id INTEGER NOT NULL,
+      base_points INTEGER NOT NULL DEFAULT 0,
+      bonus_points INTEGER NOT NULL DEFAULT 0,
+      total INTEGER NOT NULL DEFAULT 0,
+      snapshotted_at TEXT NOT NULL DEFAULT (datetime('now')),
+      PRIMARY KEY (season_id, player_id),
+      FOREIGN KEY (season_id) REFERENCES seasons(id) ON DELETE CASCADE,
+      FOREIGN KEY (player_id) REFERENCES players(id) ON DELETE CASCADE
     );
   `);
 }
