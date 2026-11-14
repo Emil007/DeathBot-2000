@@ -869,10 +869,16 @@ function getOrCreateDraft(playerId, seasonId) {
   return db.prepare("SELECT * FROM pick_drafts WHERE id = ?").get(info.lastInsertRowid);
 }
 
-function addDraftNames(draftId, names) {
+function addDraftNames(draftId, names, opts = {}) {
   const draft = db.prepare("SELECT * FROM pick_drafts WHERE id = ?").get(draftId);
   if (!draft) throw new Error("Draft nicht gefunden.");
   if (draft.status !== "draft") throw new Error("Draft bereits finalisiert.");
+  const existingCount = db
+    .prepare("SELECT COUNT(*) c FROM pick_draft_entries WHERE draft_id = ?")
+    .get(draftId).c;
+  // Globales Karten-Limit pro Spieler (& pro Draft): auch über mehrere DMs
+  // verteilte Namen dürfen das Limit nicht überschreiten — nicht nur pro Paste.
+  const maxNames = Number.isFinite(Number(opts.maxNames)) ? Number(opts.maxNames) : 50;
   const maxPos = db
     .prepare("SELECT COALESCE(MAX(position), 0) AS m FROM pick_draft_entries WHERE draft_id = ?")
     .get(draftId).m;
@@ -881,12 +887,15 @@ function addDraftNames(draftId, names) {
      VALUES (?, ?, ?, 'pending')`
   );
   let pos = maxPos;
+  let added = 0;
   for (const name of names) {
+    if (existingCount + added >= maxNames) break;
     pos += 1;
     stmt.run(draftId, pos, name);
+    added += 1;
   }
   db.prepare("UPDATE pick_drafts SET updated_at = datetime('now') WHERE id = ?").run(draftId);
-  return pos - maxPos;
+  return { added, truncated: names.length > added, limit: maxNames };
 }
 
 /** Maximale Namen in einem Draft (Karte selbst, 25 eingebettete Felder -> Sicherheit). */

@@ -34,6 +34,12 @@ services:
       DEATH_CONFIRM_DAYS: "7"
       # Full-year wiki scrape (matching + all-deaths + retract checks). Default 3am.
       NIGHTLY_FULL_SCRAPE_HOUR: "3"
+      # Max names/picks per player list (the Tipp-Assistent caps the whole draft at this,
+      # across multiple DMs — not just per paste). Default 50.
+      MAX_PICKS_PER_PLAYER: "50"
+      # User-Agent sent to Wikipedia (skilled scraping / rate-limit friendliness).
+      # GitHub repo + contact so Wikimedia ops can reach you if needed:
+      USER_AGENT: "DeathBot-2000/1.0 (Discord death-pool bot; +https://github.com/Emil007/DeathBot-2000)"
       # Custom phrases: /app/data/custom_phrases.txt
       CUSTOM_PHRASES: "no"
       # CUSTOM_PHRASES: "mix"

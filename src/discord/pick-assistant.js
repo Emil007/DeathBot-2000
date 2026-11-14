@@ -534,7 +534,7 @@ async function tryConsumePickMessage(ctx, msg) {
   }
 
   // Liste / einzelne Namen
-  const parsed = parsePickList(body);
+  const parsed = parsePickList(body, { maxNames: ctx.config.maxPicksPerPlayer });
   if (!parsed.names.length) {
     return false; // keine Namen - nicht konsumieren
   }
@@ -543,20 +543,21 @@ async function tryConsumePickMessage(ctx, msg) {
     .prepare("SELECT * FROM players WHERE discord_user_id = ?")
     .get(String(msg.author.id)) || db.upsertPlayer({ displayName: msg.author.username, discordUserId: msg.author.id });
   const draft = db.getOrCreateDraft(playerRow.id, season.id);
-  db.addDraftNames(draft.id, parsed.names);
+  const cap = ctx.config.maxPicksPerPlayer;
+  const added = db.addDraftNames(draft.id, parsed.names, { maxNames: cap });
 
   await logEvent(ctx.client, ctx.config, {
     kind: "pick-add",
-    summary: `+${parsed.names.length} Namen (Saison ${season.year})`,
+    summary: `+${added.added} Namen (Saison ${season.year})`,
     userId: msg.author.id,
     detail: parsed.names.join(" | ").slice(0, 1200),
   });
   if (parsed.duplicates.length) {
     await msg.reply(`Doppelte ignoriert: ${parsed.duplicates.join(", ")}`);
   }
-  if (parsed.truncated) {
+  if (parsed.truncated || added.truncated) {
     await msg.reply(
-      `⚠️ Mehr als **50** Namen — ich habe bei 50 abgeschnitten, der Rest (${body.split(/[\n;,]|-|/).filter(Boolean).length} erkannt) wurde ignoriert. Teil sie in zwei Meldungen auf.`
+      `⚠️ Maximal **${cap}** Karten in deiner Liste — ich habe bei ${cap} abgeschnitten (${parsed.names.length} erkannt). Teil sie in mehrere Meldungen auf oder entferne zuerst Karten.`
     );
   }
   await respondPick(ctx, msg.channel, msg.author.id, season);

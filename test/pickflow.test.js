@@ -42,6 +42,31 @@ test("parser: normal list not truncated", () => {
   assert.strictEqual(res.names.length, 3);
 });
 
+test("global draft cap: addDraftNames across DMs never exceeds maxNames", () => {
+  db.openAnnouncedSeason({
+    year: 2027,
+    startDate: "2027-01-01",
+    channelId: "777",
+    note: null,
+  });
+  const season = db.getAnnouncedSeason();
+  const pid = db.getDb().prepare("INSERT INTO players (display_name, discord_user_id, base_points) VALUES ('Capper','654','0')").run().lastInsertRowid;
+  const draft = db.getOrCreateDraft(pid, season.id);
+
+  // ein Limit von 3: drei DMs à 2 Namen -> nur 3 landen im Draft
+  const names = Array.from({ length: 6 }, (_, i) => `Name ${i + 1}`);
+  const cap = 3;
+  const r1 = db.addDraftNames(draft.id, names.slice(0, 2), { maxNames: cap });
+  const r2 = db.addDraftNames(draft.id, names.slice(2, 5), { maxNames: cap });
+  const r3 = db.addDraftNames(draft.id, names.slice(5), { maxNames: cap });
+  assert.strictEqual(r1.added, 2);
+  assert.strictEqual(r2.added, 1, "second DM only fills up to cap");
+  assert.strictEqual(r2.truncated, true, "excess reported");
+  assert.strictEqual(r3.added, 0, "draft full -> nothing added");
+  assert.strictEqual(db.listDraftEntries(draft.id).length, cap);
+  assert.strictEqual(r3.limit, cap);
+});
+
 test("unlock: draft -> finalize -> unlock -> draft again", () => {
   db.openAnnouncedSeason({
     year: 2027,

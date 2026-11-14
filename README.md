@@ -118,6 +118,8 @@ Non-admins may **see** admin slash commands in Discord’s picker (Discord limit
 | `NIGHTLY_FULL_SCRAPE_HOUR` | Full-year scrape (`3`) |
 | `DAILY_SUMMARY_HOUR` | Daily digest (`9`) |
 | `DEATH_CONFIRM_DAYS` | Days before a hit is locked (`7`) |
+| `MAX_PICKS_PER_PLAYER` | Max names per player list (whole draft, across DMs) (`50`) |
+| `USER_AGENT` | Wikipedia User-Agent (own repo + contact recommended) |
 | `CHANNEL_ALL_DEATHS` | Optional factual feed |
 | `CHANNEL_ADMIN` | Optional ops channel; empty = DM-first |
 | `CHANNEL_LOG` | Optional log channel for inputs/changes/errors (no scan-run logs) |

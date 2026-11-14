@@ -36,9 +36,12 @@ function splitBySeparators(text) {
 }
 
 /**
+ * @param {string} text
+ * @param {{ maxNames?: number }} [opts] maxNames: Karten-Obergrenze pro Einreichung
+ *   (Default 50; steuerbar via MAX_PICKS_PER_PLAYER, gelangt von der DM hierhin).
  * @returns {{ names: string[], error?: string, duplicates: string[], truncated?: boolean }}
  */
-function parsePickList(text) {
+function parsePickList(text, opts = {}) {
   if (!text || !String(text).trim()) {
     return { names: [], error: "Keine Namen erkannt." };
   }
@@ -46,9 +49,10 @@ function parsePickList(text) {
   const names = [];
   const duplicates = [];
   const seen = new Set();
-  // Maximale Kartenzahl pro Spieler: 50. Mehr Namen in einer Paste werden
-  // sauber gekappt (embed bleibt ~2000 Zeichen, Discord-fähig).
-  const MAX_NAMES = 50;
+  // Maximale Kartenzahl pro Spieler: 50 (Default). Mehr Namen in einer Paste
+  // werden sauber gekappt (auf die Obergrenze), Discord-fähig. Als Env
+  // MAX_PICKS_PER_PLAYER übersteuerbar.
+  const MAX_NAMES = Number.isFinite(Number(opts.maxNames)) ? Number(opts.maxNames) : 50;
   for (const t of tokens) {
     const k = nameKey(t);
     if (!k) continue;
