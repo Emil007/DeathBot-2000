@@ -1164,7 +1164,7 @@ function getAnnouncedPreStartDeathsUnwarned(seasonId) {
        WHERE pk.season_id = ?
          AND c.is_alive = 0
          AND (
-           (c.died_at IS NOT NULL AND c.died_at <= ?)
+           (c.died_at IS NOT NULL AND c.died_at < ?)
            OR
            (c.died_at IS NULL AND c.death_detected_at IS NOT NULL AND c.death_detected_at < ?)
          )
@@ -1503,7 +1503,56 @@ function seasonReview(seasonId) {
   const rows = Object.values(byPlayer)
     .map((r) => ({ ...r, total: r.total || 0 }))
     .sort((a, b) => b.total - a.total || b.hits - a.hits);
-  return { season, rows, deaths: awardRows.length };
+  // F20(c): deaths = ANZAHL VERSCHIEDENER Toter, nicht Award-Zeilen. Zehn
+  // Spieler auf demselben Toten sind EIN Todesfall, nicht zehn.
+  const deaths = new Set(awardRows.map((a) => a.celeb_id)).size;
+  return { season, rows, deaths };
+}
+
+/**
+ * Live-Auswertung einer NOCH LAUFENDEN Saison (F20(b)): Punktestände werden
+ * direkt aus base_points + Boni (playerTotal) gerechnet — NICHT aus
+ * season_point_snapshots, die erst activateAnnouncedSeason beim Archivieren
+ * schreibt. Für den einmaligen Jahresbericht am 01.01. (ohne Wechsel) braucht
+ * es exakt dieselben Summen wie activateAnnouncedSeason, nur ohne die Saison
+ * zu archivieren. Bonus-only-Spieler sind enthalten, weil je Spieler
+ * base_points + Boni aufsummiert werden.
+ */
+function seasonLiveReview(seasonId) {
+  const season = db.prepare("SELECT * FROM seasons WHERE id = ?").get(seasonId);
+  if (!season) return null;
+
+  const players = db.prepare("SELECT * FROM players").all();
+  const awardRows = db
+    .prepare(
+      `SELECT da.celeb_id, p.id AS player_id, p.display_name FROM death_awards da
+       INNER JOIN players p ON p.id = da.player_id
+       WHERE da.season_id = ?`
+    )
+    .all(seasonId);
+
+  const byPlayer = {};
+  for (const p of players) {
+    const bonuses = db
+      .prepare(
+        `SELECT COALESCE(SUM(b.points * pb.times), 0) AS s FROM player_bonuses pb
+         INNER JOIN bonuses b ON b.id = pb.bonus_id WHERE pb.player_id = ?`
+      )
+      .get(p.id).s;
+    const total = p.base_points + bonuses;
+    byPlayer[p.id] = { name: p.display_name, total, points: total, hits: 0 };
+  }
+  for (const a of awardRows) {
+    if (!byPlayer[a.player_id]) {
+      byPlayer[a.player_id] = { name: a.display_name, total: 0, points: 0, hits: 0 };
+    }
+    byPlayer[a.player_id].hits++;
+  }
+  const rows = Object.values(byPlayer)
+    .map((r) => ({ ...r, total: r.total || 0 }))
+    .sort((a, b) => b.total - a.total || b.hits - a.hits);
+  const deaths = new Set(awardRows.map((a) => a.celeb_id)).size;
+  return { season, rows, deaths };
 }
 
 function getPlayerPicks(discordUserId) {
@@ -1900,6 +1949,7 @@ module.exports = {
   getAnnouncedPreStartDeathsUnwarned,
   markAnnouncedDeathWarned,
   seasonReview,
+  seasonLiveReview,
   setPickAgeAtPick,
   celebHasRunningPick,
   nameKey,

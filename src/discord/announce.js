@@ -107,7 +107,7 @@ async function processDeathpoolHit(
   const ageLine =
     age != null
       ? `Alter (Pool-Start): **${age}** → Punkte **${score}** (=100−Alter)`
-      : "Alter unbekannt → 0 Punkte";
+      : "Alter unbekannt";
   const wikiAgeLine =
     wikiAge != null && wikiAge !== age ? `Alter (Wiki-Text): ${wikiAge}` : null;
 
@@ -474,7 +474,7 @@ async function announceSimulatedDeath(
   const ageLine =
     age != null
       ? `Alter (Pool-Start): **${age}** → Punkte **${score}** (=100−Alter)`
-      : "Alter unbekannt → 0 Punkte";
+      : "Alter unbekannt";
 
   // Names only — never <@id> (no pings in simulation)
   let deathpoolValue;

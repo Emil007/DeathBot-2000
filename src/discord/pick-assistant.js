@@ -27,9 +27,12 @@ const REMOVE_RE = /^entfern\w*\s+(\d+)$/i;
 // F09: Die Anleitung sagt `ändern 3 Neuer Name` (mit n). `ändern`, `ändere`,
 // `aendere`, `aendern` … müssen ALLE greifen — analog zu REMOVE_RE (entfern\w*).
 const CHANGE_RE = /^(?:änder\w*|aender\w*|change)\s+(\d+)\s+(.+)$/i;
-// F09: Mehrdeutige/unbekannte Befehlzeilen der Form `verb nummer rest` NICHT
-// als Namen importieren (sonst landet „xyz 3 abc“ als Karte im Draft).
-const UNKNOWN_CMD_RE = /^\S+\s+\d+\s+\S+/;
+// F26: NUR Zeilen mit dokumentierten BEFEHL-Verben (typische + offensichtliche
+// Tippfehler wie `aendrn`) als Kommando klassifizieren — NICHT jede Zeile mit
+// einer Zahl. Namen wie „Boeing 737 Max” oder „Apollo 13 Crew” fallen nicht
+// darunter und bleiben Karten. Das Rest-Wort darf Leerzeichen enthalten
+// („ändern 3 Neuer Name“), das Verb muss die Zeile anführen.
+const UNKNOWN_CMD_RE = /^\s*(?:änder\w*|aender\w*|aendr\w*|entfern\w*|link\w*|falsch\w*|nein\w*|wrong\w*|chang\w*|remove\w*|unlock\w*|fertig\w*|done\w*|end\w*)(?:\s+\d+\s+.+|\s+\d+)$/i;
 const UNLOCK_RE = /^(unlock|entsperren|oeffnen|öffnen)$/i;
 const LINK_URL_RE = /^link\s+(\d+)\s+(\S+\.wikipedia\.org\/wiki\/\S+)$/i;
 const WRONG_RE = /^(?:falsch|nein|wrong|nicht richtig|falsche)\s*(?:\s*(\d+))?$/i;
@@ -237,10 +240,17 @@ async function handlePickInteraction(ctx, interaction) {
     await interaction.followUp?.({ content: "Kandidat ungültig.", ephemeral: true }).catch(() => {});
     return true;
   }
-  // R2-4/F08c: Laufenden Auto-Resolver stoppen, damit er die manuelle Wahl
-  // NICHT überschreibt. Nur wenn wirklich ein Lauf läuft — sonst bliebe das
-  // Flag bis zum nächsten Lauf hängen. Löschen übernimmt der Resolver finally.
-  if (busyUsers.has(userId)) interruptUsers.add(userId);
+  // R2-4/F08c: Manuelle Wahl gegen den laufenden Auto-Resolver schützen
+  // (recheckEntry lässt sie nicht überschreiben). Nur wenn wirklich ein Lauf
+  // läuft — sonst bliebe das Flag bis zum nächsten Lauf hängen.
+  if (busyUsers.has(userId)) {
+    interruptUsers.add(userId);
+    // F22: Select muss denselben Nachlauf anstoßen wie die URL-Pfade — sonst
+    // bleiben übrige pending-Namen liegen, wenn der laufende Lauf gerade
+    // Pause macht. Der Resolver-`finally` zieht GENAU EINEN weiteren Lauf
+    // nach, der die Rest-Namen auflöst.
+    rerunUsers.add(userId);
+  }
   // Diese Wahl ist synchron — keine URL-Asynchronität, in der ein Resolver
   // überschreiben könnte (await-frei bis zum nächsten Send).
   db.setDraftEntryLinked(entryId, {
@@ -619,13 +629,23 @@ async function tryConsumePickMessage(ctx, msg) {
 
   // Liste / einzelne Namen
   const parsed = parsePickList(body, { maxNames: ctx.config.maxPicksPerPlayer });
-  // F09: Mehrdeutige/unbekannte Befehlszeilen der Form `verb nummer rest`
-  // (z.B. Tippfehler „ändern 3 Neuer Name“ oder ein unbekanntes Kommando)
-  // NICHT als Namen importieren — solche Zeilen werden herausgefiltert.
-  // Bleibt gar nichts übrig, wird die DM nicht konsumiert.
+  // F26: Erkannte unerkannte BEFEHL-Zeilen (nur dokumentierte Verben, siehe
+  // UNKNOWN_CMD_RE) NICHT als Namen importieren. Echte Namen mit Zahlen
+  // („Boeing 737 Max“, „Apollo 13 Crew“) fallen NICHT darunter.
   const cleanNames = parsed.names.filter((n) => !UNKNOWN_CMD_RE.test(n.trim()));
-  if (!cleanNames.length) {
+  // F26: Kommando-Zeilen in einer Mehrzeilen-DM nicht STILL verschlucken —
+  // sie werden klar benannt („mit einem Satz ablehnen“ statt heimlich löschen).
+  const cmdLines = parsed.names.filter((n) => UNKNOWN_CMD_RE.test(n.trim()));
+  if (!parsed.names.length) {
     return false; // keine (anerkannten) Namen - nicht konsumieren
+  }
+  if (!cleanNames.length) {
+    // F26: ausschließlich eine unbekannte Befehlzeile — deutlich ablehnen, die
+    // DM ist verbraucht (kein „false“ ohne Antwort, kein Speichern).
+    await msg.reply(
+      "Das sieht nach einem unbekannten Befehl aus (nur `ändern <Nr> <Name>`, `entfernen <Nr>`, `link <Nr> <URL>`, `fertig`, `unlock` und `falsch [<Nr>]` sind Befehle). Namen speichere ich unverändert."
+    );
+    return true;
   }
   const playerRow = db
     .getDb()
@@ -634,6 +654,16 @@ async function tryConsumePickMessage(ctx, msg) {
   const draft = db.getOrCreateDraft(playerRow.id, season.id);
   const cap = ctx.config.maxPicksPerPlayer;
   const added = db.addDraftNames(draft.id, cleanNames, { maxNames: cap });
+
+  // F26: Unbekannte Befehlzeilen in einer Mehrzeilen-DM transparent melden,
+  // statt sie still zu verschlucken — die restlichen Zeilen wurden gespeichert.
+  if (cmdLines.length) {
+    await msg.reply(
+      `Diese Zeilen sehen nach Befehlen aus und wurden NICHT als Namen gespeichert: ${cmdLines
+        .map((c) => `\`${c}\``)
+        .join(", ")} — für Ändern/Entfernen/Linken kennst du die Form \`ändern <Nr> <Name>\` & Co.`
+    );
+  }
 
   await logEvent(ctx.client, ctx.config, {
     kind: "pick-add",
@@ -701,9 +731,14 @@ async function resolvePendingSynchronous(ctx, channel, userId, season, draftId, 
       }
       let i = 0;
       for (const e of pendings) {
-        // R2-4: User hat währenddessen manuell eingegriffen (Menü/„falsch") —
-        // laufenden Auto-Lauf stoppen statt dessen Wahl zu überschreiben.
-        if (interruptUsers.has(userId)) break;
+        // F22: KEIN break über interruptUsers — ein manueller Link/Select
+        // während des Laufs darf NICHT die saubere Auflösung der übrigen
+        // Zeilen abbrechen. Der Überschreibschutz läuft ohnehin Eintrag für
+        // Eintrag: eine manuell bearbeitete Zeile (Status ≠ pending bzw.
+        // fremder Claim) wird per recheckEntry einfach übersprungen, die
+        // übrigen pending-Zeilen (inkl. geclaimter wiki_url) lösen sich weiter
+        // über lookupUrl auf. So endet ein `link N`-Interrupt mit der Zeile
+        // linked/unlinked statt hängend pending.
         // F08b: Zeile VOR jedem Verarbeiten frisch lesen — seit dem Snapshot
         // kann eine manuelle Wahl / URL-Linkung sie aus pending genommen haben.
         const fresh = db
@@ -781,11 +816,22 @@ async function resolvePendingSynchronous(ctx, channel, userId, season, draftId, 
       await respondPick(ctx, channel, userId, season);
     }
   } finally {
+    // F22: Der Lauf ist hier WIRKLICH beendet (alle Zeilen verarbeitet bzw.
+    // alle manuell vergebenen Claims respektiert) — erst JETZT Flags löschen.
     busyUsers.delete(userId);
-    // F08c: Interrupt-Flag NUR löschen, wenn der Lauf WIRKLICH beendet ist —
-    // nicht vorzeitig nach einem einzelnen `link`/Menu, damit keins davon durch
-    // einen fortsetzenden Resolver überschrieben werden kann.
     interruptUsers.delete(userId);
+    // F22 Nachlauf-Loch: Eine DM, die exakt zwischen der Schleife und diesem
+    // finally eintraf (respondPick-Fenster), hat rerunUsers gesetzt, aber der
+    // do/while sah es nicht mehr. busyUsers ist hier schon gelöscht, also
+    // startet resolvePendingSynchronous einen FRISCHEN Lauf; dessen Schleife
+    // löscht rerunUsers gleich am Anfang und bricht sauber ab, sobald alle
+    // pending-Zeilen erledigt sind. GENAU EIN Nachlauf genügt: neue DMs in
+    // dessen Lauf setzen rerunUsers erneut, was ein weiterer finally-Nachlauf
+    // (bzw. der do/while) abdeckt.
+    if (rerunUsers.has(userId)) {
+      rerunUsers.delete(userId);
+      void resolvePendingSynchronous(ctx, channel, userId, season, draftId, mode);
+    }
   }
 }
 

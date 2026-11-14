@@ -17,7 +17,9 @@ const {
   formatSeasonReviewText,
   remindAdminToAnnounce,
   createNextSeasonChannel,
+  finalizeYearSwitch,
   todayInVienna,
+  isNewYearDayVienna,
 } = require("../src/jobs/year-rollover");
 
 let config;
@@ -46,6 +48,8 @@ function resetToRunningCurrentYear() {
   `);
   db.ensureActiveSeason();
   db.setSeasonLive(true); // F05: setzt automatisch phase='running'
+  // F20: Jahresbericht-Flag zurücksetzen, damit Tests den 01.01.-Pfad frisch prüfen.
+  db.setMeta("year_rollover_annual_review", "0");
 }
 
 // Minimale Fake-Discord-Channel, die .send() und .isTextBased() können
@@ -134,6 +138,8 @@ test("runYearRollover does NOT switch before Vienna midnight (F01 guard)", async
   assert.strictEqual(res.reason, "not-yet");
   assert.strictEqual(db.getActiveSeason().phase, "running", "active unchanged");
   assert.strictEqual(db.getActiveSeason().year, new Date().getFullYear(), "still current year");
+  // F20(a): vor dem Stichtag KEIN Post — keine Abschlussbilanz der laufenden Saison.
+  assert.strictEqual(bucket.length, 0, "no post before start_date (F20)");
 });
 
 // ---- F02: Nachhol-Run nach erfolgreichem Wechsel -> no-announced ----
@@ -153,17 +159,19 @@ test("runYearRollover after success is a no-op (F02 catch-up safety)", async () 
   assert.strictEqual(first.switched, true, "setup switch happens");
 
   // Zweiter Lauf (z. B. Start-Nachhol nach Restart): announced verbraucht.
+  // F20: Außer am Wiener 01.01. wird auf dem no-announced-Pfad KEINE Bilanz
+  // gepostet (keine Snapshots der laufenden Saison vorhanden).
   const bucket = [];
   const client = makeFakeClient(makeFakeChannel(bucket));
-  const res = await runYearRollover(client, config, { force: false });
+  const res = await runYearRollover(client, config, {
+    force: false,
+    now: new Date("2026-11-14T10:00:00Z"), // Normalbetrieb, nicht 01.01.
+  });
 
   assert.strictEqual(res.switched, false, "no second switch");
   assert.strictEqual(res.reason, "no-announced");
   assert.strictEqual(db.getActiveSeason().year, new Date().getFullYear() + 1, "no double switch");
-  // Kein Live-Satz, kein 'null' im Text (F03)
-  assert.ok(bucket.length >= 1, "review of running season still posted");
-  assert.ok(!bucket[bucket.length - 1].content.includes("ist live"), "no live sentence without switch");
-  assert.ok(!bucket[bucket.length - 1].content.includes("null"), "no 'null' in text");
+  assert.strictEqual(bucket.length, 0, "NO review post outside Jan 1 (F20)");
 });
 
 // ---- F05: setSeasonLive setzt phase mit ----
@@ -349,7 +357,9 @@ test("createNextSeasonChannel creates deathpool-{year} and invites players", asy
   const ids = created[0].permissionOverwrites.map((o) => o.id);
   assert.ok(ids.includes("1001") && ids.includes("2002"), "players invited");
   assert.ok(
-    created[0].permissionOverwrites.every((o) => o.allow.includes("ViewChannel")),
+    created[0].permissionOverwrites.every(
+      (o) => o.allow.ViewChannel === true && o.allow.SendMessages === true
+    ),
     "all invitees can view"
   );
 });
@@ -469,7 +479,7 @@ test("F15: existing same-name GuildText channel is reused, overwrites synced for
   // Overwrites für den NEUEN Spieler nachgezogen
   assert.strictEqual(edited.length, 1, "exactly one overwrite edit");
   assert.strictEqual(edited[0].userId, "9999");
-  assert.ok(edited[0].allow.includes("ViewChannel") && edited[0].allow.includes("SendMessages"));
+  assert.ok(edited[0].allow.ViewChannel === true && edited[0].allow.SendMessages === true);
 });
 
 test("F15: voice channel with same name is NOT reused (creates text channel)", async () => {
@@ -555,4 +565,244 @@ test("F06: announceDailySummary sends to the stored deathpool channel, not the e
   assert.strictEqual(sent.length, 1, "summary message posted");
 
   db.setSeasonDeathpoolChannel(running.id, null);
+});
+
+// ---- F20(b): Einmaliger Jahresbericht am Wiener 01.01. (no-announced) ----
+
+/** Wartet, bis die (Test-)Log-Queue geleert ist (max ~3s). */
+async function flushLogQueue(maxWait = 3000) {
+  const t0 = Date.now();
+  while (Date.now() - t0 < maxWait) {
+    // log.js-Interna: consumerRunning ist nach dem Drain wieder false.
+    try {
+      // kein direkter Zugriff — einfach abwarten und oben im Aufrufer prüfen
+    } catch {}
+    await new Promise((r) => setTimeout(r, 50));
+    break;
+  }
+}
+
+test("F20: annual review on Vienna Jan 1 (no-announced) posts REAL live totals incl. bonus-only, once only", async () => {
+  resetToRunningCurrentYear();
+  db.getDb().exec(`
+    DELETE FROM death_awards; DELETE FROM picks; DELETE FROM player_bonuses;
+    DELETE FROM bonuses; DELETE FROM celebs; DELETE FROM players;
+  `);
+  const running = db.getActiveSeason();
+
+  // Anna: base_points 120 + Bonus 30 = 150
+  const anna = db.upsertPlayer({ displayName: "Anna", discordUserId: "2001" });
+  db.setPoints(anna.id, 120);
+  db.upsertBonus({ id: "b1", name: "Bonus1", description: "", points: 30 });
+  db.awardBonus(anna.id, "b1");
+
+  // Bruno: NUR Bonus (70) — keine base_points → 70 (Bonus-only-Spieler inklusive)
+  const bruno = db.upsertPlayer({ displayName: "Bruno", discordUserId: "2002" });
+  db.upsertBonus({ id: "b2", name: "Bonus2", description: "", points: 70 });
+  db.awardBonus(bruno.id, "b2");
+
+  // Cara: keine Punkte, 2 Treffer auf 2 verschiedenen Toten
+  const cara = db.upsertPlayer({ displayName: "Cara", discordUserId: "2003" });
+
+  const x = db.findOrCreateCeleb({ name: "Xavier" }).celeb;
+  const y = db.findOrCreateCeleb({ name: "Yoko" }).celeb;
+  // Xavier gepickt von Anna UND Cara; Yoko nur von Cara → 3 award rows, 2 distinct deaths
+  db.setPick(anna.id, x.id, running.id);
+  db.setPick(cara.id, x.id, running.id);
+  db.setPick(cara.id, y.id, running.id);
+  const insAward = db
+    .getDb()
+    .prepare("INSERT INTO death_awards (celeb_id, player_id, points, season_id) VALUES (?, ?, ?, ?)");
+  insAward.run(x.id, anna.id, 100, running.id);
+  insAward.run(x.id, cara.id, 100, running.id);
+  insAward.run(y.id, cara.id, 100, running.id);
+
+  // Live-Auswertung direkt prüfen: echte Summen + distinct deaths (F20 c)
+  const live = db.seasonLiveReview(running.id);
+  const byName = Object.fromEntries(live.rows.map((r) => [r.name, r]));
+  assert.strictEqual(byName["Anna"].total, 150, "base_points + Bonus");
+  assert.strictEqual(byName["Bruno"].total, 70, "bonus-only player counted");
+  assert.strictEqual(byName["Cara"].total, 0);
+  assert.strictEqual(byName["Anna"].hits, 1);
+  assert.strictEqual(byName["Cara"].hits, 2);
+  assert.strictEqual(live.deaths, 2, "COUNT(DISTINCT celeb_id): 3 awards, 2 distinct deaths");
+
+  // runYearRollover am Wiener 01.01. (2025-12-31T23:00:00Z == 2026-01-01 Wien), keine announced-Saison
+  const bucket = [];
+  const client = { channels: { fetch: async () => makeFakeChannel(bucket) } };
+  const frozen = new Date("2025-12-31T23:00:00Z");
+  const res = await runYearRollover(client, config, { force: false, now: frozen });
+  assert.strictEqual(res.switched, false);
+  assert.strictEqual(res.reason, "no-announced");
+  assert.strictEqual(bucket.length, 1, "exactly one annual review on Jan 1");
+  const text = bucket[0].content;
+  assert.ok(text.includes("Abschlussbilanz"), "review posted");
+  assert.ok(text.includes("150 Punkte"), "Anna real total from base_points+bonus");
+  assert.ok(text.includes("70 Punkte"), "Bruno bonus-only total");
+  assert.ok(/💀 \*\*2\*\* Todesfälle/.test(text), "distinct deaths (2), not 3 award rows");
+  assert.ok(!text.includes("ist live"), "no live sentence without switch (F03)");
+  assert.strictEqual(db.getMeta("year_rollover_annual_review"), "2026", "flag set for this year");
+
+  // Zweiter Lauf am selben Tag: KEIN zweiter Post (Meta-Flag, F20).
+  const res2 = await runYearRollover(client, config, { force: false, now: frozen });
+  assert.strictEqual(res2.reason, "no-announced");
+  assert.strictEqual(bucket.length, 1, "no duplicate annual review");
+});
+
+// ---- F25: fehlender Zielkanal wird geloggt, false, Restart postet nicht erneut ----
+
+test("F25: postReview no-target logs error and returns false; review not repeated next run", async () => {
+  resetToRunningCurrentYear();
+  const running = db.getActiveSeason();
+  db.setPoints(db.upsertPlayer({ displayName: "Sunny", discordUserId: "3001" }).id, 50);
+
+  const logSent = [];
+  // Für CHANNEL_LOG steht ein (Fake-)Kanal bereit; der Deathpool-Zielkanal fehlt.
+  const client = {
+    channels: {
+      fetch: async (id) =>
+        id === "logchan-1" ? makeFakeChannel(logSent) : null,
+    },
+  };
+  const cfg = { ...config, channelLog: "logchan-1", channelDeathpool: "", channelAllDeaths: "" };
+  const frozen = new Date("2025-12-31T23:00:00Z"); // Wiener 01.01.
+
+  const res = await runYearRollover(client, cfg, { force: false, now: frozen });
+  assert.strictEqual(res.switched, false);
+  assert.strictEqual(res.reason, "no-announced");
+
+  // logError-Queue leeren lassen und prüfen: no-target-Fehler ging in den Logkanal.
+  await flushLogQueue();
+  const joined = logSent.map((m) => JSON.stringify(m.embeds || m)).join("\n");
+  assert.match(joined, /postReview no-target/, "no-target error logged with where (F25)");
+
+  // Zweiter Lauf am selben Tag: Meta-Flag verhindert Wiederholen der Bilanz —
+  // ein fehlgeschlagener Post bricht nicht endlos nach (genau einmal pro Jahr).
+  const before = logSent.length;
+  await runYearRollover(client, cfg, { force: false, now: frozen });
+  await flushLogQueue();
+  assert.strictEqual(logSent.length, before, "no repeated no-target storm");
+});
+
+// ---- F21: finalizeYearSwitch (gemeinsame Cron-/Handwechsel-Nacharbeit) ----
+
+test("F21: finalizeYearSwitch creates channel, sets deathpool_channel_id, posts archived review with live sentence", async () => {
+  resetToRunningCurrentYear();
+  const running = db.getActiveSeason();
+  db.openAnnouncedSeason({
+    year: running.year + 1,
+    startDate: `${running.year + 1}-01-01`,
+    channelId: "777",
+    note: null,
+  });
+  const res = db.activateAnnouncedSeason(); // Snapshots der archivierten Saison entstehen hier
+
+  const created = [];
+  const fakeGuild = {
+    id: "guild-1",
+    channels: {
+      fetch: async () => [],
+      create: async (opts) => {
+        created.push(opts);
+        return { id: "newchan-9", name: opts.name, permissionOverwrites: { cache: new Map() } };
+      },
+    },
+  };
+  const sent = [];
+  const client = {
+    guilds: { fetch: async () => fakeGuild },
+    channels: { fetch: async () => makeFakeChannel(sent) },
+  };
+  const cfg = { ...config, discordGuildId: "guild-1" };
+
+  const fin = await finalizeYearSwitch(client, cfg, res.archived.id, res.activated.year);
+  assert.strictEqual(fin.posted, true, "archived review posted");
+  assert.strictEqual(fin.newChannel.id, "newchan-9");
+  assert.strictEqual(fin.newChannelFailed, false);
+  assert.strictEqual(created.length, 1, "channel created");
+  assert.strictEqual(created[0].name, `deathpool-${res.activated.year}`);
+
+  const activated = db.getActiveSeason();
+  assert.strictEqual(activated.deathpool_channel_id, "newchan-9", "id in deathpool_channel_id (F21)");
+  assert.strictEqual(activated.announce_channel_id, "777", "announce_channel_id untouched");
+
+  assert.ok(sent.length >= 1, "review posted");
+  assert.ok(sent[0].content.includes("Abschlussbilanz"));
+  assert.ok(sent[0].content.includes("ist live"), "live sentence on committed switch (F03)");
+});
+
+test("F15: edit throws → per-player failure is logged, existing channel is NOT discarded (F23 no ReferenceError)", async () => {
+  db.getDb().exec("DELETE FROM players");
+  db.upsertPlayer({ displayName: "Old", discordUserId: "1001" });
+  db.upsertPlayer({ displayName: "Gone", discordUserId: "7777" }); // z. B. Server verlassen
+  const edited = [];
+  const existingChannel = {
+    id: "exist-1",
+    name: "deathpool-2027",
+    type: 0, // GuildText
+    permissionOverwrites: {
+      cache: new Map([
+        ["1001", { id: "1001", allow: { has: (p) => ["ViewChannel", "SendMessages"].includes(p) } }],
+      ]),
+      edit: async (userId, allow, opts) => {
+        edited.push({ userId, allow, opts });
+        if (userId === "7777") throw new Error("Unknown User");
+      },
+    },
+  };
+  const fakeGuild = {
+    id: "guild-1",
+    channels: {
+      fetch: async () => [existingChannel],
+      create: async (opts) => {
+        throw new Error("create must NOT be called on existing channel");
+      },
+    },
+  };
+  const cfg = { ...config, discordGuildId: "guild-1" };
+  const client = { guilds: { fetch: async () => fakeGuild } };
+
+  // F23: darf NICHT mit ReferenceError crashen (früher referenzierte der catch
+  // `client`, der nicht im Scope war) und muss den Bestands-Kanal ZURÜCKgeben.
+  const ch = await createNextSeasonChannel(client, cfg, 2027);
+  assert.ok(ch, "existing channel still returned despite failing edit");
+  assert.strictEqual(ch.id, "exist-1", "existing channel NOT discarded");
+  assert.strictEqual(edited.length, 1, "one failing edit attempted");
+  assert.ok(
+    edited[0].allow.ViewChannel === true && edited[0].allow.SendMessages === true,
+    "boolean-map passed to edit even on failure path"
+  );
+});
+
+test("F23: guild-null sets newChannelFailed so ack says „Wechsel ohne neuen Kanal”", async () => {
+  resetToRunningCurrentYear();
+  const runningBefore = db.getActiveSeason();
+  db.openAnnouncedSeason({
+    year: runningBefore.year + 1,
+    startDate: `${runningBefore.year + 1}-01-01`,
+    channelId: "777",
+    note: null,
+  });
+  const sent = [];
+  // Keine Guild: guilds.fetch -> null, und der Kanal-Fetch hat keine guild-Prop
+  // (derive fehlschlägt). Derselbe Fetch dient review + ack => sendbarer Kanal.
+  const fakeChannel = {
+    isTextBased: () => true,
+    send: async (payload) => {
+      sent.push(payload);
+      return {};
+    },
+  };
+  const client = {
+    guilds: { fetch: async () => null },
+    channels: { fetch: async () => fakeChannel },
+  };
+  const cfg = { ...config, discordGuildId: "" }; // nicht gesetzt
+
+  const res = await runYearRollover(client, cfg, { force: true });
+  assert.strictEqual(res.switched, true, "switch still commits");
+  assert.strictEqual(res.channel, null, "no channel created");
+  const ack = sent.find((p) => p.content && p.content.includes("Saisonwechsel"));
+  assert.ok(ack, "switch-ack posted");
+  assert.ok(ack.content.includes("Wechsel ohne neuen Kanal"), "ack names the missing channel");
 });

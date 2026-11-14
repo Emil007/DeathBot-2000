@@ -2,6 +2,7 @@ const { createPackage } = require("../../backup");
 const db = require("../../db");
 const { logEvent, logError } = require("../log");
 const { runWikiPoll } = require("../../jobs/wiki-poll");
+const { finalizeYearSwitch } = require("../../jobs/year-rollover");
 const { formatReconcileSummary } = require("../announce");
 const { resolveAdminTarget } = require("../admin-notify");
 
@@ -182,6 +183,31 @@ const cmd = {
         .prepare("SELECT COUNT(*) c FROM season_point_snapshots WHERE season_id = ?")
         .get(archivedSeason.id).c;
 
+      // F21: Dieselbe Nacharbeit wie der Cron — Kanal anlegen, ID in
+      // deathpool_channel_id (NICHT announce_channel_id), Bilanz der ARCHIVIERTEN
+      // Saison mit Live-Satz posten. Fehlschlag wird unten ehrlich genannt.
+      let fin = null;
+      let newChannelFailed = false;
+      let reviewPosted = false;
+      try {
+        fin = await finalizeYearSwitch(ctx.client, ctx.config, res.archived.id, res.activated.year);
+        newChannelFailed = Boolean(fin?.newChannelFailed);
+        reviewPosted = Boolean(fin?.posted);
+      } catch (e) {
+        // finalizeYearSwitch wirft nur bei createNextSeasonChannel-Durchbrüchen
+        // (nicht abgefangene Fehler) — loggen und im Antworttext nennen.
+        newChannelFailed = true;
+        await logError(ctx.client, ctx.config, e, { where: "new-year activate finalize", userId: ctx.config.adminId });
+      }
+      if (!reviewPosted) {
+        await logError(
+          ctx.client,
+          ctx.config,
+          new Error("new-year activate: Abschlussbilanz wurde nicht gesendet"),
+          { where: "new-year postReview failed", userId: ctx.config.adminId, detail: `archived=${res.archived.id}` }
+        );
+      }
+
       await logEvent(ctx.client, ctx.config, {
         kind: "season-switch",
         summary: `Saisonwechsel ${archivedSeason.year} → ${res.activated.year}`,
@@ -202,6 +228,8 @@ const cmd = {
           `✅ **Saison ${res.archived.year} archiviert** — **Saison ${res.activated.year} ist live**`,
           `• Archiv: id ${res.archived.id} (Punkte-Snapshot: ${snapCount} Spieler)`,
           `• Live: id ${res.activated.id}, Start **${res.activated.start_date}**`,
+          `• Deathpool-Kanal: ${fin?.newChannel ? `<#${fin.newChannel.id}>` : newChannelFailed ? "**Anlage fehlgeschlagen** (gesehen in Logs)" : "kein neuer Kanal angelegt"}`,
+          `• Abschlussbilanz: ${reviewPosted ? "gepostet" : "**nicht gesendet** (Details in den Logs)"}`,
           "• Picks/Celebs beider Saisons bleiben erhalten, Kontostand startet bei 0",
           `• Stiller Abgleich: **${reconcileHits.length}** Nachträge (Details per DM/Admin)`,
           "• All-Deaths-Feed läuft weiter (kein neuer Seed)",

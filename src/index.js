@@ -96,8 +96,10 @@ async function main() {
     // festen Zeit. Beim (Wieder-)Start einmal prüfen: der Wiener Datums-Guard
     // lässt überfällige start_date durch und blockt zukünftige; ein zweiter
     // Lauf nach Erfolg ist durch getAnnouncedSeason()==null abgedeckt.
+    // F25: Fehler über logError in den Logkanal, nicht nur stdout.
     runYearRollover(client, config).catch((e) => {
       console.error("[year-rollover] startup catch-up failed", e.message);
+      logError(client, config, e, { where: "year-rollover startup catch-up" });
     });
     startAutoBackup(config, client);
     startPresence(client, config, db);

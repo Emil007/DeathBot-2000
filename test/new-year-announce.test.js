@@ -24,6 +24,18 @@ before(() => {
   db.getDb().prepare("UPDATE seasons SET phase = 'running' WHERE active = 1").run();
 });
 
+/** Minimale Fake-Discord-Channel mit .send()/.isTextBased(). */
+function makeFakeChannel(bucket) {
+  return {
+    id: "fake-" + (bucket.length + 1),
+    isTextBased: () => true,
+    send: async (payload) => {
+      bucket.push(payload);
+      return payload;
+    },
+  };
+}
+
 after(() => {
   try {
     db.closeDb();
@@ -246,4 +258,104 @@ test("F18d: note value stops at the next known key/flag token", () => {
   );
   assert.deepStrictEqual(rebuildPrefixArgs("note:Eins".split(/\s+/)), ["note:Eins"]);
   assert.deepStrictEqual(rebuildPrefixArgs("note:a b c".split(/\s+/)), ["note:a b c"]);
+});
+
+// ---- F21: /new-year activate macht die komplette Cron-Nacharbeit ----
+
+test("F21: /new-year activate creates channel, sets deathpool_channel_id, posts archived review (live sentence)", async () => {
+  // Frisches Setup in einer eigenen Saison:
+  db.getDb().exec(`
+    DELETE FROM season_point_snapshots;
+    DELETE FROM seasons;
+  `);
+  db.ensureActiveSeason();
+  db.setSeasonLive(true);
+  const running = db.getActiveSeason();
+  db.openAnnouncedSeason({
+    year: running.year + 1,
+    startDate: `${running.year + 1}-01-01`,
+    channelId: "777",
+    note: null,
+  });
+
+  // Punkte, die im Snapshot landen müssen (Bonus-only inklusive).
+  const p1 = db.upsertPlayer({ displayName: "Mia", discordUserId: "4001" });
+  db.setPoints(p1.id, 90);
+  db.upsertBonus({ id: "f21b", name: "FB", description: "", points: 10 });
+  db.awardBonus(p1.id, "f21b");
+
+  // Netzwerk-Scrape stubben: runWikiPoll(reconcile) liefert leere Treffer.
+  const wikiPollPath = require.resolve("../src/jobs/wiki-poll");
+  const origWikiPoll = require.cache[wikiPollPath]?.exports;
+  require.cache[wikiPollPath] = { exports: { runWikiPoll: async () => ({ hits: [] }) } };
+  const newYearPath = require.resolve("../src/discord/commands/new-year");
+  delete require.cache[newYearPath];
+  const newYearCmd = require(newYearPath);
+
+  const created = [];
+  const fakeGuild = {
+    id: "guild-1",
+    channels: {
+      fetch: async () => [],
+      create: async (opts) => {
+        created.push(opts);
+        return { id: "handchan-7", name: opts.name, permissionOverwrites: { cache: new Map() } };
+      },
+    },
+  };
+  const sent = [];
+  const client = {
+    guilds: { fetch: async () => fakeGuild },
+    channels: { fetch: async () => makeFakeChannel(sent) },
+  };
+  const replies = [];
+  const ctx = {
+    client,
+    config: { ...config, discordGuildId: "guild-1", channelAdmin: "" },
+  };
+  const msg = {
+    author: { id: "1", createDM: async () => ({ send: async () => {} }) },
+    async reply(t) {
+      replies.push(t);
+      return t;
+    },
+  };
+
+  await newYearCmd.run(ctx, ["activate", "force"], msg);
+
+  const activated = db.getActiveSeason();
+  assert.strictEqual(activated.year, running.year + 1, "new season live");
+  assert.strictEqual(activated.deathpool_channel_id, "handchan-7", "F21: hand switch sets deathpool_channel_id");
+  assert.strictEqual(activated.announce_channel_id, "777", "announce_channel_id untouched");
+  assert.strictEqual(created.length, 1, "F21: channel created by hand switch");
+  assert.strictEqual(created[0].name, `deathpool-${running.year + 1}`);
+
+  // Bilanz der ARCHIVIERTEN Saison mit echten Snapshot-Summen inkl. Bonus-only.
+  const reviewMsg = sent.find((p) => p.content && p.content.includes("Abschlussbilanz"));
+  assert.ok(reviewMsg, "F21: archived review posted by hand switch");
+  assert.ok(reviewMsg.content.includes("100 Punkte"), "snapshot total base+bonus");
+  assert.ok(reviewMsg.content.includes("ist live"), "live sentence present");
+
+  // Antworttext nennt Kanal + Bilanz.
+  const replyText = replies.join("\n");
+  assert.ok(replyText.includes("handchan-7"), "reply mentions the new channel");
+  assert.ok(replyText.includes("Abschlussbilanz: gepostet"), "reply confirms review posted");
+
+  // Stub wiederherstellen, damit spätere Tests das Echtmodul sehen.
+  require.cache[wikiPollPath] = origWikiPoll || { exports: {} };
+});
+
+test("F27: announce-season usage/details have no fixed 2027 and use [year:YYYY]", () => {
+  const cmd = require("../src/discord/commands/announce-season");
+  assert.ok(cmd.usage.includes("[year:YYYY]"), "usage must use [year:YYYY] placeholder");
+  assert.ok(cmd.usage.includes("[start_date:YYYY-MM-DD]"), "start_date placeholder without fixed year");
+  assert.ok(cmd.details.includes("nextes") || cmd.details.includes("nächste"), "details refers to the announced round, not a fixed year");
+  assert.ok(!/2027/.test(cmd.usage) && !/2027/.test(cmd.details), "no fixed 2027 anywhere in help");
+});
+
+test("F27: Tarif sentence mentions unknown age → 0 points (no 'Weniger als 1 gibt es nicht')", () => {
+  const cmd = require("../src/discord/commands/announce-season");
+  const tpl = cmd.DEFAULT_ANNOUNCE_TEMPLATE;
+  assert.match(tpl, /unbekanntem Alter[\s\S]*0 Punkte/, "unknown age → 0 points in Tarif");
+  assert.doesNotMatch(tpl, /Weniger als \*\*1\*\* gibt es nicht/, "min-1 sentence removed from Tarif");
 });

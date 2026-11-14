@@ -455,7 +455,7 @@ test("F09: regex also matches aendere/ändere/change variants", () => {
   assert.ok(!assistant.CHANGE_RE.test("ändern Foo"), "no number -> no match");
 });
 
-test("F09: command-like typo is not imported as a name", async () => {
+test("F09/F26: command-like typo is rejected with a sentence, not imported as a name", async () => {
   const season = db.getAnnouncedSeason();
   const { ctx, msg } = fakeCtx("F09cuser", "F09c");
   const pid = db
@@ -465,7 +465,10 @@ test("F09: command-like typo is not imported as a name", async () => {
   const draft = db.getOrCreateDraft(pid, season.id);
 
   const res = await sendPick(ctx, msg, "aendrn 3 Jemand");
-  assert.strictEqual(res, false, "unknown cmd-like line not consumed as a name");
+  // F26: eine unbekannte Befehlzeile wird NICHT mehr still verworfen (keine
+  // „false ohne Antwort“) — sie wird mit einem Satz abgelehnt und verbraucht.
+  assert.strictEqual(res, true, "command-like line consumed (F26, not silent)");
+  assert.match(lastReply(msg.channel.replies), /unbekannten Befehl/i, "rejected with a sentence");
   assert.strictEqual(db.listDraftEntries(draft.id).length, 0, "no draft entry created");
 });
 
@@ -604,4 +607,313 @@ test("F08: link N <url> while a resolver run is active is NOT ignored (rerun + i
   } finally {
     pageLookup.lookupUrl = origLookup;
   }
+});
+
+// ---- F22: Interrupt während der Auflösung darf pendings NICHT hängen lassen ----
+
+/**
+ * F22: Eine `link N <url>`-DM während eines laufenden Auto-Resolvers muss am
+ * Ende die geclaimte Zeile abschließen (linked/unlinked) — und die übrigen
+ * pending-Zeilen müssen trotz Interrupt weiter aufgelöst werden, damit `fertig`
+ * nicht mehr „Ein Name ist noch unklar“ sagt.
+ */
+test("F22: link N while busy -> claimed URL resolved, all entries finalized (no pending left)", async () => {
+  const season = db.getAnnouncedSeason();
+  const { ctx, msg } = fakeCtx("F22user", "F22");
+  const pid = db
+    .getDb()
+    .prepare("INSERT INTO players (display_name, discord_user_id, base_points) VALUES ('F22','F22user','0')")
+    .run().lastInsertRowid;
+  const draft = db.getOrCreateDraft(pid, season.id);
+  db.addDraftNames(draft.id, ["Ziel F22", "Nebenperson Two"]);
+
+  let lookupCalls = 0;
+  let proposeCalls = 0;
+  const origLookup = pageLookup.lookupUrl;
+  const origPropose = pageLookup.proposeWikiForName;
+  // Auto-Propose für „Nebenperson Two“ braucht etwas Zeit, damit die link-DM
+  // während des laufenden Laufs eintrifft; liefert eine sauber linkbare Proposal.
+  pageLookup.proposeWikiForName = async (ua, name) => {
+    proposeCalls++;
+    await new Promise((r) => setTimeout(r, 15));
+    return {
+      wikiUrl: `https://en.wikipedia.org/wiki/${name.replace(/ /g, "_")}`,
+      wikiNorm: `en:${name.toLowerCase().replace(/ /g, "_")}`,
+      qid: "Q" + name.length,
+      proposedAge: 30,
+      title: name,
+      candidates: [],
+    };
+  };
+  pageLookup.lookupUrl = async () => {
+    lookupCalls++;
+    await new Promise((r) => setTimeout(r, 4));
+    return { wikiUrl: "https://en.wikipedia.org/wiki/Ziel_F22", wikiNorm: "en:ziel_f22", qid: "QZ", proposedAge: 44, title: "Ziel F22", candidates: [] };
+  };
+  try {
+    // Echten Auto-Lauf starten (fire-and-forget wie in Produktion).
+    const started = (async () => {
+      await assistant.resolvePendingSynchronous(ctx, msg.channel, "F22user", season, draft.id, "add");
+    })();
+    // Kurz warten, bis der Lauf die erste Zeile IN Bearbeitung hat (15ms-Propose).
+    await new Promise((r) => setTimeout(r, 5));
+    // Jetzt die link-DM während busy: Claim wird gespeichert, rerun+interrupt.
+    const res = await sendPick(ctx, msg, "link 1 https://en.wikipedia.org/wiki/Ziel_F22");
+    assert.strictEqual(res, true, "link DM consumed while busy");
+    const claimed = db.listDraftEntries(draft.id).find((e) => e.raw_name === "Ziel F22");
+    assert.strictEqual(claimed.link_status, "pending", "entry claimed pending");
+    assert.match(String(claimed.wiki_url), /Ziel_F22/, "URL stored as claim");
+
+    // Lauf + Nachlauf abschließen lassen.
+    await started;
+    await settle();
+
+    assert.strictEqual(assistant.busyUsers.has("F22user"), false, "busyUsers cleared after all runs");
+    assert.strictEqual(assistant.interruptUsers.has("F22user"), false, "interrupt cleared");
+    assert.strictEqual(assistant.rerunUsers.has("F22user"), false, "rerun drained after finally rerun");
+
+    const entries = db.listDraftEntries(draft.id);
+    assert.strictEqual(entries.length, 2, "two draft entries");
+    const linkEntry = entries.find((e) => e.raw_name === "Ziel F22");
+    const other = entries.find((e) => e.raw_name === "Nebenperson Two");
+    // Erster Eintrag: der gesperrte Claim wurde über lookupUrl aufgelöst.
+    assert.strictEqual(linkEntry.link_status, "linked", "claimed URL entry ends linked");
+    assert.strictEqual(linkEntry.wiki_norm, "en:ziel_f22", "URL lookup applied");
+    // Zweiter Eintrag: Auto-Propose darf trotz Interrupt weiterlaufen.
+    assert.strictEqual(other.link_status, "linked", "second pending entry also resolved (kein pending-Falle)");
+    assert.ok(lookupCalls >= 1, "lookupUrl called for the claimed URL");
+    assert.ok(proposeCalls >= 1, "proposeWikiForName called for the second entry");
+
+    // `fertig` muss ohne „unklar“ durchgehen und die Picks anlegen.
+    const fin = db.finalizeDraft(pid, season.id);
+    assert.strictEqual(fin.blocked, undefined, "no pending blocks finalize (F22)");
+    assert.ok(fin.added === 2, "both entries become picks");
+  } finally {
+    assistant.busyUsers.delete("F22user");
+    assistant.interruptUsers.delete("F22user");
+    assistant.rerunUsers.delete("F22user");
+    pageLookup.lookupUrl = origLookup;
+    pageLookup.proposeWikiForName = origPropose;
+  }
+});
+
+/**
+ * F22 zweites Loch: Eine DM, die exakt im respondPick-Fenster (nach der
+ * Schleife, vor dem `finally`) eintrifft, setzt rerunUsers, wird aber vom
+ * do/while nicht mehr gesehen. Das `finally` muss nach dem Löschen der Flags
+ * GENAU EINEN Nachlauf starten, der die neuen pending-Zeilen auflöst.
+ *
+ * Der respondPick-Send wird hier mit einem künstlich vermaschten Channel
+ * verlangsamt und beobachtet: der Test wartet, bis der Lauf bei respondPick
+ * angekommen ist, schickt dann die neue DM, und lässt danach alles fertiglaufen.
+ */
+test("F22: DM in the respondPick window triggers exactly one finally rerun that resolves leftovers", async () => {
+  const season = db.getAnnouncedSeason();
+  const { ctx, msg } = fakeCtx("F22buser", "F22b");
+  const pid = db
+    .getDb()
+    .prepare("INSERT INTO players (display_name, discord_user_id, base_points) VALUES ('F22b','F22buser','0')")
+    .run().lastInsertRowid;
+  const draft = db.getOrCreateDraft(pid, season.id);
+  db.addDraftNames(draft.id, ["Erste F22b", "Zweite F22b"]);
+
+  const origPropose = pageLookup.proposeWikiForName;
+  const origLookup = pageLookup.lookupUrl;
+  pageLookup.proposeWikiForName = async (ua, name) => ({
+    wikiUrl: `https://en.wikipedia.org/wiki/${name.replace(/ /g, "_")}`,
+    wikiNorm: `en:${name.toLowerCase().replace(/ /g, "_")}`,
+    qid: "Q" + name.length,
+    proposedAge: 30,
+    title: name,
+    candidates: [],
+  });
+  pageLookup.lookupUrl = async () => ({ wikiUrl: "https://en.wikipedia.org/wiki/X", wikiNorm: "en:x", qid: "QX", proposedAge: 30, title: "X", candidates: [] });
+  try {
+    // Channel mit verzögertem/beobachtetem respondPick-Send (F22-Fenster).
+    const enteredRespondPick = gate();
+    const originalSend = msg.channel.send.bind(msg.channel);
+    msg.channel.send = async (...args) => {
+      // respondPick sendet ein Embed — das ist das Fenster nach der Schleife.
+      if (String(args[0]?.content ?? "").startsWith("Auflösung") === false) {
+        enteredRespondPick.open();
+      }
+      await new Promise((r) => setTimeout(r, 8));
+      return originalSend(...args);
+    };
+
+    // Noch nicht künstlich busy setzen — der echte Lauf soll selbst busy setzen.
+    const started = (async () => {
+      await assistant.resolvePendingSynchronous(ctx, msg.channel, "F22buser", season, draft.id, "add");
+    })();
+    // Warten, bis der Lauf die Schleife beendet hat und bei respondPick ist.
+    await enteredRespondPick.promise;
+
+    // Jetzt die neue Namen-DM: sie sieht busyUsers noch gesetzt und schreibt
+    // ihre Zeile + fordert rerun an.
+    const addRes = await sendPick(ctx, msg, "Dritte F22b");
+    assert.strictEqual(addRes, true);
+
+    // Rest des Laufs + finally-Nachlauf abschließen.
+    await started;
+    await settle();
+
+    const entries = db.listDraftEntries(draft.id);
+    const rest = entries.filter((e) => e.link_status === "pending");
+    assert.strictEqual(rest.length, 0, "no entry stays pending after finally rerun (F22 second hole)");
+    assert.strictEqual(entries.length, 3, "third name present");
+    assert.strictEqual(assistant.busyUsers.has("F22buser"), false, "busy cleared after finally rerun");
+    assert.strictEqual(assistant.rerunUsers.has("F22buser"), false, "rerun drained");
+  } finally {
+    assistant.busyUsers.delete("F22buser");
+    assistant.interruptUsers.delete("F22buser");
+    assistant.rerunUsers.delete("F22buser");
+    pageLookup.lookupUrl = origLookup;
+    pageLookup.proposeWikiForName = origPropose;
+  }
+});
+
+/** Baut eine Fake-pka:pick-Interaktion auf msg.channel für handlePickInteraction. */
+function fakePickSelectInteraction(ctx, msg, entryId, valueIndex = 0) {
+  return {
+    isStringSelectMenu: () => true,
+    customId: `pka:pick:${entryId}`,
+    deferred: false,
+    deferUpdate: async () => {},
+    editReply: async () => {},
+    followUp: async () => {},
+    channel: msg.channel,
+    user: { id: msg.author.id },
+    values: [String(valueIndex)],
+  };
+}
+
+/**
+ * F22: Ein pka:pick-Select während eines laufenden Auto-Laufs muss denselben
+ * Nachlauf anstoßen wie die URL-Pfade — sonst bleiben übrige pending-Namen
+ * liegen (REVIEW-4: „Select muss denselben Nachlauf anstoßen“).
+ */
+test("F22: select while busy triggers finally rerun, leftover entries resolved", async () => {
+  const season = db.getAnnouncedSeason();
+  const { ctx, msg } = fakeCtx("F22suser", "F22s");
+  const pid = db
+    .getDb()
+    .prepare("INSERT INTO players (display_name, discord_user_id, base_points) VALUES ('F22s','F22suser','0')")
+    .run().lastInsertRowid;
+  const draft = db.getOrCreateDraft(pid, season.id);
+
+  // Eintrag 1: bereits ambiguous (mit Kandidaten) — der wird per Select gewählt.
+  const ambiguous = db
+    .getDb()
+    .prepare(
+      `INSERT INTO pick_draft_entries (draft_id, position, raw_name, link_status, candidates_json)
+       VALUES (?, 1, 'Ambigu F22s', 'ambiguous', ?)`
+    )
+    .run(
+      draft.id,
+      JSON.stringify([
+        { title: "Kandidat A", url: "https://en.wikipedia.org/wiki/Kandidat_A", norm: "en:kandidat_a", qid: "QA", proposedAge: 50 },
+        { title: "Kandidat B", url: "https://en.wikipedia.org/wiki/Kandidat_B", norm: "en:kandidat_b", qid: "QB", proposedAge: 51 },
+      ])
+    ).lastInsertRowid;
+  // Eintrag 2: pending, muss vom Nachlauf aufgelöst werden.
+  db.getDb()
+    .prepare(
+      `INSERT INTO pick_draft_entries (draft_id, position, raw_name, link_status)
+       VALUES (?, 2, 'Rest F22s', 'pending')`
+    )
+    .run(draft.id);
+
+  const origLookup = pageLookup.lookupUrl;
+  const origPropose = pageLookup.proposeWikiForName;
+  pageLookup.proposeWikiForName = async (ua, name) => {
+    await new Promise((r) => setTimeout(r, 15)); // laufender Lauf bleibt offen
+    return {
+      wikiUrl: `https://en.wikipedia.org/wiki/${name.replace(/ /g, "_")}`,
+      wikiNorm: `en:${name.toLowerCase().replace(/ /g, "_")}`,
+      qid: "Q" + name.length,
+      proposedAge: 30,
+      title: name,
+      candidates: [],
+    };
+  };
+  pageLookup.lookupUrl = async () => ({ wikiUrl: "https://en.wikipedia.org/wiki/X", wikiNorm: "en:x", qid: "QX", proposedAge: 30, title: "X", candidates: [] });
+  try {
+    const started = (async () => {
+      await assistant.resolvePendingSynchronous(ctx, msg.channel, "F22suser", season, draft.id, "add");
+    })();
+    await new Promise((r) => setTimeout(r, 5));
+    // Sicherstellen, dass der Lauf wirklich noch läuft (busy gesetzt).
+    assert.strictEqual(assistant.busyUsers.has("F22suser"), true, "resolver run still in flight");
+    // Select während des Laufs: wählt Kandidat A für den ambiguous Eintrag.
+    const interaction = fakePickSelectInteraction(ctx, msg, ambiguous, 0);
+    const didPick = await assistant.handlePickInteraction(ctx, interaction);
+    assert.strictEqual(didPick, true, "select handled");
+    assert.strictEqual(assistant.rerunUsers.has("F22suser"), true, "select requests rerun while busy (F22)");
+
+    await started;
+    await settle();
+
+    assert.strictEqual(assistant.busyUsers.has("F22suser"), false, "busy cleared after finally rerun");
+    assert.strictEqual(assistant.rerunUsers.has("F22suser"), false, "rerun drained");
+    const entries = db.listDraftEntries(draft.id);
+    assert.strictEqual(entries.length, 2, "two entries");
+    const a = entries.find((e) => e.raw_name === "Ambigu F22s");
+    const r = entries.find((e) => e.raw_name === "Rest F22s");
+    assert.strictEqual(a.link_status, "linked", "selected entry linked");
+    assert.strictEqual(a.wiki_norm, "en:kandidat_a", "chosen candidate applied");
+    assert.strictEqual(r.link_status, "linked", "leftover pending resolved by finally rerun (F22 select path)");
+  } finally {
+    assistant.busyUsers.delete("F22suser");
+    assistant.interruptUsers.delete("F22suser");
+    assistant.rerunUsers.delete("F22suser");
+    pageLookup.lookupUrl = origLookup;
+    pageLookup.proposeWikiForName = origPropose;
+  }
+});
+
+/** Kleiner Gate-Helfer: await gate.promise; gate.open() setzt ihn frei. */
+function gate() {
+  let open;
+  const promise = new Promise((r) => {
+    open = r;
+  });
+  return { promise, open };
+}
+
+test("F26: names containing a number are stored (Boeing 737 Max / Apollo 13 Crew)", async () => {
+  const season = db.getAnnouncedSeason();
+  const { ctx, msg } = fakeCtx("F26user", "F26");
+  const pid = db
+    .getDb()
+    .prepare("INSERT INTO players (display_name, discord_user_id, base_points) VALUES ('F26','F26user','0')")
+    .run().lastInsertRowid;
+  const draft = db.getOrCreateDraft(pid, season.id);
+
+  const res = await sendPick(ctx, msg, "Boeing 737 Max; Apollo 13 Crew");
+  await settle();
+  assert.strictEqual(res, true, "names with numbers consumed");
+  const entries = db.listDraftEntries(draft.id);
+  assert.strictEqual(entries.length, 2, "both numbered names stored");
+  assert.strictEqual(entries[0].raw_name, "Boeing 737 Max");
+  assert.strictEqual(entries[1].raw_name, "Apollo 13 Crew");
+});
+
+test("F26: command-line inside a multi-line DM is rejected loudly, peers still stored", async () => {
+  const season = db.getAnnouncedSeason();
+  const { ctx, msg } = fakeCtx("F26buser", "F26b");
+  const pid = db
+    .getDb()
+    .prepare("INSERT INTO players (display_name, discord_user_id, base_points) VALUES ('F26b','F26buser','0')")
+    .run().lastInsertRowid;
+  const draft = db.getOrCreateDraft(pid, season.id);
+
+  const res = await sendPick(ctx, msg, "Keanu Reeves\nändern 3 Neuer Name");
+  await settle();
+  assert.strictEqual(res, true, "DM consumed");
+  const entries = db.listDraftEntries(draft.id);
+  const names = entries.map((e) => e.raw_name);
+  assert.ok(names.includes("Keanu Reeves"), "real name still stored");
+  assert.ok(!names.includes("ändern 3 Neuer Name"), "command line not stored as name");
+  const text = msg.channel.replies.map((r) => String(r[0]?.content ?? r[0])).join("\n");
+  assert.match(text, /Befehl/i, "command line named in the reply, not silently swallowed");
 });

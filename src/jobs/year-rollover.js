@@ -58,23 +58,55 @@ function todayInVienna(date = new Date()) {
   }).format(date);
 }
 
-/** Führt den Jahreswechsel aus: Auswertung posten + announced-Saison live schalten. */
+/** Ist heute (Wien) der 01.01.? — Stichtag für den einmaligen Jahresbericht (F20). */
+function isNewYearDayVienna(date = new Date()) {
+  return todayInVienna(date).endsWith("-01-01");
+}
+
+/**
+ * Führt den Jahreswechsel aus: Auswertung posten + announced-Saison live schalten.
+ *
+ * F20: Der no-announced-Pfad postet NICHT mehr bei jedem Start — nur am WIENER
+ * 01.01. genau einmal (Meta-Flag `year_rollover_annual_review`), mit echten
+ * Live-Summen der laufenden Saison statt 0-Punkte-Snapshots. Der not-yet-Pfad
+ * (start_date liegt in der Zukunft) postet GAR NICHT.
+ */
 async function runYearRollover(client, config, { force = false, now = null } = {}) {
   const announced = db.getAnnouncedSeason();
   const running = db.getActiveSeason();
 
-  // Nichts zu wechseln? trotzdem Auswertung der laufenden + Hinweis, dass keine
-  // neue Saison eröffnet wurde. Kein Live-Satz (runningYear = null).
+  // Nichts zu wechseln. Nur am Wiener 01.01. GENAU EINMAL eine echte Jahresbilanz
+  // der laufenden Saison posten (Live-Summen, KEINE Snapshots), als Rückgrat
+  // für Handwechsel/Deploys, bei denen keine announced-Saison angelegt wurde.
   if (!announced) {
-    await postReview(client, config, running, null);
+    const today = todayInVienna(now);
+    const reviewKey = "year_rollover_annual_review";
+    if (isNewYearDayVienna(now) && db.getMeta(reviewKey) !== today.slice(0, 4)) {
+      // Flag VOR dem Post setzen: sendet der Post (z. B. Zielkanal weg), ist er
+      // nicht wiederholbar — genau einmal pro Jahr.
+      db.setMeta(reviewKey, today.slice(0, 4));
+      // live:true → echte Live-Summen der laufenden Saison (base_points + Boni),
+      // NICHT die leeren Snapshot-Zählung (F20(b)).
+      const posted = await postReview(client, config, running, null, null, { live: true });
+      // F25: auch der no-announced-Pfad wertet den Rückgabewert aus.
+      if (!posted) {
+        await logError(
+          client,
+          config,
+          new Error("runYearRollover: Jahresbilanz (no-announced) konnte nicht gesendet werden"),
+          { where: "year-rollover postReview failed", detail: `season=${running.id}` }
+        );
+      }
+    }
     return { switched: false, reason: "no-announced" };
   }
 
   // F01: Wechsel erst, wenn das WIENER Datum >= start_date. Der Cron läuft
   // 00:00 Europe/Vienna; ein Nachhol-Run (Bot-Ausfall) kommt am selben Wiener
   // Tag oder später — überfällige start_date passieren, zukünftige blocken.
+  // F20(a): vor dem Stichtag gibt es KEINEN Post — keine Abschlussbilanz der
+  // laufenden Saison ohne deren Snapshots.
   if (!force && announced.start_date && todayInVienna(now) < announced.start_date) {
-    await postReview(client, config, running, null);
     return { switched: false, reason: "not-yet", start: announced.start_date };
   }
 
@@ -96,28 +128,26 @@ async function runYearRollover(client, config, { force = false, now = null } = {
     throw e;
   }
 
-  // F06: Neuen Kanal deathpool-{YEAR} anlegen + alle Teilnehmer einladen (1.1.).
-  // Die neue Kanal-ID geht NUR in deathpool_channel_id — announce_channel_id
-  // bleibt der Anmeldungskanal.
-  let newChannel = null;
-  let newChannelFailed = false; // F06: Fehlschlag muss die Kurzbestätigung sagen
-  try {
-    newChannel = await createNextSeasonChannel(client, config, res.activated.year);
-    if (newChannel?.id) {
-      db.setSeasonDeathpoolChannel(res.activated.id, newChannel.id);
-    }
-  } catch (e) {
-    // F04/F06: Fehler nicht still schlucken — loggen, der Text unten sagt es.
-    newChannelFailed = true;
-    await logError(client, config, e, {
-      where: "year-rollover createChannel",
-      detail: `year=${res.activated.year}`,
-    });
+  // F21: gemeinsame Nacharbeit (Cron +/new-year activate): Kanal anlegen,
+  // deathpool_channel_id setzen, Bilanz der ARCHIVIERTEN Saison posten.
+  const fin = await finalizeYearSwitch(client, config, res.archived.id, res.activated.year);
+  const newChannel = fin.newChannel;
+  const newChannelFailed = fin.newChannelFailed;
+
+  // F25: postReview-Rückgabewert auswerten — false NICHT still schlucken.
+  if (!fin.posted) {
+    await logError(
+      client,
+      config,
+      new Error("runYearRollover: Abschlussbilanz wurde nicht gesendet"),
+      { where: "year-rollover postReview failed", detail: `archived=${res.archived.id}` }
+    );
   }
 
-  // F06: Jahresbilanz + Kurzbestätigung in den NEUEN Kanal, wenn einer erstellt
-  // wurde — sonst in den gewohnten Zielkanal (gespeicherte ID/Env-Fallback).
-  await postReview(client, config, res.archived, res.activated.year, newChannel?.id || null);
+  // Der Jahresbericht für den neuen Jahreswechsel ist erledigt (Bilanz der
+  // archivierten Saison). Flag setzen, damit ein Restart am selben/folgenden Tag
+  // auf dem no-announced-Pfad NICHT erneut postet (F20).
+  db.setMeta("year_rollover_annual_review", String(res.activated.year));
 
   await logEvent(client, config, {
     kind: "season-switch-auto",
@@ -165,18 +195,71 @@ async function runYearRollover(client, config, { force = false, now = null } = {
 }
 
 /**
+ * F21/Cron-Nacharbeit nach erfolgreichem activateAnnouncedSeason — von beiden
+ * Einstiegen gemeinsam genutzt: neuen Deathpool-Kanal anlegen (deathpool_channel_id),
+ * Bilanz der ARCHIVIERTEN Saison mit Live-Satz posten. Rückgabe enthält Kanal,
+ * Fehlschlag-Flag und ob die Bilanz wirklich gesendet wurde — Aufrufer loggen
+ * die Details (F25).
+ */
+async function finalizeYearSwitch(client, config, archivedId, newYear) {
+  const archived = db.getDb().prepare("SELECT * FROM seasons WHERE id = ?").get(archivedId);
+  let newChannel = null;
+  let newChannelFailed = false; // F06: Fehlschlag muss die Kurzbestätigung sagen
+  try {
+    newChannel = await createNextSeasonChannel(client, config, newYear);
+    if (newChannel?.id) {
+      // F06: Kanal-ID NUR in deathpool_channel_id — announce_channel_id bleibt der
+      // Anmeldungskanal. Nach activateAnnouncedSeason ist die neue Saison active.
+      db.setSeasonDeathpoolChannel(db.getActiveSeason().id, newChannel.id);
+    } else {
+      // F23: createNextSeasonChannel liefert bei fehlender Guild null (kein throw —
+      // der Fehler wurde dort schon geloggt). Das Flag muss trotzdem gesetzt werden,
+      // damit die Kurzbestätigung den fehlenden Kanal nennt statt „ist live".
+      newChannelFailed = true;
+    }
+  } catch (e) {
+    // F04/F06: Fehler nicht still schlucken — loggen, der Text unten sagt es.
+    newChannelFailed = true;
+    await logError(client, config, e, {
+      where: "year-rollover finalize createChannel",
+      detail: `year=${newYear}`,
+    });
+  }
+
+  // Jahresbilanz + Kurzbestätigung in den NEUEN Kanal, wenn einer erstellt
+  // wurde — sonst in den gewohnten Zielkanal (gespeicherte ID/Env-Fallback).
+  const posted = await postReview(client, config, archived, newYear, newChannel?.id || null);
+  return { newChannel, newChannelFailed, posted };
+}
+
+/**
  * Postet die Abschlussbilanz. `season` ist die zu bewertende Saison (nach dem
  * Wechsel die ARCHIVIERTE), `liveYear` steuert den Live-Satz: gesetzt nur wenn
  * der Wechsel committet wurde, sonst null (F03). Fehlgeschlagene sends werden
  * geloggt und liefern false statt still zu verschwinden.
+ *
+ * F20(b): `live` wählt die Live-Auswertung (base_points + Boni der laufenden
+ * Saison) statt seasonReview (Snapshots, die nur beim Archivieren existieren) —
+ * für den einmaligen Jahresbericht am 01.01. ohne Wechsel.
+ * F25: fehlendes Ziel (gelöschter Kanal / nichts konfiguriert) wird per logError
+ * gemeldet und liefert false — kein stilles Schweigen.
  */
-async function postReview(client, config, season, liveYear, preferredChannelId = null) {
+async function postReview(client, config, season, liveYear, preferredChannelId = null, { live = false } = {}) {
   // F06: Bilanz in den NEUEN Kanal, wenn einer erstellt wurde — sonst der
   // gewohnte Deathpool-/All-Deaths-Kanal (gespeicherte ID zuerst, Env-Fallback).
   const targetId = preferredChannelId || db.resolveDeathpoolChannel(config) || config.channelAllDeaths || null;
   const channel = targetId ? await client.channels.fetch(targetId).catch(() => null) : null;
-  if (!channel?.isTextBased()) return false;
-  const review = season ? db.seasonReview(season.id) : null;
+  if (!channel?.isTextBased()) {
+    // F25: fehlendes/unerreichbares Ziel NICHT still schlucken.
+    await logError(
+      client,
+      config,
+      new Error(`postReview: kein sendbarer Kanal (targetId=${targetId || "keiner"})`),
+      { where: "year-rollover postReview no-target", detail: `season=${season?.id ?? "?"} liveYear=${liveYear ?? "-"}` }
+    );
+    return false;
+  }
+  const review = season ? (live ? db.seasonLiveReview(season.id) : db.seasonReview(season.id)) : null;
   const text = formatSeasonReviewText(review, liveYear ?? null);
   if (!text) return false;
   try {
@@ -250,7 +333,7 @@ async function createNextSeasonChannel(client, config, year) {
     console.log(`[year-rollover] Kanal ${name} existiert bereits`);
     // F15: Overwrites auf den AKTUELLEN Spielerstand nachziehen (wer neu
     // eingeladen wurde, muss den Kanal sehen/darauf schreiben).
-    await syncChannelOverwrites(existing, config);
+    await syncChannelOverwrites(client, existing, config);
     return existing;
   }
 
@@ -280,7 +363,7 @@ function currentPlayerOverwrites() {
     .filter((p) => p.discord_user_id)
     .map((p) => ({
       id: p.discord_user_id,
-      allow: ["ViewChannel", "SendMessages"],
+      allow: { ViewChannel: true, SendMessages: true },
     }));
 }
 
@@ -289,38 +372,41 @@ function currentPlayerOverwrites() {
  * Spielerstand nachziehen. Rückgabe true wenn mind. eine Änderung gepingt wurde,
  * false wenn nichts zu tun war oder das Edit fehlschlug (Fehler wird geloggt).
  */
-async function syncChannelOverwrites(channel, config) {
+async function syncChannelOverwrites(client, channel, config) {
   const desired = currentPlayerOverwrites();
-  try {
-    const existingOw = (channel.permissionOverwrites?.cache || []);
-    const existingFor = (id) =>
-      Array.isArray(existingOw)
-        ? existingOw.find((o) => String(o.id) === String(id))
-        : existingOw.get(String(id));
-    let changed = 0;
-    for (const d of desired) {
-      const o = existingFor(d.id);
-      const hasView =
-        o?.allow?.has?.("ViewChannel") ??
-        (Array.isArray(o?.allow) && o.allow.includes("ViewChannel"));
-      const hasSend =
-        o?.allow?.has?.("SendMessages") ??
-        (Array.isArray(o?.allow) && o.allow.includes("SendMessages"));
-      if (o && hasView && hasSend) continue; // schon passend
+  const existingOw = (channel.permissionOverwrites?.cache || []);
+  const existingFor = (id) =>
+    Array.isArray(existingOw)
+      ? existingOw.find((o) => String(o.id) === String(id))
+      : existingOw.get(String(id));
+  let changed = 0;
+  for (const d of desired) {
+    const o = existingFor(d.id);
+    // F23: Bestand kann entweder ein PermissionsBitField (.has()) oder eine
+    // Boolean-Map sein — das ARRAY-Format gibt es nicht mehr.
+    const hasView =
+      o?.allow?.has?.("ViewChannel") ?? (o?.allow?.ViewChannel === true);
+    const hasSend =
+      o?.allow?.has?.("SendMessages") ?? (o?.allow?.SendMessages === true);
+    if (o && hasView && hasSend) continue; // schon passend
+    try {
+      // F23: d.allow ist die Boolean-Map — genau das zweite Argument, das
+      // edit() für die Overwrite-Nachpflege auf Bestands-Kanälen braucht.
       await channel.permissionOverwrites.edit(d.id, d.allow, {
         type: 1, // PermissionOverwriteType.Member
         reason: `Deathpool ${channel.name}: Spieler ${d.id} Zugriff nachgezogen (year-rollover)`,
       });
       changed++;
+    } catch (e) {
+      // F23: Teilfehler (z.B. Server verlassen, fehlende Rechte) nur loggen —
+      // der bestehende Kanal wird NICHT verworfen, die übrigen Spieler laufen weiter.
+      await logError(client, config, e, {
+        where: "year-rollover syncChannelOverwrites",
+        detail: `channel=${channel.id} player=${d.id}`,
+      });
     }
-    return changed > 0;
-  } catch (e) {
-    await logError(client, config, e, {
-      where: "year-rollover syncChannelOverwrites",
-      detail: `channel=${channel.id}`,
-    });
-    return false;
   }
+  return changed > 0;
 }
 
 
@@ -393,9 +479,11 @@ function startYearRollover(client, config) {
   cron.schedule(
     expr,
     () => {
-      runYearRollover(client, config).catch((e) =>
-        console.error("[year-rollover] failed", e.message)
-      );
+      // F25: Fehler über logError in den Logkanal, nicht nur stdout.
+      runYearRollover(client, config).catch((e) => {
+        console.error("[year-rollover] failed", e.message);
+        logError(client, config, e, { where: "year-rollover cron" });
+      });
     },
     { timezone: "Europe/Vienna" }
   );
@@ -406,9 +494,10 @@ function startYearRollover(client, config) {
   cron.schedule(
     remindExpr,
     () => {
-      remindAdminToAnnounce(client, config).catch((e) =>
-        console.error("[year-rollover] reminder failed", e.message)
-      );
+      remindAdminToAnnounce(client, config).catch((e) => {
+        console.error("[year-rollover] reminder failed", e.message);
+        logError(client, config, e, { where: "year-rollover reminder cron" });
+      });
     },
     { timezone: "Europe/Vienna" }
   );
@@ -420,9 +509,11 @@ function startYearRollover(client, config) {
 module.exports = {
   runYearRollover,
   startYearRollover,
+  finalizeYearSwitch,
   formatSeasonReviewText,
   remindAdminToAnnounce,
   createNextSeasonChannel,
   nextYear,
   todayInVienna,
+  isNewYearDayVienna,
 };

@@ -32,7 +32,7 @@ Sitzt du bei den Alten im Deathpool, kenne ich deine Liste. Dieselben Feiglinge,
 
 **Vor dem Start.** Stirbt jemand vor **{START_DATE}** auf deiner Liste, schreibe ich dir. Tauschen geht. Punkte gibt es dafür nicht.
 
-**Tarif.** Alter am **{START_DATE}**: \`max(1, 100 - Alter)\`. Jünger bringt mehr. Weniger als **1** gibt es nicht.`;
+**Tarif.** Alter am **{START_DATE}**: \`max(1, 100 - Alter)\`. Jünger bringt mehr, mindestens 1 Punkt — bei unbekanntem Alter (kein Geburtsdatum) gibt es **0 Punkte**.`;
 
 /**
  * Ersetzt die Template-Platzhalter des Announcement-Texts durch Werte aus der
@@ -109,14 +109,14 @@ const cmd = {
   group: "season",
   description: "Öffnet die Anmeldung für die nächste (angekündigte) Saison",
   usage:
-    "/announce-season announce_channel:#Kanal [note:…] [year:2027] [start_date:2027-01-01] [repost:true]",
+    "/announce-season announce_channel:#Kanal [note:…] [year:YYYY] [start_date:YYYY-MM-DD] [repost:true]",
   examples: [
     "/announce-season announce_channel:#wettbuero",
     "/announce-season announce_channel:#wettbuero note:Wer will mitmachen?",
     "/announce-season repost:true",
   ],
   details:
-    "Legt eine announced-Saison (2027) an, speichert den Kanal und postet das Teilnahme-Embed. Die laufende Saison bleibt unangetastet. repost postet nur das Embed erneut. Wechsel am Saisonstart: /new-year activate:true.",
+    "Legt die announced-Saison für die nächste (angekündigte) Runde an, speichert den Kanal und postet das Teilnahme-Embed. Das Jahr ist Standard nächstes Jahr (Default aus der laufenden Saison) oder per [year:YYYY]; start_date Standard 1. Januar des Jahres. Die laufende Saison bleibt unangetastet. repost postet nur das Embed erneut. Wechsel am Saisonstart: /new-year activate:true.",
   options: [
     {
       name: "announce_channel",

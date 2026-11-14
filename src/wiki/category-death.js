@@ -325,6 +325,16 @@ async function findAnnouncedDeathsByCategory(userAgent, { delayMs = 350, seasonS
       continue;
     }
 
+    // F24: Das Kategorie-Jahr als Eintragsdatum setzen. Tag/Monat fehlen, also
+    // den maximal-späten Zeitpunkt des Jahres (31.12.) verwenden — entryDeathDateIso
+    // (month 0-basiert) liefert daraus "{jahr}-12-31". applyDeath vergleicht das
+    // gegen den Start der LAUFENDEN Saison: Ein 2024-deaths-Kategorie-Tod, erkannt
+    // im Dezember 2026, liegt mit "2024-12-31" vor "2026-01-01" → preStart-Zweig
+    // → 0 Punkte + Warnung, statt fälschlich den Erkennungstag zu nehmen und in
+    // der laufenden Saison Punkte zu vergeben. Ohne erkennbares Jahr (parseDeathYear
+    // == null) bleiben year/month/day null → entryDeathDateIso liefert null →
+    // Erkennungstag bleibt der echte Fallback (nur wenn wirklich kein Datum da).
+    const deathYear = parseDeathYear(found.category);
     console.log(
       new Date().toISOString(),
       "[category-death] announced",
@@ -346,6 +356,9 @@ async function findAnnouncedDeathsByCategory(userAgent, { delayMs = 350, seasonS
         text: `${celeb.name} (${found.category || "death category"})`,
         url: found.url,
         lang: /de\.wikipedia/i.test(found.url) ? "de" : "en",
+        year: deathYear ?? null,
+        month: deathYear != null ? 11 : null,
+        day: deathYear != null ? 31 : null,
       },
       age: celeb.age_at_pick ?? null,
       via: "category",

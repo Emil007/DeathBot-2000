@@ -27,7 +27,8 @@ services:
       WIKI_POLLER_MINUTES: "30"
       DAILY_SUMMARY_HOUR: "9"
       DATA_DIR: "/app/data"
-      TZ: "Europe/Berlin"
+      # Bot-Zeitzone: Jahreswechsel/Erinnerungen rechnen in Europe/Vienna (Wien).
+      TZ: "Europe/Vienna"
       ALERT_EMOJI: "⚰️"
       ALERT_EMOJI_REPEAT: "3"
       # Days a live wiki-hit must stay on death lists before it is locked (else retract)
