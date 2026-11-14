@@ -48,28 +48,59 @@ function renderSeasonTemplate(template, { year, runningYear, startDate, maxPicks
     .split("{MAX_PICKS}").join(String(NP));
 }
 
+// F17: Discord-Limits — Embed-Description max. 4096, Titel max. 256 Zeichen.
+const MAX_DESCRIPTION_LENGTH = 4096;
+const MAX_TITLE_LENGTH = 256;
+// F17: Kennzeichnung einer gekürzten Notiz (Embed + Admin-Antwort nutzen sie).
+const TRUNCATION_HINT = "(gekürzt)";
+
+/**
+ * Kürzt einen String auf maxLength und hängt einen Hinweis an, wenn gekürzt.
+ * Gibt { text, truncated } zurück; truncated=true wenn etwas abgeschnitten wurde.
+ * Exportiert für Tests.
+ */
+function truncateForEmbed(value, maxLength, hint = TRUNCATION_HINT) {
+  const s = String(value ?? "");
+  if (s.length <= maxLength) return { text: s, truncated: false };
+  const suffix = ` … ${hint}`;
+  return { text: `${s.slice(0, Math.max(0, maxLength - suffix.length))}${suffix}`, truncated: true };
+}
+
 /**
  * Embed für die Teilnahme-Ankündigung der nächsten Runde.
  * Feste Sätze — der Tipp-Assistent (M4) erklärt exakt diese Schritte.
- * Exportiert für Tests.
+ * Exportiert für Tests. F18a: `channelName` war unbenutzt — entfernt.
+ * F17: Description wird auf 4096, Titel auf 256 Zeichen gekürzt statt
+ * discord.js einen EmbedBuilder-RangeError zu überlassen.
  */
-function buildSeasonEmbed({ year, startDate, channelName, note, runningYear, maxPicks, template, title }) {
+function buildSeasonEmbed({ year, startDate, note, runningYear, maxPicks, template, title }) {
   const NP = Number.isFinite(Number(maxPicks)) ? Number(maxPicks) : 50;
   const vars = { year, runningYear, startDate, maxPicks: NP };
   const useTemplate = template || DEFAULT_ANNOUNCE_TEMPLATE;
   const useTitle = title || DEFAULT_ANNOUNCE_TITLE;
   let description = renderSeasonTemplate(useTemplate, vars);
-  if (note) description += `\n\n📝 **Notiz:** ${note}`;
+  if (note) {
+    const noteText = truncateForEmbed(String(note), MAX_DESCRIPTION_LENGTH - description.length - 9);
+    description += `\n\n📝 **Notiz:** ${noteText.text}`;
+  }
+  if (description.length > MAX_DESCRIPTION_LENGTH) {
+    description = truncateForEmbed(description, MAX_DESCRIPTION_LENGTH).text;
+  }
+  const rawTitle = useTitle ? renderSeasonTemplate(useTitle, vars) : `Nächste Runde: ${year}`;
+  const titleRes = truncateForEmbed(rawTitle, MAX_TITLE_LENGTH);
   return new EmbedBuilder()
     .setColor(0x2a9d3f)
-    .setTitle(useTitle ? renderSeasonTemplate(useTitle, vars) : `Nächste Runde: ${year}`)
+    .setTitle(titleRes.text)
     .setDescription(description)
     .setTimestamp(new Date());
 }
 
+// F18b: Default-Jahr = Jahr der laufenden Saison + 1. Der alte UTC-Monats-Test
+// hatte zwei identische Zweige (immer UTC-Jahr+1) und lag am 01.01. bereits
+// ein Jahr daneben. Die laufende Saison ist die Quelle der Wahrheit.
 const DEFAULT_YEAR = () => {
-  const now = new Date();
-  return now.getUTCMonth() >= 10 ? now.getUTCFullYear() + 1 : now.getUTCFullYear() + 1;
+  const active = db.getActiveSeason();
+  return (active && Number.isFinite(Number(active.year)) ? Number(active.year) : 0) + 1;
 };
 
 const cmd = {
@@ -179,15 +210,31 @@ const cmd = {
       const running = db.getActiveSeason();
       // F26: fehlgeschlagenes Embed darf NICHT als Erfolg gemeldet werden
       try {
+        // F11: nach setSeasonAnnounce den frischen DB-Stand verwenden — vorher
+        // gewann die ALTE Notiz (announced.announce_note || note).
+        const fresh = db.getAnnouncedSeason();
         const embed = buildSeasonEmbed({
-          year: announced.year,
-          startDate: announced.start_date,
-          channelName: channel.name,
-          note: announced.announce_note || note || null,
+          year: fresh.year,
+          startDate: fresh.start_date,
+          note: fresh.announce_note || note || null,
           runningYear: running?.year,
           maxPicks: ctx.config.maxPicksPerPlayer,
         });
         await channel.send({ embeds: [embed], allowedMentions: { parse: [] } });
+        const noteWasTruncated = embed.data.description?.includes(TRUNCATION_HINT);
+        await logEvent(ctx.client, ctx.config, {
+          kind: "season-repost",
+          summary: `Embed für ${fresh.year} erneut gepostet in Kanal ${chanId}`,
+          userId: ctx.config.adminId,
+        });
+        const noteBit =
+          note && note !== fresh.announce_note
+            ? `\n📝 Notiz aktualisiert: **${note.length > 80 ? note.slice(0, 80) + "…" : note}**`
+            : "";
+        // F17: Hinweis, dass die Notiz im Embed gekürzt wurde
+        const truncBit = noteWasTruncated ? `\n⚠️ Notiz zu lang — im Embed **${TRUNCATION_HINT}** abgeschnitten.` : "";
+        await msg.reply(`Embed erneut gepostet — nichts wurde angelegt oder gelöscht.${noteBit}${truncBit}`);
+        return;
       } catch (e) {
         await logError(ctx.client, ctx.config, e, {
           where: "announce-season repost",
@@ -196,12 +243,6 @@ const cmd = {
         await msg.reply(`Embed-Repost fehlgeschlagen: ${e.message}`);
         return;
       }
-      await logEvent(ctx.client, ctx.config, {
-        kind: "season-repost",
-        summary: `Embed für ${announced.year} erneut gepostet in Kanal ${chanId}`,
-        userId: ctx.config.adminId,
-      });
-      await msg.reply("Embed erneut gepostet — nichts wurde angelegt oder gelöscht.");
       return;
     }
 
@@ -233,18 +274,19 @@ const cmd = {
     const channel = await ctx.client.channels.fetch(channelId).catch(() => null);
     const running = db.getActiveSeason();
     let embedSent = false;
+    let embedTruncated = false;
     if (channel?.send) {
       try {
         const embed = buildSeasonEmbed({
           year: season.year,
           startDate: season.start_date,
-          channelName: channel.name,
           note: season.announce_note,
           runningYear: running?.year,
           maxPicks: ctx.config.maxPicksPerPlayer,
         });
         await channel.send({ embeds: [embed], allowedMentions: { parse: [] } });
         embedSent = true;
+        embedTruncated = Boolean(embed.data.description?.includes(TRUNCATION_HINT));
       } catch (e) {
         await logError(ctx.client, ctx.config, e, { where: "announce-season send" });
       }
@@ -262,7 +304,8 @@ const cmd = {
         `• Start: **${season.start_date}** · live: **nein**`,
         `• Kanal: <#${channelId}>`,
         embedSent
-          ? `• ${running?.year ?? "Die laufende Runde"} läuft unverändert weiter (Punkte/Kills).`
+          ? `• ${running?.year ?? "Die laufende Runde"} läuft unverändert weiter (Punkte/Kills).` +
+            (embedTruncated ? ` ⚠️ Notiz zu lang — im Embed **${TRUNCATION_HINT}** abgeschnitten.` : "")
           : "• ⚠️ Embed-Posten **fehlgeschlagen** — Saison ist trotzdem angelegt, `repost:true` nutzen.",
         "",
         `Anleitung zum Tippen steht im Embed. ${announced ? "Repost: `/announce-season repost:true`" : ""}`,
@@ -276,3 +319,6 @@ module.exports.buildSeasonEmbed = buildSeasonEmbed;
 module.exports.renderSeasonTemplate = renderSeasonTemplate;
 module.exports.DEFAULT_ANNOUNCE_TEMPLATE = DEFAULT_ANNOUNCE_TEMPLATE;
 module.exports.DEFAULT_ANNOUNCE_TITLE = DEFAULT_ANNOUNCE_TITLE;
+module.exports.DEFAULT_YEAR = DEFAULT_YEAR;
+module.exports.MAX_DESCRIPTION_LENGTH = MAX_DESCRIPTION_LENGTH;
+module.exports.TRUNCATION_HINT = TRUNCATION_HINT;

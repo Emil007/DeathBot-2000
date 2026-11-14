@@ -10,11 +10,11 @@ const cmd = {
   usage: "/review [scope:pool]\n{prefix}review",
   examples: ["/review", "/review scope:pool", "{prefix}review"],
   details:
-    "Zeigt standardmäßig die Anmeldungs-Queue (2027). scope:pool = laufender Pool. Nach /import erscheinen Karten mit Buttons; /review zeigt die nächste. Mit CHANNEL_ADMIN landen Karten dort.",
+    "Zeigt standardmäßig die Anmeldungs-Queue der angekündigten Runde. scope:pool = laufender Pool. Nach /import erscheinen Karten mit Buttons; /review zeigt die nächste. Mit CHANNEL_ADMIN landen Karten dort.",
   options: [
     {
       name: "scope",
-      description: "next (2027-Anmeldung) oder pool (laufender Pool)",
+      description: "next (Anmeldung der angekündigten Runde) oder pool (laufender Pool)",
       type: "STRING",
       required: false,
     },
@@ -26,7 +26,7 @@ const cmd = {
   async run(ctx, args, msg) {
     // F18: pool NICHT durch Number schicken — NaN fragt nach season_id NaN ab
     // und findet nie etwas. explizit pool => laufender Pool (seasonId undefined),
-    // sonst die 2027-Anmeldungs-Queue.
+    // sonst die Anmeldungs-Queue der angekündigten Runde.
     const wantPool = args.some(
       (a) => a === "pool" || String(a).toLowerCase().startsWith("scope:pool")
     );

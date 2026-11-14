@@ -12,6 +12,12 @@ function openDb(config) {
   db = new Database(config.dbPath);
   db.exec(SCHEMA);
   migrate(db);
+  // F05-Reparatur (einmalig, idempotent): vor dem Fix ließ `/go` aktive Zeilen
+  // mit live=1 + phase='setup' zurück, weil setSeasonLive `phase` nie setzte.
+  // Diese Bestandszeilen auf 'running' heben — danach matcht kein weiterer Lauf.
+  db.exec(
+    `UPDATE seasons SET phase='running' WHERE active=1 AND live=1 AND phase='setup'`
+  );
   ensureActiveSeason();
   try {
     repairAnnouncedBursts();
@@ -49,12 +55,6 @@ function reopenDb(config) {
   }
 }
 
-function setSeasonLive(live) {
-  const s = getActiveSeason();
-  db.prepare("UPDATE seasons SET live = ? WHERE id = ?").run(live ? 1 : 0, s.id);
-  return getActiveSeason();
-}
-
 function ensureActiveSeason() {
   const active = db.prepare("SELECT id FROM seasons WHERE active = 1 LIMIT 1").get();
   if (active) return active.id;
@@ -84,9 +84,24 @@ function setSeasonStartDate(startDate) {
   return getActiveSeason();
 }
 
+// F05: setSeasonLive hält live UND phase konsistent. Vorher wurde nur `live`
+// gesetzt — `/go` ließ die aktive Zeile mit live=1 + phase='setup' zurück und
+// `activateAnnouncedSeason` verweigerte den Wechsel („Aktive Saison ist nicht
+// running"). Jetzt: live=true => phase 'running' (wenn setup/NULL); live=false =>
+// 'setup' (wenn 'running'). announced/archived werden nie überschrieben.
 function setSeasonLive(live) {
   const s = getActiveSeason();
-  db.prepare("UPDATE seasons SET live = ? WHERE id = ?").run(live ? 1 : 0, s.id);
+  let phase = s.phase;
+  if (live) {
+    if (phase === "setup" || phase == null) phase = "running";
+  } else {
+    if (phase === "running") phase = "setup";
+  }
+  db.prepare("UPDATE seasons SET live = ?, phase = ? WHERE id = ?").run(
+    live ? 1 : 0,
+    phase,
+    s.id
+  );
   return getActiveSeason();
 }
 
@@ -206,6 +221,10 @@ function activateAnnouncedSeason() {
   })();
 }
 
+// Derselbe Normalisierungs-Schlüssel wie in src/discord/pick-parse.js (nameKey),
+// damit die Duplikat-Erkennung ACROSS DMs gegen die EXAKT gleiche Regel läuft
+// wie innerhalb einer Paste (beide bauen Akzente ab/assozieren ASCII gleich).
+// Duplikat-/Dedup-Logik für Draft-Einträge hängt an diesem einen Schlüssel.
 function nameKey(name) {
   return String(name)
     .normalize("NFKD")
@@ -428,8 +447,15 @@ function countPendingReviews({ seasonId, blockingLive } = {}) {
       .prepare(`SELECT COUNT(*) AS c FROM celeb_review_queue WHERE status = 'pending' AND season_id = ?`)
       .get(seasonId).c;
   }
+  // Default-/Pool-Pfad (seasonId fehlt, nicht blockingLive): dieselbe Bedingung
+  // wie nextPendingReview(null) — `season_id IS NULL OR season_id = <aktive Saison>`.
+  // Nur so zählt der laufende Pool konsistent zu dem, was /review dann auch
+  // liefert. announced-Zeilen (z.B. 2027) zählen hier NICHT mit (F12).
   return db
-    .prepare(`SELECT COUNT(*) AS c FROM celeb_review_queue WHERE status = 'pending'`)
+    .prepare(
+      `SELECT COUNT(*) AS c FROM celeb_review_queue
+       WHERE status = 'pending' AND (season_id IS NULL OR season_id = (SELECT id FROM seasons WHERE active = 1))`
+    )
     .get().c;
 }
 
@@ -882,6 +908,15 @@ function addDraftNames(draftId, names, opts = {}) {
   const maxPos = db
     .prepare("SELECT COALESCE(MAX(position), 0) AS m FROM pick_draft_entries WHERE draft_id = ?")
     .get(draftId).m;
+  // F10: Bestands-Dedup. Eine zweite DM derselben Person (per nameKey wie in
+  // parsePickList) darf KEINE zweite Zeile anlegen — Doppelte zählen über alle
+  // Direktnachrichten, nicht nur innerhalb einer Paste. Die betroffenen
+  // Rohstrings werden als `duplicates` zurückgegeben, damit die DM sie nennt.
+  const entries = db
+    .prepare("SELECT raw_name FROM pick_draft_entries WHERE draft_id = ?")
+    .all(draftId);
+  const existingKeys = new Set(entries.map((r) => nameKey(r.raw_name)).filter(Boolean));
+  const duplicates = [];
   const stmt = db.prepare(
     `INSERT INTO pick_draft_entries (draft_id, position, raw_name, link_status)
      VALUES (?, ?, ?, 'pending')`
@@ -889,13 +924,24 @@ function addDraftNames(draftId, names, opts = {}) {
   let pos = maxPos;
   let added = 0;
   for (const name of names) {
+    const k = nameKey(name);
+    if (!k) continue;
+    if (existingKeys.has(k)) {
+      duplicates.push(name);
+      continue;
+    }
     if (existingCount + added >= maxNames) break;
+    existingKeys.add(k);
     pos += 1;
     stmt.run(draftId, pos, name);
     added += 1;
   }
   db.prepare("UPDATE pick_drafts SET updated_at = datetime('now') WHERE id = ?").run(draftId);
-  return { added, truncated: names.length > added, limit: maxNames };
+  // truncated: es blieben Namen wegen des GLOBALEN Limits draußen (nur
+  // `entfernen` schafft Platz — ganze Liste, keine „mehrere Meldungen").
+  // Duplikate zählen hier NICHT als truncated — sie werden separat gemeldet.
+  const processed = added + duplicates.length;
+  return { added, duplicates, truncated: processed < names.length, limit: maxNames };
 }
 
 /** Maximale Namen in einem Draft (Karte selbst, 25 eingebettete Felder -> Sicherheit). */
@@ -1068,6 +1114,14 @@ function getAnnouncedSeasonPicksForPlayer(playerId, seasonId) {
  * Ungewarnete Pre-Start-Tode in announced-Picks: Celebs, die vor dem
  * Saisonstart gestorben sind, aber noch NICHT in pick_death_warnings stehen.
  * Liefert Zeilen für den DM-Versand in announced Season (live=0).
+ *
+ * F14b: died_at trägt seit F14a das echte Wiki-Todesdatum (entry.day/month/
+ * year), nicht den Erkennungstag. Ein Wiki-Todestag vor dem Saisonstart gilt
+ * also auch dann als Vor-Start-Tod, wenn er erst NACH dem Start erkannt wurde
+ * (z.B. 20.12. erkannt am 2.1.). OHNE Wiki-Datum (died_at IS NULL) zählt nur
+ * ein Tod als Vor-Start, der auch tatsächlich VOR dem Start erkannt wurde
+ * (death_detected_at < start) — sonst würde jeder nach dem Start erkannte,
+ * datumslose Tod fälschlich als Vor-Start-Tod gewarnt.
  */
 function getAnnouncedPreStartDeathsUnwarned(seasonId) {
   const season = db.prepare("SELECT * FROM seasons WHERE id = ?").get(seasonId);
@@ -1075,6 +1129,7 @@ function getAnnouncedPreStartDeathsUnwarned(seasonId) {
   return db
     .prepare(
       `SELECT pk.player_id, pk.celeb_id, c.name AS celeb_name, c.died_at AS celeb_died_at,
+              c.death_detected_at AS celeb_detected_at,
               u.discord_user_id AS user_discord_id, w.season_id AS warned_season
        FROM picks pk
        JOIN celebs c ON c.id = pk.celeb_id
@@ -1083,10 +1138,14 @@ function getAnnouncedPreStartDeathsUnwarned(seasonId) {
          ON w.season_id = pk.season_id AND w.player_id = pk.player_id AND w.celeb_id = pk.celeb_id
        WHERE pk.season_id = ?
          AND c.is_alive = 0
-         AND (c.died_at IS NULL OR c.died_at <= ?)
+         AND (
+           (c.died_at IS NOT NULL AND c.died_at <= ?)
+           OR
+           (c.died_at IS NULL AND c.death_detected_at IS NOT NULL AND c.death_detected_at < ?)
+         )
          AND w.season_id IS NULL`
     )
-    .all(seasonId, season.start_date);
+    .all(seasonId, season.start_date, season.start_date);
 }
 
 function markAnnouncedDeathWarned(seasonId, playerId, celebId) {
@@ -1164,6 +1223,21 @@ function applyDeath(celebId, opts = {}) {
     const now = new Date().toISOString();
     const diedAt = o.diedAt || now.slice(0, 10);
 
+    // F14: seit der Fix vergeht diedAt das echte Wiki-Todesdatum (entry.day/
+    // month/year), nicht den Erkennungstag. Ein Tod VOR dem Saisonstart darf
+    // deshalb KEINE Punkte in der aktiven Saison gewinnen — auch wenn er erst
+    // NACH dem Start entdeckt wird (z.B. 20.12. in der Jan-Liste). Der Tod wird
+    // trotzdem vermerkt (is_alive=0), damit getAnnouncedPreStartDeathsUnwarned
+    // bzw. die Pre-Start-Warnung den Einreicher erreichen kann.
+    const seasonStart = season?.start_date;
+    const isoRe = /^\d{4}-\d{2}-\d{2}$/;
+    const preStart =
+      Boolean(o.diedAt) &&
+      Boolean(seasonStart) &&
+      isoRe.test(String(o.diedAt)) &&
+      isoRe.test(String(seasonStart)) &&
+      String(o.diedAt) < String(seasonStart);
+
     // Never overwrite a confirmed biography URL with a death-list link
     if (celeb.wiki_confirmed) {
       db.prepare(
@@ -1215,26 +1289,30 @@ function applyDeath(celebId, opts = {}) {
         .get(cid, w.id, season.id);
       const age = pick?.age_at_pick ?? celeb.age_at_pick;
       const score = scoreForAge(age);
+      // Vor-Start-Tod: 0 Punkte (keine DB-Gutschrift, kein death_award),
+      // aber der Winner taucht weiterhin im Result auf (Punkte 0) — so kann
+      // der Aufrufer zwischen „kein Winner“ und „Winner ohne Punkte“ unterscheiden.
+      const awardPoints = preStart ? 0 : score;
       if (awards.length === 0) {
-        firstScore = score;
+        firstScore = awardPoints;
         effAge = age;
       }
-      if (score > 0) {
+      if (awardPoints > 0) {
         const existing = db
           .prepare(
             `SELECT id FROM death_awards WHERE celeb_id = ? AND player_id = ? AND season_id = ?`
           )
           .get(cid, w.id, season.id);
         if (!existing) {
-          db.prepare("UPDATE players SET base_points = base_points + ? WHERE id = ?").run(score, w.id);
+          db.prepare("UPDATE players SET base_points = base_points + ? WHERE id = ?").run(awardPoints, w.id);
           db.prepare(
             `INSERT INTO death_awards (celeb_id, player_id, points, season_id) VALUES (?, ?, ?, ?)`
-          ).run(cid, w.id, score, season.id);
+          ).run(cid, w.id, awardPoints, season.id);
         }
       }
       awards.push({
         player: w,
-        points: score,
+        points: awardPoints,
         total: playerTotal(w.id),
       });
     }

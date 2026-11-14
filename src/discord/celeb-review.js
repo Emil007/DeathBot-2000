@@ -404,8 +404,14 @@ async function handleReviewInteraction(ctx, interaction) {
   if (!interaction.isButton()) return false;
 
   if (action === "confirm") {
-    confirmFromProposal(celebId, celeb, q);
+    // F13: Saison VOR dem (evtl. mergenden) Confirm einfrieren und an
+    // sendNextReview weiterreichen, analog zum Skip-Pfad. applyWikiConfirm kann
+    // celebId per QID/norm-Merge in einen kanonischen Celeb mergen und löscht
+    // dabei die Queue-Zeile der Dublette — ein nachträgliches seasonForQueue(celebId)
+    // fände keine Zeile mehr und würde in die aktive Saison abrutschen. So bleibt
+    // die Navigation nach einem Merge in der announced-Queue.
     const { season, seasonId } = seasonForQueue(celebId);
+    confirmFromProposal(celebId, celeb, q);
     await interaction.update({
       content: `Bestätigt **${celeb.name}** → Auto-Match an.`,
       embeds: [],

@@ -14,14 +14,22 @@ const {
 const db = require("../db");
 const { parsePickList } = require("./pick-parse");
 const { canParticipate } = require("./membership");
-const { proposeWikiForName, lookupUrl } = require("../wiki/page-lookup");
+// pageLookup als MODUL referenzieren statt die Funktionen beim Load zu
+// destrukturieren — Aufrufe gehen durch das Modul-Objekt, sodass Tests die
+// Netz-Funktionen überschreiben können (kein Verhaltensunterschied in Prod).
+const pageLookup = require("../wiki/page-lookup");
 const { queueCelebsForReview, sendNextReview } = require("./celeb-review");
 const { resolveAdminTarget } = require("./admin-notify");
 const { logEvent, logError } = require("./log");
 
 const DONE_RE = /^(fertig|done|end|liste fertig)$/i;
 const REMOVE_RE = /^entfern\w*\s+(\d+)$/i;
-const CHANGE_RE = /^(?:änder|aendere|ändere|change)\s+(\d+)\s+(.+)$/i;
+// F09: Die Anleitung sagt `ändern 3 Neuer Name` (mit n). `ändern`, `ändere`,
+// `aendere`, `aendern` … müssen ALLE greifen — analog zu REMOVE_RE (entfern\w*).
+const CHANGE_RE = /^(?:änder\w*|aender\w*|change)\s+(\d+)\s+(.+)$/i;
+// F09: Mehrdeutige/unbekannte Befehlzeilen der Form `verb nummer rest` NICHT
+// als Namen importieren (sonst landet „xyz 3 abc“ als Karte im Draft).
+const UNKNOWN_CMD_RE = /^\S+\s+\d+\s+\S+/;
 const UNLOCK_RE = /^(unlock|entsperren|oeffnen|öffnen)$/i;
 const LINK_URL_RE = /^link\s+(\d+)\s+(\S+\.wikipedia\.org\/wiki\/\S+)$/i;
 const WRONG_RE = /^(?:falsch|nein|wrong|nicht richtig|falsche)\s*(?:\s*(\d+))?$/i;
@@ -43,6 +51,35 @@ function classifyProposal(proposal) {
   // ein stilles Verknüpfen auf den ersten Treffer wäre falsch.
   if (cands.length >= 2) return { linkStatus: "ambiguous" };
   return { linkStatus: "linked" };
+}
+
+/**
+ * F08: Entry-Zeile neu lesen und prüfen, ob sie noch unangetastet ist, sodass
+ * die asynchrone Auflösung sie überschreiben darf.
+ *
+ * - claimedUrl gegeben (URL-Paste/link N): die Zeile muss immer noch pending
+ *   sein UND wiki_url exakt dem Claim entsprechen. Hat der User inzwischen
+ *   manuell gewählt (Status ≠ pending) oder einen ANDEREN Link geschickt,
+ *   wird nicht überschrieben.
+ * - claimedUrl = null (Auto-Resolver): pending und ohne gesetzte URL.
+ */
+function recheckEntry(entryId, claimedUrl) {
+  const row = db
+    .getDb()
+    .prepare("SELECT link_status, wiki_url FROM pick_draft_entries WHERE id = ?")
+    .get(entryId);
+  if (!row || row.link_status !== "pending") return false;
+  if (claimedUrl != null) return row.wiki_url === String(claimedUrl);
+  return row.wiki_url == null || row.wiki_url === "";
+}
+
+/** F08a: URL/Link sofort in der Draft-Zeile festhalten (Bevor die async löst). */
+function claimEntryUrl(entryId, url) {
+  db.setDraftEntryLinked(entryId, {
+    wikiUrl: url,
+    linkStatus: "pending",
+    candidatesJson: null,
+  });
 }
 
 function draftEmbed(entries, season, draftStatus = "draft") {
@@ -76,11 +113,13 @@ function draftEmbed(entries, season, draftStatus = "draft") {
     const per = 12;
     for (let start = 0; start < lines.length; start += per) {
       const chunkLines = lines.slice(start, start + per);
-      const n0 = start +(1);
+      const n0 = start + 1;
       const n1 = Math.min(start + per, lines.length);
+      // F19c: gekürzte Feldwerte sichtbar machen („…“ statt stiller Abschnitt)
+      const value = chunkLines.join("\n");
       embed.addFields({
         name: `Einträge ${n0}–${n1}`,
-        value: chunkLines.join("\n").slice(0, 1024),
+        value: value.length > 1024 ? value.slice(0, 1023) + "…" : value,
         inline: false,
       });
     }
@@ -198,7 +237,12 @@ async function handlePickInteraction(ctx, interaction) {
     await interaction.followUp?.({ content: "Kandidat ungültig.", ephemeral: true }).catch(() => {});
     return true;
   }
-  interruptUsers.add(userId); // R2-4: laufenden Resolver stoppen
+  // R2-4/F08c: Laufenden Auto-Resolver stoppen, damit er die manuelle Wahl
+  // NICHT überschreibt. Nur wenn wirklich ein Lauf läuft — sonst bliebe das
+  // Flag bis zum nächsten Lauf hängen. Löschen übernimmt der Resolver finally.
+  if (busyUsers.has(userId)) interruptUsers.add(userId);
+  // Diese Wahl ist synchron — keine URL-Asynchronität, in der ein Resolver
+  // überschreiben könnte (await-frei bis zum nächsten Send).
   db.setDraftEntryLinked(entryId, {
     wikiUrl: chosen.url,
     wikiNorm: chosen.norm,
@@ -206,7 +250,6 @@ async function handlePickInteraction(ctx, interaction) {
     proposedAge: chosen.proposedAge,
     linkStatus: "linked",
   });
-  interruptUsers.delete(userId);
   await logEvent(ctx.client, ctx.config, {
     kind: "pick-link",
     summary: `Kandidat gewählt: ${entry.raw_name} → ${chosen.title} (Saison ${season.year})`,
@@ -265,18 +308,26 @@ async function tryConsumePickMessage(ctx, msg) {
       return true;
     }
     // Kurz auf laufende Auto-Auflösung warten, damit keine Überschreibung passiert.
-    // R2-4: NICHT droppen — Nachlauf anfordern, der laufende Lauf stoppt bei der
-    // nächsten Interrupt-Prüfung und löscht danach das Flag.
+    // R2-4/F08: NICHT droppen — die URL wird SOFORT als Claim in der
+    // Draft-Zeile gespeichert, Nachlauf + Interrupt stoppen den laufenden Lauf.
+    // Der angeforderte Rerun übernimmt den Claim (wiki_url) statt einer
+    // Auto-Überschreibung.
+    const targetId = target.id;
+    claimEntryUrl(targetId, body);
     if (busyUsers.has(msg.author.id)) {
       rerunUsers.add(msg.author.id);
       interruptUsers.add(msg.author.id);
       await msg.reply("Moment, ich löse noch Namen auf — deinen Link setze ich gleich um.");
       return true;
     }
-    interruptUsers.add(msg.author.id);
     try {
-      const proposal = await lookupUrl(ctx.config.userAgent, body, season.start_date, null);
-      db.setDraftEntryLinked(target.id, {
+      const proposal = await pageLookup.lookupUrl(ctx.config.userAgent, body, season.start_date, null);
+      // F08b: nach dem await neu lesen — falls der User inzwischen manuell
+      // gewählt hat oder der Claim ersetzt wurde, NICHT überschreiben.
+      if (!recheckEntry(targetId, body)) {
+        throw new Error("Eintrag wurde während der Auflösung verändert — nicht überschrieben.");
+      }
+      db.setDraftEntryLinked(targetId, {
         wikiUrl: proposal.wikiUrl,
         wikiNorm: proposal.wikiNorm,
         qid: proposal.qid,
@@ -290,11 +341,15 @@ async function tryConsumePickMessage(ctx, msg) {
         userId: msg.author.id,
       });
     } catch (err) {
+      // F08a: Fehler UND Überschreibungs-Schutz lassen die Zeile nicht
+      // dauerhaft pending — sonst blockt `fertig` dauerhaft (F8). Als unlinked
+      // markieren, sofern sie immer noch pending mit DIESEM Claim ist.
+      if (recheckEntry(targetId, body)) {
+        db.setDraftEntryLinked(targetId, { linkStatus: "unlinked", candidatesJson: null });
+      }
       await msg.reply(
         `Mit dieser URL konnte nichts verlinkt werden (**${err.message}**). Nur en./de.wikipedia.org/wiki/…-Links zu Personen funktionieren.`
       );
-    } finally {
-      interruptUsers.delete(msg.author.id);
     }
     // R2-4: verbleibende pending-Einträge werden danach weiter aufgelöst — ein
     // einzelner Link-Paste darf den Rest NICHT als pending blockieren (`fertig`).
@@ -339,9 +394,7 @@ async function tryConsumePickMessage(ctx, msg) {
     }
     // Link entfernen → wieder pending zur Neu-Auflösung (gemeint war ein anderer
     // oder keiner: User kann neu wählen oder per Link-Paste auflösen).
-    interruptUsers.add(msg.author.id); // R2-4: laufenden Resolver stoppen
     db.replaceDraftEntryName(target.id, target.raw_name);
-    interruptUsers.delete(msg.author.id);
     await logEvent(ctx.client, ctx.config, {
       kind: "pick-wrong",
       summary: `${target.raw_name} als falsch markiert (Link entfernt)`,
@@ -374,10 +427,26 @@ async function tryConsumePickMessage(ctx, msg) {
       await msg.reply(`Kein Eintrag Nr. **${num}**.`);
       return true;
     }
+    // F08: `link N` darf einen laufenden Auto-Resolver NICHT ignorieren — er
+    // würde sonst die manuelle Wahl überschreiben. URL sofort als Claim
+    // speichern (F08a), Nachlauf + Interrupt stoppen den laufenden Lauf; der
+    // Rerun übernimmt den Claim (wiki_url) statt Auto-Propose.
+    const entryId = target.id;
+    claimEntryUrl(entryId, url);
+    if (busyUsers.has(msg.author.id)) {
+      rerunUsers.add(msg.author.id);
+      interruptUsers.add(msg.author.id);
+      await msg.reply("Moment, ich löse noch Namen auf — deinen Link setze ich gleich um.");
+      return true;
+    }
     try {
-      interruptUsers.add(msg.author.id); // R2-4: laufenden Resolver stoppen
-      const proposal = await lookupUrl(ctx.config.userAgent, url, season.start_date, null);
-      db.setDraftEntryLinked(target.id, {
+      const proposal = await pageLookup.lookupUrl(ctx.config.userAgent, url, season.start_date, null);
+      // F08b: nach dem await neu lesen — nur überschreiben, wenn der Eintrag
+      // noch pending MIT DIESEM Claim ist (manuelle Wahl / neuer Link → skip).
+      if (!recheckEntry(entryId, url)) {
+        throw new Error("Eintrag wurde während der Auflösung verändert — nicht überschrieben.");
+      }
+      db.setDraftEntryLinked(entryId, {
         wikiUrl: proposal.wikiUrl,
         wikiNorm: proposal.wikiNorm,
         qid: proposal.qid,
@@ -386,9 +455,10 @@ async function tryConsumePickMessage(ctx, msg) {
       });
       await msg.reply(`🔗 ${target.raw_name} → **${proposal.title || url}**`);
     } catch (err) {
+      if (recheckEntry(entryId, url)) {
+        db.setDraftEntryLinked(entryId, { linkStatus: "unlinked", candidatesJson: null });
+      }
       await msg.reply(`Mit dieser URL konnte nichts verlinkt werden (**${err.message}**).`);
-    } finally {
-      interruptUsers.delete(msg.author.id);
     }
     await respondPick(ctx, msg.channel, msg.author.id, season);
     return true;
@@ -446,6 +516,9 @@ async function tryConsumePickMessage(ctx, msg) {
     const res = db.finalizeDraft(player.id, season.id);
     if (res.locked) {
       await msg.reply("Deine Liste ist bereits eingefroren.");
+    } else if (res.reason === "empty") {
+      // F19a: leerer Draft ist KEIN „unklarer Name” — eigener Satz.
+      await msg.reply("Du hast noch keine Namen geschickt — tipp erst Personen ein, dann `fertig`.");
     } else if (res.blocked) {
       await msg.reply(
         "Ein Name ist noch unklar (⚠️). Wähle zuerst die passende Person aus, dann `fertig`."
@@ -535,8 +608,13 @@ async function tryConsumePickMessage(ctx, msg) {
 
   // Liste / einzelne Namen
   const parsed = parsePickList(body, { maxNames: ctx.config.maxPicksPerPlayer });
-  if (!parsed.names.length) {
-    return false; // keine Namen - nicht konsumieren
+  // F09: Mehrdeutige/unbekannte Befehlszeilen der Form `verb nummer rest`
+  // (z.B. Tippfehler „ändern 3 Neuer Name“ oder ein unbekanntes Kommando)
+  // NICHT als Namen importieren — solche Zeilen werden herausgefiltert.
+  // Bleibt gar nichts übrig, wird die DM nicht konsumiert.
+  const cleanNames = parsed.names.filter((n) => !UNKNOWN_CMD_RE.test(n.trim()));
+  if (!cleanNames.length) {
+    return false; // keine (anerkannten) Namen - nicht konsumieren
   }
   const playerRow = db
     .getDb()
@@ -544,20 +622,32 @@ async function tryConsumePickMessage(ctx, msg) {
     .get(String(msg.author.id)) || db.upsertPlayer({ displayName: msg.author.username, discordUserId: msg.author.id });
   const draft = db.getOrCreateDraft(playerRow.id, season.id);
   const cap = ctx.config.maxPicksPerPlayer;
-  const added = db.addDraftNames(draft.id, parsed.names, { maxNames: cap });
+  const added = db.addDraftNames(draft.id, cleanNames, { maxNames: cap });
 
   await logEvent(ctx.client, ctx.config, {
     kind: "pick-add",
     summary: `+${added.added} Namen (Saison ${season.year})`,
     userId: msg.author.id,
-    detail: parsed.names.join(" | ").slice(0, 1200),
+    detail: cleanNames.join(" | ").slice(0, 1200),
   });
-  if (parsed.duplicates.length) {
-    await msg.reply(`Doppelte ignoriert: ${parsed.duplicates.join(", ")}`);
+  // F10: Doppelte gegen das GESAMTE bestehende Draft (nicht nur die Paste).
+  // parsePickList meldet Duplikate in derselben Paste, addDraftNames jetzt
+  // auch gegen die bereits gespeicherten Zeilen — beide werden genannt.
+  const dups = [...parsed.duplicates, ...added.duplicates];
+  if (dups.length) {
+    await msg.reply(`Doppelt, nicht übernommen: ${[...new Set(dups)].join(", ")}`);
   }
+  // F10: Der Kappungs-Text war falsch — das Limit gilt für die GANZE Liste
+  // (alle Direktnachrichten), NICHT pro Meldung. Nur `entfernen` schafft
+  // Platz. parsed.recognized zählt auch die über die Obergrenze hinaus
+  // angekommenen Tokens (parsePickList zählt sie seit F10 mit).
+  const recognized = parsed.recognized ?? cleanNames.length;
   if (parsed.truncated || added.truncated) {
+    const recount = added.truncated
+      ? db.listDraftEntries(draft.id).length
+      : Math.min(recognized, cap);
     await msg.reply(
-      `⚠️ Maximal **${cap}** Karten in deiner Liste — ich habe bei ${cap} abgeschnitten (${parsed.names.length} erkannt). Teil sie in mehrere Meldungen auf oder entferne zuerst Karten.`
+      `⚠️ Maximal **${cap}** Karten in deiner Liste — ${recognized} Namen erkannt, ${recount} aufgenommen. Platz schafft nur \`entfernen <Nummer>\`, weil das Limit für die ganze Liste gilt.`
     );
   }
   await respondPick(ctx, msg.channel, msg.author.id, season);
@@ -600,11 +690,16 @@ async function resolvePendingSynchronous(ctx, channel, userId, season, draftId, 
       }
       let i = 0;
       for (const e of pendings) {
-        // R2-4: User hat währenddessen manuell eingegriffen (URL/link/falsch/
-        // Menü) — laufenden Auto-Lauf stoppen statt dessen Wahl zu überschreiben.
-        if (interruptUsers.has(userId)) {
-          break;
-        }
+        // R2-4: User hat währenddessen manuell eingegriffen (Menü/„falsch") —
+        // laufenden Auto-Lauf stoppen statt dessen Wahl zu überschreiben.
+        if (interruptUsers.has(userId)) break;
+        // F08b: Zeile VOR jedem Verarbeiten frisch lesen — seit dem Snapshot
+        // kann eine manuelle Wahl / URL-Linkung sie aus pending genommen haben.
+        const fresh = db
+          .getDb()
+          .prepare("SELECT * FROM pick_draft_entries WHERE id = ?")
+          .get(e.id);
+        if (!fresh || fresh.link_status !== "pending") continue;
         i++;
         if (progressMsg?.edit) {
           await progressMsg
@@ -612,23 +707,25 @@ async function resolvePendingSynchronous(ctx, channel, userId, season, draftId, 
             .catch(() => {});
         }
         try {
-          const proposal = await proposeWikiForName(
-            ctx.config.userAgent,
-            e.raw_name,
-            season.start_date,
-            null
-          );
+          let proposal;
+          if (fresh.wiki_url) {
+            // F08a/b: eine bereits gespeicherte URL-Choice (nackte URL-Paste
+            // oder `link N`) VOR dem Auto-Propose auflösen und anwenden — der
+            // Auto-Lauf darf sie nicht mit proposWikiForName übertünchen.
+            proposal = await pageLookup.lookupUrl(ctx.config.userAgent, fresh.wiki_url, season.start_date, null);
+          } else {
+            proposal = await pageLookup.proposeWikiForName(
+              ctx.config.userAgent,
+              e.raw_name,
+              season.start_date,
+              null
+            );
+          }
+          // F08b: nach dem await neu lesen — falls der User inzwischen manuell
+          // gewählt/verlinkt hat (Status ≠ pending), NICHT überschreiben.
+          if (!recheckEntry(e.id, fresh.wiki_url || null)) continue;
           const { linkStatus } = classifyProposal(proposal);
-          if (linkStatus === "ambiguous") {
-            db.setDraftEntryLinked(e.id, {
-              wikiUrl: proposal.wikiUrl,
-              wikiNorm: proposal.wikiNorm,
-              qid: proposal.qid,
-              proposedAge: proposal.proposedAge,
-              candidatesJson: JSON.stringify(proposal.candidates || []),
-              linkStatus,
-            });
-          } else if (linkStatus === "linked") {
+          if (linkStatus === "ambiguous" || linkStatus === "linked") {
             db.setDraftEntryLinked(e.id, {
               wikiUrl: proposal.wikiUrl,
               wikiNorm: proposal.wikiNorm,
@@ -647,7 +744,9 @@ async function resolvePendingSynchronous(ctx, channel, userId, season, draftId, 
           // Ein Wiki-Fehler ist KEIN "kein Treffer": wird NICHT pending gelassen,
           // sondern als unlinked markiert — sonst blockt `fertig` dauerhaft (F8).
           console.warn("[pick] propose failed", e.raw_name, err.message);
-          db.setDraftEntryLinked(e.id, { linkStatus: "unlinked", candidatesJson: null });
+          if (recheckEntry(e.id, fresh.wiki_url || null)) {
+            db.setDraftEntryLinked(e.id, { linkStatus: "unlinked", candidatesJson: null });
+          }
           logError(ctx.client, ctx.config, err, {
             where: "pick propose " + e.raw_name,
             userId,
@@ -672,6 +771,10 @@ async function resolvePendingSynchronous(ctx, channel, userId, season, draftId, 
     }
   } finally {
     busyUsers.delete(userId);
+    // F08c: Interrupt-Flag NUR löschen, wenn der Lauf WIRKLICH beendet ist —
+    // nicht vorzeitig nach einem einzelnen `link`/Menu, damit keins davon durch
+    // einen fortsetzenden Resolver überschrieben werden kann.
+    interruptUsers.delete(userId);
   }
 }
 
@@ -687,6 +790,7 @@ async function warnAnnouncedPreStartDeaths(ctx) {
   const rows = db.getAnnouncedPreStartDeathsUnwarned(season.id);
   if (!rows.length) return 0;
   let sent = 0;
+  let failed = 0;
   for (const r of rows) {
     try {
       // R2-7: Stempel NUR nach erfolgreicher Zustellung — bei DM-Fehler bleibt
@@ -705,20 +809,28 @@ async function warnAnnouncedPreStartDeaths(ctx) {
           delivered = true;
           sent++;
         } catch (e) {
+          failed++;
           console.warn("[pick] death-warn DM failed", r.celeb_name, e.message);
+          logError(ctx.client, ctx.config, e, {
+            where: "death-warn DM " + r.celeb_name,
+            userId: String(r.user_discord_id),
+          }).catch(() => {});
         }
       }
       if (delivered) db.markAnnouncedDeathWarned(season.id, r.player_id, r.celeb_id);
     } catch (e) {
+      failed++;
       console.warn("[pick] death-warn row failed", r.celeb_name, e.message);
+      logError(ctx.client, ctx.config, e, {
+        where: "death-warn row " + r.celeb_name,
+      }).catch(() => {});
     }
   }
   if (rows.length) {
-    const { logEvent } = require("./log");
     await logEvent(ctx.client, ctx.config, {
       kind: "pick-death-warn",
-      summary: `${rows.length} Pre-Start-Tode an Tipp-Einreicher gemeldet (Saison ${season.year})`,
-    });
+      summary: `${sent} Pre-Start-Todes-DM(s) gesendet (${failed} fehlgeschlagen, ${rows.length} Fälle) — Saison ${season.year}`,
+    }).catch(() => {});
   }
   return sent;
 }
@@ -741,7 +853,13 @@ module.exports = {
   classifyProposal,
   warnAnnouncedPreStartDeaths,
   targetForUrlPaste,
+  resolvePendingSynchronous,
   WIKI_URL_RE,
   LINK_URL_RE,
   WRONG_RE,
+  CHANGE_RE,
+  // Für Tests: anhaltender Auto-Auflösungs-Zustand eines Users.
+  busyUsers,
+  interruptUsers,
+  rerunUsers,
 };

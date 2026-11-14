@@ -28,6 +28,27 @@ function formatDeathDate(entry) {
 }
 
 /**
+ * "YYYY-MM-DD" from an entry's scraped death date. Both EN/DE month scrapers
+ * use a 0-based month index: {day: 20, month: 11, year: 2026} = 20. Dez. 2026.
+ * Returns null when any part is missing or out of range — callers then fall
+ * back to the detection day.
+ */
+function entryDeathDateIso(entry) {
+  if (!entry || entry.day == null || entry.month == null || entry.year == null) return null;
+  const y = Number(entry.year);
+  const m = Number(entry.month) + 1;
+  const d = Number(entry.day);
+  if (
+    !Number.isInteger(y) || y <= 0 ||
+    !Number.isInteger(m) || m < 1 || m > 12 ||
+    !Number.isInteger(d) || d < 1 || d > 31
+  ) {
+    return null;
+  }
+  return `${String(y).padStart(4, "0")}-${String(m).padStart(2, "0")}-${String(d).padStart(2, "0")}`;
+}
+
+/**
  * Apply death + optional public announce.
  * Uses age_at_pick for scoring (100 - age), not wiki age.
  */
@@ -37,10 +58,17 @@ async function processDeathpoolHit(
   { celeb, entry, wikiAge },
   { announce = true, confirmed = false, source = "wiki" } = {}
 ) {
+  // F14a: diedAt comes from the scraped death date (entry.day/month/year,
+  // month 0-based), NOT from the detection day. A 20-Dec death that first
+  // shows up on the death lists on Jan 2 must keep died_at "2026-12-20" —
+  // otherwise the pre-start warning predicate (died_at < start_date) misses it
+  // and applyDeath may later award points for a death that happened before the
+  // season start. Without a scraped date we fall back to the detection day.
+  const diedAt = entryDeathDateIso(entry) || new Date().toISOString().slice(0, 10);
   const result = db.applyDeath(celeb.id, {
     confirmed,
     source,
-    diedAt: new Date().toISOString().slice(0, 10),
+    diedAt,
     wikiUrl: entry?.url || null,
   });
 
@@ -480,6 +508,7 @@ async function announceSimulatedDeath(
 
 module.exports = {
   processDeathpoolHit,
+  entryDeathDateIso,
   announceRetraction,
   announceAllDeath,
   announceDailySummary,

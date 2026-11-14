@@ -4,6 +4,7 @@ const { resolveEnglishArticle } = require("../wiki/page-lookup");
 const { findPoolMatches, entryMatchesCeleb, findPoolMatchesForAnnounced } = require("../wiki/match");
 const {
   findPoolDeathsByCategory,
+  findAnnouncedDeathsByCategory,
   celebStillMarkedDead,
 } = require("../wiki/category-death");
 const db = require("../db");
@@ -493,14 +494,46 @@ async function runWikiPollInner(client, config, { mode = "live" } = {}) {
   }
 
   // R2-8: 2027-only-Celebs auf Tode prüfen — die 2026er-Pool-Logik sieht sie
-  // nicht (exclude_from_auto=1), also sucht ein Extra-Lauf in den OHNE-IDs
-  // gescrapten Todeslisten. applyDeath findet für 2027-only keinen 2026er-Pick →
-  // keine falschen Punkte, nur is_alive=0, damit warnAnnouncedPreStartDeaths
-  // den Einreicher warnen kann.
+  // nicht (exclude_from_auto=1). Zwei Wege: (a) Listen-Matching wie bisher über
+  // findPoolMatchesForAnnounced, (b) F14c der eigene Kategorie-Lauf für die
+  // ANNOUNCED-Saison (soll heißen: mit deren start_date-Ebene). Beide setzen
+  // nur is_alive=0 (announce:false), damit warnAnnouncedPreStartDeaths den
+  // Einreicher warnen kann — applyDeath findet für 2027-only keinen aktiven
+  // 2026er-Pick → keine falschen Punkte.
   try {
-    const announcedHits = findPoolMatchesForAnnounced(poolEntries);
-    for (const m of announcedHits) {
+    const announcedCategoryHits = await findAnnouncedDeathsByCategory(
+      config.userAgent,
+      { delayMs: 300 }
+    );
+    const keepAlive = new Set();
+    for (const m of announcedCategoryHits) keepAlive.add(m.celeb.id);
+    const announcedCategoryPending = announcedCategoryHits.filter((m) => m.celeb.is_alive === 1);
+    for (const m of announcedCategoryHits) {
       if (m.celeb.is_alive !== 1) continue;
+      await processDeathpoolHit(
+        client,
+        config,
+        { celeb: m.celeb, entry: m.entry, wikiAge: m.age },
+        {
+          announce: false,
+          confirmed: false,
+          source: m.announced ? "announced-prestart" : "wiki",
+        }
+      );
+    }
+    if (announcedCategoryPending.length) {
+      console.log(
+        new Date().toISOString(),
+        `[poll] announced pre-start deaths (category): ${announcedCategoryPending.length}`
+      );
+    }
+    // (a) Listen-Matching — aber Celebs, die der Kategorie-Lauf schon tot
+    // markiert hat, nicht erneut anfassen (is_alive ist dann 0).
+    const announcedMatches = findPoolMatchesForAnnounced(poolEntries).filter(
+      (m) => !keepAlive.has(m.celeb.id)
+    );
+    const announcedHits = announcedMatches.filter((m) => m.celeb.is_alive === 1);
+    for (const m of announcedHits) {
       await processDeathpoolHit(
         client,
         config,
@@ -511,19 +544,24 @@ async function runWikiPollInner(client, config, { mode = "live" } = {}) {
           source: "announced-prestart",
         }
       );
-      const announcedSeason = db.getAnnouncedSeason?.() || null;
-      const preYear = announcedSeason?.year ? `${announcedSeason.year}` : "Nächstes";
-      await logEvent(client, config, {
-        kind: "announced-death",
-        summary: `${preYear}-Pick-Tod erkannt (Pre-Start): ${m.celeb.name}`,
-        detail: `via ${m.entry?.text || "Liste"}`,
-      }).catch(() => {});
     }
     if (announcedHits.length) {
       console.log(
         new Date().toISOString(),
         `[poll] announced pre-start deaths: ${announcedHits.length}`
       );
+    }
+    const announcedDeaths = announcedHits.length + announcedCategoryPending.length;
+    if (announcedDeaths) {
+      const announcedSeason = db.getAnnouncedSeason?.() || null;
+      const preYear = announcedSeason?.year ? `${announcedSeason.year}` : "Nächstes";
+      for (const m of [...announcedCategoryPending, ...announcedHits]) {
+        await logEvent(client, config, {
+          kind: "announced-death",
+          summary: `${preYear}-Pick-Tod erkannt (Pre-Start): ${m.celeb.name}`,
+          detail: `via ${m.entry?.text || "Liste"}`,
+        }).catch(() => {});
+      }
     }
   } catch (err) {
     console.error("[poll] announced pre-start death scan failed", err.message);

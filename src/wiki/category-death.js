@@ -204,6 +204,10 @@ async function isDeathValidForSeason(userAgent, url, category, seasonStartDate) 
 /**
  * Check all auto-match celebs via their confirmed wiki URL(s).
  * Skips (and excludes from auto) deaths that pre-date the season start.
+ *
+ * For announced/2027-only celebs, call findAnnouncedDeathsByCategory instead:
+ * those live in the announced season picks even though they are NOT in the
+ * auto pool (exclude_from_auto=1).
  */
 async function findPoolDeathsByCategory(userAgent, { delayMs = 350, seasonStartDate = null } = {}) {
   const db = require("../db");
@@ -282,6 +286,80 @@ async function findPoolDeathsByCategory(userAgent, { delayMs = 350, seasonStartD
 }
 
 /**
+ * Check all ANNOUNCED-season celebs via their confirmed wiki URL(s) — the
+ * 2027-only picks (exclude_from_auto=1) that the auto pool never sees.
+ *
+ * F14c: a registered pick whose celeb dies before the season start must be
+ * caught here too. The death is applied with announce:false (no deathpool card)
+ * so warnAnnouncedPreStartDeaths() can DM the picker.
+ *
+ * Unlike the auto sweep, the validity gate does NOT suppress a hit: for an
+ * announced (live=0) season whose start is in the future, every current death
+ * happened before that start — that's exactly what should trigger a warning.
+ * died_at comes from the scraped date later; getAnnouncedPreStartDeathsUnwarned
+ * decides via died_at/death_detected_at whether to warn.
+ */
+async function findAnnouncedDeathsByCategory(userAgent, { delayMs = 350, seasonStartDate = null } = {}) {
+  const db = require("../db");
+  const announcedSeason = db.getAnnouncedSeason?.() || null;
+  const start =
+    seasonStartDate || announcedSeason?.start_date || db.getActiveSeason().start_date;
+  const celebs = db.getAliveCelebsForAnnounced();
+  const hits = [];
+
+  for (const celeb of celebs) {
+    const urls = [celeb.wiki_url, celeb.wiki_url_de].filter(Boolean);
+    if (!urls.length) continue;
+
+    let found = null;
+    for (const url of urls) {
+      const result = await checkUrlDead(userAgent, url);
+      if (result.dead) {
+        found = { url, category: result.category, lang: result.lang, title: result.title };
+        break;
+      }
+      if (delayMs) await sleep(delayMs);
+    }
+    if (!found) {
+      if (delayMs) await sleep(delayMs);
+      continue;
+    }
+
+    console.log(
+      new Date().toISOString(),
+      "[category-death] announced",
+      celeb.name,
+      found.category || "",
+      found.url
+    );
+    hits.push({
+      celeb,
+      entry: {
+        id: `cat:${celeb.id}:${found.url}`,
+        wikiPath: (() => {
+          try {
+            return new URL(found.url).pathname;
+          } catch {
+            return null;
+          }
+        })(),
+        text: `${celeb.name} (${found.category || "death category"})`,
+        url: found.url,
+        lang: /de\.wikipedia/i.test(found.url) ? "de" : "en",
+      },
+      age: celeb.age_at_pick ?? null,
+      via: "category",
+      // F14c: announced-level hits are pre-start candidates — applied with
+      // announce:false by the caller, never merged into the active pool hits.
+      announced: true,
+    });
+    if (delayMs) await sleep(delayMs);
+  }
+
+  return hits;
+}
+
+/**
  * True if celeb still has a death category (for retract safety).
  * Returns { dead, error? }: a transient wiki/API failure yields dead:false with
  * an error so callers can defer retraction instead of pulling points on a
@@ -311,6 +389,7 @@ module.exports = {
   DEATH_REGEX,
   checkUrlDead,
   findPoolDeathsByCategory,
+  findAnnouncedDeathsByCategory,
   celebStillMarkedDead,
   pageHasDeathCategory,
   parseDeathYear,

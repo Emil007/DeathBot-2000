@@ -12,18 +12,27 @@ function parseDate(s) {
   return s;
 }
 
-function utcToday() {
-  const d = new Date();
-  return `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, "0")}-${String(
-    d.getUTCDate()
-  ).padStart(2, "0")}`;
+/**
+ * Datum in Europe/Vienna (YYYY-MM-DD) — F01: Wechsel-Entscheidungen hängen am
+ * Wiener Kalendertag (Cron feuert 00:00 Europe/Vienna, also 23:00 UTC am
+ * 31.12.). Ein UTC-Datum läge am 31.12. noch einen Tag hinter dem Saisonstart.
+ * `date` ist injizierbar für Tests.
+ */
+function todayInVienna(date = new Date()) {
+  if (date == null) date = new Date();
+  return new Intl.DateTimeFormat("en-CA", {
+    timeZone: "Europe/Vienna",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+  }).format(date);
 }
 
 /** Wechsel erst ab Saisonstart erlaubt (force hebt nur das Datum auf). */
-function assertActivateDateAllowed(startDate, force) {
+function assertActivateDateAllowed(startDate, force, now = new Date()) {
   if (force) return { ok: true };
   if (!startDate) return { ok: false, reason: "Kein Startdatum gesetzt." };
-  if (utcToday() < startDate) {
+  if (todayInVienna(now) < startDate) {
     return { ok: false, reason: `Wechsel erst ab dem Saisonstart (**${startDate}**) möglich. \`force:true\` nur für Testläufe.` };
   }
   return { ok: true };
@@ -112,7 +121,7 @@ const cmd = {
         [
           "🆕 **Saison-Wechsel und Eröffnung**",
           "",
-          "• **Eröffnung:** `/announce-season announce_channel:#Kanal` — legt die kommende Saison an und postet das Teilnahme-Embed (2026 läuft weiter).",
+          "• **Eröffnung:** `/announce-season announce_channel:#Kanal` — legt die kommende Saison an und postet das Teilnahme-Embed (**die laufende Runde läuft weiter**).",
           "• **Wechsel am Saisonstart:** `/new-year activate:true` — archiviert die laufende Saison (Daten + Punkte-Snapshot bleiben), schaltet die announced-Saison live.",
           "• Erneutes Embed: `/announce-season repost:true`.",
           "",
@@ -160,7 +169,7 @@ const cmd = {
         return;
       }
 
-      // Stiller Reconcile auf der neuen (2027-)Saison; kein Seed (Feed läuft weiter).
+      // Stiller Reconcile auf der neuen Saison; kein Seed (Feed läuft weiter).
       let reconcileHits = [];
       try {
         const r = await runWikiPoll(ctx.client, ctx.config, { mode: "reconcile" });
@@ -253,4 +262,4 @@ const cmd = {
 module.exports = cmd;
 module.exports.assertWipeAllowed = assertWipeAllowed;
 module.exports.assertActivateDateAllowed = assertActivateDateAllowed;
-module.exports.utcToday = utcToday;
+module.exports.todayInVienna = todayInVienna;

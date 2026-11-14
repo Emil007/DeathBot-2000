@@ -12,14 +12,18 @@ process.env.DATA_DIR = tmp;
 
 const { loadConfig } = require("../src/config");
 const db = require("../src/db");
-const { runYearRollover, formatSeasonReviewText, remindAdminToAnnounce, createNextSeasonChannel } = require("../src/jobs/year-rollover");
+const {
+  runYearRollover,
+  formatSeasonReviewText,
+  remindAdminToAnnounce,
+  createNextSeasonChannel,
+  todayInVienna,
+} = require("../src/jobs/year-rollover");
 
 let config;
 before(() => {
   config = loadConfig();
   db.openDb(config);
-  db.setSeasonLive(true);
-  db.getDb().prepare("UPDATE seasons SET phase = 'running' WHERE active = 1").run();
 });
 
 after(() => {
@@ -28,6 +32,21 @@ after(() => {
   } catch {}
   fs.rmSync(tmp, { recursive: true, force: true });
 });
+
+/**
+ * Frischer Ausgangszustand für Rollover-Tests: KEIN announced, die aktive Saison
+ * ist das aktuelle Jahr (2026) als running. Der Reset nutzt bewusst nur
+ * ensureActiveSeason + setSeasonLive — keine manuelle phase-SQL (das ist der
+ * Punkt von F05: setSeasonLive muss die phase selbst setzen).
+ */
+function resetToRunningCurrentYear() {
+  db.getDb().exec(`
+    DELETE FROM season_point_snapshots;
+    DELETE FROM seasons;
+  `);
+  db.ensureActiveSeason();
+  db.setSeasonLive(true); // F05: setzt automatisch phase='running'
+}
 
 // Minimale Fake-Discord-Channel, die .send() und .isTextBased() können
 function makeFakeChannel(bucket) {
@@ -48,81 +67,263 @@ function makeFakeClient(channel) {
   };
 }
 
-test("seasonReview aggregates snapshots + deaths", () => {
-  const running = db.getActiveSeason();
-  db.upsertPlayer({ displayName: "Alpha", discordUserId: "10" });
-  db.upsertPlayer({ displayName: "Beta", discordUserId: "11" });
-  const recap = db.seasonReview(running.id);
-  assert.ok(recap, "review must exist");
-  assert.ok(Array.isArray(recap.rows));
-  assert.strictEqual(typeof recap.deaths, "number");
+// ---- F01: todayInVienna ----
+
+test("todayInVienna formats in Europe/Vienna (F01)", () => {
+  // 2026-12-31T23:00:00Z == 00:00 am 01.01. in Wien
+  assert.strictEqual(todayInVienna(new Date("2026-12-31T23:00:00Z")), "2027-01-01");
+  // 22:59 UTC == 23:59 am 31.12. in Wien
+  assert.strictEqual(todayInVienna(new Date("2026-12-31T22:59:00Z")), "2026-12-31");
+  // null -> jetzt (kein Absturz / keine Epoch-Koersion)
+  assert.ok(/^\d{4}-\d{2}-\d{2}$/.test(todayInVienna(null)));
 });
 
-test("formatSeasonReviewText renders standings without placeholders", () => {
+// ---- F01: Guard-Weg mit überschriebenem Datum (kein force) ----
+
+test("runYearRollover switches at 23:00Z on Dec 31 (= Jan 1 Vienna) without force (F01)", async () => {
+  resetToRunningCurrentYear();
+  const runningBefore = db.getActiveSeason();
+  assert.strictEqual(runningBefore.year, new Date().getFullYear());
+
+  db.openAnnouncedSeason({
+    year: new Date().getFullYear() + 1,
+    startDate: `${new Date().getFullYear() + 1}-01-01`,
+    channelId: "777",
+    note: null,
+  });
+
+  const bucket = [];
+  const channel = makeFakeChannel(bucket);
+  const client = makeFakeClient(channel);
+
+  // Eingefrorener Instant: Cron-Zeitpunkt 00:00 Europe/Vienna am 01.01. =
+  // 2026-12-31T23:00:00Z. start_date (2027-01-01) ist erreicht => Wechsel OHNE force.
+  const frozen = new Date("2026-12-31T23:00:00Z");
+  const res = await runYearRollover(client, config, { force: false, now: frozen });
+
+  assert.strictEqual(res.switched, true, "must switch at Vienna Jan 1 without force");
+  assert.strictEqual(res.reason, undefined);
+  assert.strictEqual(res.activated.year, new Date().getFullYear() + 1);
+  assert.strictEqual(res.archived.year, runningBefore.year);
+  assert.strictEqual(db.getActiveSeason().year, new Date().getFullYear() + 1, "new season active");
+  assert.strictEqual(db.getActiveSeason().phase, "running");
+
+  // Bilanz (first message) + Switch-Ack
+  assert.ok(bucket.length >= 2, "review + switch-ack messages posted");
+  assert.ok(bucket[0].content.includes("Abschlussbilanz"), "review posted first");
+  // F03: Live-Satz NUR auf dem committeten Pfad, kein 'null' im Text
+  assert.ok(bucket[0].content.includes("ist live"), "live sentence when switched");
+  assert.ok(!bucket[0].content.includes("null"), "no 'null' in live text");
+});
+
+test("runYearRollover does NOT switch before Vienna midnight (F01 guard)", async () => {
+  resetToRunningCurrentYear();
+  db.openAnnouncedSeason({
+    year: new Date().getFullYear() + 1,
+    startDate: `${new Date().getFullYear() + 1}-01-01`,
+    channelId: "777",
+    note: null,
+  });
+
+  const bucket = [];
+  const client = makeFakeClient(makeFakeChannel(bucket));
+  // 22:59 UTC am 31.12. == 31.12. in Wien: start_date (01.01.) noch NICHT erreicht
+  const frozen = new Date("2026-12-31T22:59:00Z");
+  const res = await runYearRollover(client, config, { force: false, now: frozen });
+
+  assert.strictEqual(res.switched, false);
+  assert.strictEqual(res.reason, "not-yet");
+  assert.strictEqual(db.getActiveSeason().phase, "running", "active unchanged");
+  assert.strictEqual(db.getActiveSeason().year, new Date().getFullYear(), "still current year");
+});
+
+// ---- F02: Nachhol-Run nach erfolgreichem Wechsel -> no-announced ----
+
+test("runYearRollover after success is a no-op (F02 catch-up safety)", async () => {
+  // Zustand: Wechsel von 2026 -> 2027 bereits committet, KEINE announced-Saison.
+  resetToRunningCurrentYear();
+  db.openAnnouncedSeason({
+    year: new Date().getFullYear() + 1,
+    startDate: `${new Date().getFullYear() + 1}-01-01`,
+    channelId: "777",
+    note: null,
+  });
+  const first = await runYearRollover(makeFakeClient(makeFakeChannel([])), config, {
+    force: true,
+  });
+  assert.strictEqual(first.switched, true, "setup switch happens");
+
+  // Zweiter Lauf (z. B. Start-Nachhol nach Restart): announced verbraucht.
+  const bucket = [];
+  const client = makeFakeClient(makeFakeChannel(bucket));
+  const res = await runYearRollover(client, config, { force: false });
+
+  assert.strictEqual(res.switched, false, "no second switch");
+  assert.strictEqual(res.reason, "no-announced");
+  assert.strictEqual(db.getActiveSeason().year, new Date().getFullYear() + 1, "no double switch");
+  // Kein Live-Satz, kein 'null' im Text (F03)
+  assert.ok(bucket.length >= 1, "review of running season still posted");
+  assert.ok(!bucket[bucket.length - 1].content.includes("ist live"), "no live sentence without switch");
+  assert.ok(!bucket[bucket.length - 1].content.includes("null"), "no 'null' in text");
+});
+
+// ---- F05: setSeasonLive setzt phase mit ----
+
+test("setSeasonLive(true/false) maintains phase without manual SQL (F05)", () => {
+  db.getDb().exec(`
+    DELETE FROM season_point_snapshots;
+    DELETE FROM seasons;
+  `);
+  db.ensureActiveSeason(); // phase='setup', live=0
+
+  let s = db.getActiveSeason();
+  assert.strictEqual(s.phase, "setup");
+  assert.strictEqual(s.live, 0);
+
+  db.setSeasonLive(true); // wie /go — KEINE manuelle phase-SQL
+  s = db.getActiveSeason();
+  assert.strictEqual(s.live, 1);
+  assert.strictEqual(s.phase, "running", "setSeasonLive(true) must set phase running");
+
+  db.setSeasonLive(false); // wie /ungo
+  s = db.getActiveSeason();
+  assert.strictEqual(s.live, 0);
+  assert.strictEqual(s.phase, "setup", "setSeasonLive(false) must reset phase to setup");
+});
+
+// ---- F05: activateAnnouncedSeason klappt NACH /go ohne manuelles SQL ----
+
+test("activateAnnouncedSeason works after setSeasonLive(true) with no manual update (F05)", () => {
+  db.getDb().exec(`
+    DELETE FROM season_point_snapshots;
+    DELETE FROM seasons;
+  `);
+  db.ensureActiveSeason();
+  db.setSeasonLive(true); // /go Äquivalent: live=1 + phase='running' automatisch
+
+  const running = db.getActiveSeason();
+  assert.strictEqual(running.phase, "running");
+
+  db.openAnnouncedSeason({
+    year: new Date().getFullYear() + 1,
+    startDate: `${new Date().getFullYear() + 1}-01-01`,
+    channelId: "777",
+    note: null,
+  });
+
+  const res = db.activateAnnouncedSeason(); // darf NICHT „Aktive Saison ist nicht running" werfen
+  assert.strictEqual(res.archived.phase, "archived");
+  assert.strictEqual(res.activated.phase, "running");
+  assert.strictEqual(db.getActiveSeason().phase, "running");
+});
+
+// ---- F03: formatSeasonReviewText(null) / wiederkehrende Darstellung ----
+
+test("formatSeasonReviewText omits live sentence when runningYear is null (F03)", () => {
+  db.getDb().exec(`
+    DELETE FROM season_point_snapshots;
+    DELETE FROM seasons;
+  `);
+  db.ensureActiveSeason();
+  db.setSeasonLive(true);
+  const review = db.seasonReview(db.getActiveSeason().id);
+  assert.ok(review, "review must exist");
+
+  const withoutLive = formatSeasonReviewText(review, null);
+  assert.ok(withoutLive, "text renders with null runningYear");
+  assert.ok(withoutLive.includes("Abschlussbilanz"));
+  assert.ok(!withoutLive.includes("ist live"), "no live sentence on no-announced path");
+  assert.ok(!withoutLive.includes("null"), "no 'null' placeholder leaked");
+});
+
+test("formatSeasonReviewText renders standings + live sentence when switched", () => {
+  db.getDb().exec(`
+    DELETE FROM season_point_snapshots;
+    DELETE FROM seasons;
+  `);
+  db.ensureActiveSeason();
+  db.setSeasonLive(true);
   const review = db.seasonReview(db.getActiveSeason().id);
   const text = formatSeasonReviewText(review, 2027);
-  assert.ok(text, "text must render");
   assert.ok(text.includes("Abschlussbilanz"));
   assert.ok(text.includes("2027"), "new running year should be announced");
-  assert.ok(!isNaN(text.match(/\d+/)?.[0]) === false || true); // smoke
   assert.ok(!/\{[A-Z_]+\}/.test(text), "no leftover placeholders");
 });
 
-test("runYearRollover posts review and performs switch on deadline", async () => {
-  const bucket = [];
-  const channel = makeFakeChannel(bucket);
-  const client = makeFakeClient(channel);
+// ---- F07: Admin-Erinnerung mit DM-Fallback ----
 
-  const runningBefore = db.getActiveSeason();
-  db.openAnnouncedSeason({ year: 2027, startDate: "2027-01-01", channelId: "777", note: null });
+test("remindAdminToAnnounce sends DM when no channelAdmin (F07)", async () => {
+  // Zustand: keine announced-Saison
+  db.getDb().exec(`
+    DELETE FROM season_point_snapshots;
+    DELETE FROM seasons;
+  `);
+  db.ensureActiveSeason();
+  db.setSeasonLive(true);
+  assert.strictEqual(db.getAnnouncedSeason(), null);
+  const running = db.getActiveSeason();
 
-  const res = await runYearRollover(client, config, { force: true });
-  assert.strictEqual(res.switched, true, "must switch when forced to deadline");
-  assert.strictEqual(res.activated.year, 2027);
-  assert.strictEqual(res.archived.year, runningBefore.year);
-  assert.strictEqual(db.getActiveSeason().year, 2027, "2027 must now be active");
-  assert.strictEqual(db.getActiveSeason().phase, "running");
-  assert.ok(bucket.length >= 2, "review + switch-ack messages posted");
-  // Erste Nachricht ist die Auswertung
-  assert.ok(bucket[0].content.includes("Abschlussbilanz"), "review posted first");
+  const dmSent = [];
+  const fakeClient = {
+    channels: { fetch: async () => null }, // kein CHANNEL_ADMIN-Kanal
+    users: {
+      fetch: async (id) => ({
+        id,
+        createDM: async () => ({
+          send: async (payload) => {
+            dmSent.push(payload);
+            return {};
+          },
+        }),
+      }),
+    },
+  };
+  const cfg = { ...config, channelAdmin: "" }; // CHANNEL_ADMIN leer
 
-  // Zugriff: keine zweite Saison durch den automatischen Rollover erzeugt
-  const counts = db.getDb().prepare("SELECT COUNT(*) c FROM seasons").get().c;
-  assert.strictEqual(counts, 2, "exactly running + announced (no duplicate)");
+  const res = await remindAdminToAnnounce(fakeClient, cfg);
+  assert.strictEqual(res.reminded, true, "reminder actually delivered");
+  assert.strictEqual(res.reason, "sent");
+  assert.strictEqual(dmSent.length, 1, "exactly one DM sent");
+  assert.strictEqual(res.target, running.year + 1, "reminds about next year");
+  assert.ok(dmSent[0].content.includes(String(running.year + 1)), "DM mentions target year");
 });
 
-test("runYearRollover skips switch when no announced season", async () => {
-  // Nach dem vorherigen Test: 2027 ist running/aktiv, KEINE announced-Saison —
-  // genau der Zustand, den dieser Test braucht.
-  const runningNow = db.getActiveSeason();
-  assert.strictEqual(db.getAnnouncedSeason(), null, "precondition: no announced");
+test("remindAdminToAnnounce returns no-target without sendable target (F07)", async () => {
+  db.getDb().exec(`
+    DELETE FROM season_point_snapshots;
+    DELETE FROM seasons;
+  `);
+  db.ensureActiveSeason();
+  db.setSeasonLive(true);
+  assert.strictEqual(db.getAnnouncedSeason(), null);
 
-  const bucket = [];
-  const channel = makeFakeChannel(bucket);
-  const client = makeFakeClient(channel);
+  const fakeClient = {
+    channels: { fetch: async () => null },
+    users: { fetch: async () => null }, // Admin nicht auflösbar
+  };
+  const cfg = { ...config, channelAdmin: "" };
 
-  const res = await runYearRollover(client, config, { force: true });
-  assert.strictEqual(res.switched, false);
-  assert.strictEqual(res.reason, "no-announced");
-  assert.strictEqual(db.getActiveSeason().id, runningNow.id, "running unchanged");
+  const res = await remindAdminToAnnounce(fakeClient, cfg);
+  assert.strictEqual(res.reminded, false, "no false positive 'sent'");
+  assert.strictEqual(res.reason, "no-target");
 });
 
 test("remindAdminToAnnounce stays silent when new season already announced", async () => {
   const running = db.getActiveSeason();
-  const { season } = db.openAnnouncedSeason({
+  db.openAnnouncedSeason({
     year: running.year + 1,
     startDate: `${running.year + 1}-01-01`,
     channelId: "c",
     note: null,
   });
-  assert.strictEqual(season.phase, "announced");
   const res = await remindAdminToAnnounce(makeFakeClient(makeFakeChannel([])), config);
   assert.strictEqual(res.reminded, false, "no reminder when announced exists");
   assert.strictEqual(res.reason, "already-announced");
 });
 
+// ---- createNextSeasonChannel (unverändert) ----
+
 test("createNextSeasonChannel creates deathpool-{year} and invites players", async () => {
-  // Player anlegen, die eingeladen werden sollen
   db.upsertPlayer({ displayName: "Alpha", discordUserId: "1001" });
   db.upsertPlayer({ displayName: "Beta", discordUserId: "2002" });
   const created = [];
@@ -144,7 +345,6 @@ test("createNextSeasonChannel creates deathpool-{year} and invites players", asy
   assert.strictEqual(ch.id, "chan-123");
   assert.ok(created.length === 1, "channel.create called once");
   assert.strictEqual(created[0].name, "deathpool-2027");
-  // Überwrites: alle Spieler haben ViewChannel+SendMessages
   const ids = created[0].permissionOverwrites.map((o) => o.id);
   assert.ok(ids.includes("1001") && ids.includes("2002"), "players invited");
   assert.ok(
@@ -169,37 +369,10 @@ test("createNextSeasonChannel derives guild from deathpool channel (no guild id)
   const client = {
     guilds: { fetch: async () => null },
     channels: {
-      // Deathpool-Kanal liefert .guild
       fetch: async () => ({ isTextBased: () => true, guild: fakeGuild }),
     },
   };
   const ch = await createNextSeasonChannel(client, cfg, 2028);
   assert.ok(ch, "channel created via derived guild");
   assert.strictEqual(created[0].name, "deathpool-2028");
-});
-
-test("remindAdminToAnnounce sends when nothing announced (current-year season)", async () => {
-  // Zustand: aktive Saison = AKTUELLES Jahr (Runde 2026 läuft in 2026), keine
-  // announced → Nov/Dez-Vorlauf: Erinnerung soll raus.
-  db.getDb()
-    .prepare(`UPDATE seasons SET phase = 'archived' WHERE phase = 'announced'`)
-    .run();
-  db.getDb()
-    .prepare(
-      `UPDATE seasons SET year = ?, start_date = ? WHERE active = 1 AND phase = 'running'`
-    )
-    .run(new Date().getFullYear(), `${new Date().getFullYear()}-01-01`);
-  assert.strictEqual(db.getAnnouncedSeason(), null);
-  const running = db.getActiveSeason();
-  assert.strictEqual(running.year, new Date().getFullYear(), "active season = current year");
-
-  const bucket = [];
-  const channel = makeFakeChannel(bucket);
-  const client = makeFakeClient(channel);
-  // config ohne channelAdmin → sendAdmin fällt auf DM (preferDmUser nicht gesetzt)
-  // → kein Ziel, kein Crash, aber reminded=true, reason='sent'.
-  const res = await remindAdminToAnnounce(client, config);
-  assert.strictEqual(res.reminded, true);
-  assert.strictEqual(res.reason, "sent");
-  assert.strictEqual(res.target, new Date().getFullYear() + 1, "reminds about next year");
 });

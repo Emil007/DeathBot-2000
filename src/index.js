@@ -20,11 +20,41 @@ const { registerSlashCommands } = require("./discord/slash");
 const { suggestCommands } = require("./discord/usage");
 const { startWikiPoller } = require("./jobs/wiki-poll");
 const { startDailySummary } = require("./jobs/daily-summary");
-const { startYearRollover } = require("./jobs/year-rollover");
+const { startYearRollover, runYearRollover } = require("./jobs/year-rollover");
 const { startAutoBackup } = require("./backup");
 const { startPresence } = require("./discord/presence");
 
 const EPHEMERAL = { flags: MessageFlags.Ephemeral };
+
+// F18d: Präfix-Argumente sollen „note:Zwei Worte“ erhalten können. Der naive
+// whitespace-Split lieferte nur „note:Zwei“. Bekannte Schlüssel/Flags markieren
+// die Grenze, bis zu der ein note:-Wert Leerzeichen aufnehmen darf.
+const NOTE_VALUE_KEYS = new Set(["note", "year", "start", "start_date", "channel", "scope", "max_picks"]);
+const NOTE_VALUE_FLAGS = new Set(["repost", "force", "activate", "wipe", "confirm", "pool"]);
+
+function rebuildPrefixArgs(parts) {
+  const out = [];
+  for (let i = 0; i < parts.length; i++) {
+    const p = parts[i];
+    if (!p.startsWith("note:")) {
+      out.push(p);
+      continue;
+    }
+    const headline = p.slice("note:".length);
+    let j = i + 1;
+    const rest = [];
+    while (j < parts.length) {
+      const t = parts[j];
+      const keyMatch = /^([a-z][a-z0-9_]*):/.exec(t);
+      if ((keyMatch && NOTE_VALUE_KEYS.has(keyMatch[1])) || NOTE_VALUE_FLAGS.has(t)) break;
+      rest.push(t);
+      j++;
+    }
+    out.push(rest.length ? `note:${headline} ${rest.join(" ")}` : p);
+    i = j - 1;
+  }
+  return out;
+}
 
 function isUnknownInteraction(err) {
   return err?.code === 10062 || err?.rawError?.code === 10062;
@@ -62,6 +92,13 @@ async function main() {
     setTimeout(() => startWikiPoller(client, config), 1500);
     startDailySummary(client, config);
     startYearRollover(client, config);
+    // F02: Nachholen nach Bot-Ausfall am 01.01. — der Cron läuft nur zur
+    // festen Zeit. Beim (Wieder-)Start einmal prüfen: der Wiener Datums-Guard
+    // lässt überfällige start_date durch und blockt zukünftige; ein zweiter
+    // Lauf nach Erfolg ist durch getAnnouncedSeason()==null abgedeckt.
+    runYearRollover(client, config).catch((e) => {
+      console.error("[year-rollover] startup catch-up failed", e.message);
+    });
     startAutoBackup(config, client);
     startPresence(client, config, db);
   });
@@ -140,7 +177,7 @@ async function main() {
     }
 
     if (!msg.content.startsWith(config.prefix)) return;
-    const parts = msg.content.slice(config.prefix.length).trim().split(/\s+/);
+    const parts = rebuildPrefixArgs(msg.content.slice(config.prefix.length).trim().split(/\s+/));
     const name = (parts.shift() || "").toLowerCase();
     const cmd = commands.get(name);
     if (!cmd) {
@@ -177,7 +214,12 @@ async function main() {
   await client.login(config.token);
 }
 
-main().catch((e) => {
-  console.error("Fatal:", e);
-  process.exit(1);
-});
+// F18d: Export für Tests; beim normalen Start wird main() ausgeführt.
+module.exports = { rebuildPrefixArgs, main };
+
+if (require.main === module) {
+  main().catch((e) => {
+    console.error("Fatal:", e);
+    process.exit(1);
+  });
+}

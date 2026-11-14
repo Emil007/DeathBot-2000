@@ -2,7 +2,6 @@ const cron = require("node-cron");
 const { ChannelType } = require("discord.js");
 const db = require("../db");
 const { logEvent, logError } = require("../discord/log");
-const { sendAdmin } = require("../discord/admin-notify");
 const { createPackage } = require("../backup");
 
 /** Nächstes Jahr relativ zur laufenden Saison/aktuellen Datum. */
@@ -34,33 +33,50 @@ function formatSeasonReviewText(review, runningYear) {
   }
   lines.push("");
   lines.push(`💀 **${deaths}** Todesfälle dieses Jahres in den Listen.`);
-  if (runningYear) lines.push("");
-  lines.push(`Die neue Runde **${runningYear}** ist live. Tippt weiter — ich kenne das Ende schon.`);
+  // F03: Live-Satz NUR wenn der Wechsel committet wurde (runningYear gesetzt) —
+  // auf dem no-announced-Pfad kommt hier null rein und der Satz entfällt.
+  if (runningYear) {
+    lines.push("");
+    lines.push(`Die neue Runde **${runningYear}** ist live. Tippt weiter — ich kenne das Ende schon.`);
+  }
   return lines.join("\n");
 }
 
+/**
+ * Datum in Europe/Vienna (YYYY-MM-DD) — F01: Der Cron feuert 00:00 Wiener Zeit
+ * (= 23:00 UTC am 31.12.). Ein UTC-Datum täte den Wechsel am 31.12. statt am
+ * 01.01., wodurch der Guard „start_date > heute" nie erfüllt würde. `date` ist
+ * injizierbar für Tests mit eingefrorenem Instant.
+ */
+function todayInVienna(date = new Date()) {
+  if (date == null) date = new Date();
+  return new Intl.DateTimeFormat("en-CA", {
+    timeZone: "Europe/Vienna",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+  }).format(date);
+}
+
 /** Führt den Jahreswechsel aus: Auswertung posten + announced-Saison live schalten. */
-async function runYearRollover(client, config, { force = false } = {}) {
+async function runYearRollover(client, config, { force = false, now = null } = {}) {
   const announced = db.getAnnouncedSeason();
   const running = db.getActiveSeason();
 
   // Nichts zu wechseln? trotzdem Auswertung der laufenden + Hinweis, dass keine
-  // neue Saison eröffnet wurde.
+  // neue Saison eröffnet wurde. Kein Live-Satz (runningYear = null).
   if (!announced) {
-    await postReview(client, config, running);
+    await postReview(client, config, running, null);
     return { switched: false, reason: "no-announced" };
   }
 
-  if (!force && announced.start_date && utcToday() < announced.start_date) {
-    // Noch nicht am Startdatum — Kritisch: der Cron ist auf 1.1.0 gesetzt,
-    // aber falls der Bot offline war und der Run nachgeholt wird, verhindert
-    // das doppelten Wechsel an falschem Datum.
-    await postReview(client, config, running);
+  // F01: Wechsel erst, wenn das WIENER Datum >= start_date. Der Cron läuft
+  // 00:00 Europe/Vienna; ein Nachhol-Run (Bot-Ausfall) kommt am selben Wiener
+  // Tag oder später — überfällige start_date passieren, zukünftige blocken.
+  if (!force && announced.start_date && todayInVienna(now) < announced.start_date) {
+    await postReview(client, config, running, null);
     return { switched: false, reason: "not-yet", start: announced.start_date };
   }
-
-  // Posten VOR dem Wechsel, damit 'running' noch die alte Saison ist.
-  await postReview(client, config, running);
 
   let pkg;
   try {
@@ -70,6 +86,8 @@ async function runYearRollover(client, config, { force = false } = {}) {
     throw e;
   }
 
+  // F03: Wechsel KOMMITTEN, BEVOR die Bilanz gepostet wird — seasonReview liest
+  // season_point_snapshots, die erst activateAnnouncedSeason schreibt.
   let res;
   try {
     res = db.activateAnnouncedSeason();
@@ -77,6 +95,10 @@ async function runYearRollover(client, config, { force = false } = {}) {
     await logError(client, config, e, { where: "year-rollover activate" });
     throw e;
   }
+
+  // F03: Bilanz der ARCHIVIERTEN Saison (Snapshot liegt jetzt vor), Live-Satz
+  // mit der neuen Saison nur weil der Wechsel tatsächlich committet wurde.
+  await postReview(client, config, res.archived, res.activated.year);
 
   await logEvent(client, config, {
     kind: "season-switch-auto",
@@ -100,43 +122,46 @@ async function runYearRollover(client, config, { force = false } = {}) {
     await logError(client, config, e, { where: "year-rollover createChannel" });
   }
 
-  // Kurze Bestätigung im (neuen) Deathpool-Kanal
+  // Kurze Bestätigung im (neuen) Deathpool-Kanal — Fehler nicht stumm schlucken.
   const targetId =
     newChannel?.id || config.channelAllDeaths || config.channelDeathpool;
   const channel = targetId ? await client.channels.fetch(targetId).catch(() => null) : null;
   if (channel?.isTextBased()) {
-    await channel
-      .send({
+    try {
+      await channel.send({
         content: newChannel
           ? `🆕 **Neue Saison ${res.activated.year} live** — Kanal <#${newChannel.id}> ist erstellt, alle Teilnehmer sind eingeladen.`
           : `🔄 **Saisonwechsel:** ${res.archived.year} archiviert — **${res.activated.year} ist live**.`,
         allowedMentions: { parse: [] },
-      })
-      .catch(() => {});
+      });
+    } catch (e) {
+      await logError(client, config, e, { where: "year-rollover switch-ack send" });
+    }
   }
 
   return { switched: true, archived: res.archived, activated: res.activated };
 }
 
-async function postReview(client, config, runningSeason) {
+/**
+ * Postet die Abschlussbilanz. `season` ist die zu bewertende Saison (nach dem
+ * Wechsel die ARCHIVIERTE), `liveYear` steuert den Live-Satz: gesetzt nur wenn
+ * der Wechsel committet wurde, sonst null (F03). Fehlgeschlagene sends werden
+ * geloggt und liefern false statt still zu verschwinden.
+ */
+async function postReview(client, config, season, liveYear) {
   const targetId = config.channelAllDeaths || config.channelDeathpool;
   const channel = targetId ? await client.channels.fetch(targetId).catch(() => null) : null;
   if (!channel?.isTextBased()) return false;
-  const review = runningSeason ? db.seasonReview(runningSeason.id) : null;
-  const text = formatSeasonReviewText(review, announcedYear(config));
+  const review = season ? db.seasonReview(season.id) : null;
+  const text = formatSeasonReviewText(review, liveYear ?? null);
   if (!text) return false;
-  await channel.send({ content: text, allowedMentions: { parse: [] } }).catch(() => false);
+  try {
+    await channel.send({ content: text, allowedMentions: { parse: [] } });
+  } catch (e) {
+    await logError(client, config, e, { where: "year-rollover postReview" });
+    return false;
+  }
   return true;
-}
-
-function announcedYear(config) {
-  const announced = config && db.getAnnouncedSeason ? db.getAnnouncedSeason() : null;
-  return announced?.year || null;
-}
-
-function utcToday() {
-  const d = new Date();
-  return `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, "0")}-${String(d.getUTCDate()).padStart(2, "0")}`;
 }
 
 /**
@@ -209,26 +234,53 @@ async function createNextSeasonChannel(client, config, year) {
  */
 async function remindAdminToAnnounce(client, config) {
   const announced = db.getAnnouncedSeason();
+  // F07: Erinnern, solange keine announced-Saison existiert — der falsche
+  // Jahr-Vergleichs-Guard (unterdrückte die Erinnerung nach einem
+  // liegengebliebenen Jahr) ist entfernt.
   if (announced) return { reminded: false, reason: "already-announced" };
 
   const running = db.getActiveSeason();
   const target = nextYear(running);
-  const today = utcToday();
-  const [y] = today.split("-").map(Number);
-
-  // Erinnere nur, wenn wir im aktuellen Kalenderjahr der noch laufenden Runde
-  // sind (z. B. Nov/Dez 2026, Runde 2026) und die neue (2027) noch fehlt.
-  if (running && y !== running.year) {
-    // Wir sind bereits im neuen Jahr und die alte Runde läuft noch — keine
-    // Erinnerung nötig (es läuft erst gerade an).
-    return { reminded: false, reason: "running-current-year" };
-  }
 
   const text =
     `⚰️ **Erinnerung:** Die Runde **${target}** ist noch nicht eröffnet.\n` +
     "Erstelle sie manuell mit `/announce-season announce_channel:#Kanal` (oder `!announce-season #Kanal`), " +
     "bevor am 01.01. gewechselt wird — sonst verpasst Gregg den Kanal-Start.";
-  await sendAdmin({ client, config }, { content: text });
+
+  // F07: Ziel auflösen — CHANNEL_ADMIN, sonst DM an den Admin. sendAdmin hat
+  // KEINEN DM-Fallback: bei leerem CHANNEL_ADMIN ginge sonst nichts raus, aber
+  // es würde trotzdem reminded:true / reason:'sent' geloggt.
+  let targetObj = null;
+  if (config.channelAdmin) {
+    try {
+      const ch = await client.channels.fetch(config.channelAdmin).catch(() => null);
+      if (ch?.isTextBased?.() || ch?.send) targetObj = ch;
+    } catch {
+      targetObj = null;
+    }
+  }
+  if (!targetObj && config.adminId) {
+    try {
+      const user = await client.users.fetch(config.adminId).catch(() => null);
+      if (user?.createDM) targetObj = await user.createDM().catch(() => null);
+    } catch {
+      targetObj = null;
+    }
+  }
+  if (!targetObj?.send) {
+    const err = new Error(
+      "remindAdminToAnnounce: kein Ziel (kein CHANNEL_ADMIN und Admin-DM fehlgeschlagen)"
+    );
+    await logError(client, config, err, { where: "remindAdminToAnnounce" });
+    return { reminded: false, reason: "no-target", target };
+  }
+
+  try {
+    await targetObj.send({ content: text });
+  } catch (e) {
+    await logError(client, config, e, { where: "remindAdminToAnnounce send" });
+    return { reminded: false, reason: "no-target", target };
+  }
   await logEvent(client, config, {
     kind: "admin-reminder",
     summary: `Erinnerung: Runde ${target} noch nicht eröffnet`,
@@ -275,4 +327,5 @@ module.exports = {
   remindAdminToAnnounce,
   createNextSeasonChannel,
   nextYear,
+  todayInVienna,
 };
