@@ -96,9 +96,28 @@ async function runYearRollover(client, config, { force = false, now = null } = {
     throw e;
   }
 
-  // F03: Bilanz der ARCHIVIERTEN Saison (Snapshot liegt jetzt vor), Live-Satz
-  // mit der neuen Saison nur weil der Wechsel tatsächlich committet wurde.
-  await postReview(client, config, res.archived, res.activated.year);
+  // F06: Neuen Kanal deathpool-{YEAR} anlegen + alle Teilnehmer einladen (1.1.).
+  // Die neue Kanal-ID geht NUR in deathpool_channel_id — announce_channel_id
+  // bleibt der Anmeldungskanal.
+  let newChannel = null;
+  let newChannelFailed = false; // F06: Fehlschlag muss die Kurzbestätigung sagen
+  try {
+    newChannel = await createNextSeasonChannel(client, config, res.activated.year);
+    if (newChannel?.id) {
+      db.setSeasonDeathpoolChannel(res.activated.id, newChannel.id);
+    }
+  } catch (e) {
+    // F04/F06: Fehler nicht still schlucken — loggen, der Text unten sagt es.
+    newChannelFailed = true;
+    await logError(client, config, e, {
+      where: "year-rollover createChannel",
+      detail: `year=${res.activated.year}`,
+    });
+  }
+
+  // F06: Jahresbilanz + Kurzbestätigung in den NEUEN Kanal, wenn einer erstellt
+  // wurde — sonst in den gewohnten Zielkanal (gespeicherte ID/Env-Fallback).
+  await postReview(client, config, res.archived, res.activated.year, newChannel?.id || null);
 
   await logEvent(client, config, {
     kind: "season-switch-auto",
@@ -107,39 +126,42 @@ async function runYearRollover(client, config, { force = false, now = null } = {
     detail: `backup=${pkg?.name} archived=${res.archived.id} activated=${res.activated.id}`,
   });
 
-  // Neuen Kanal deathpool-{YEAR} anlegen + alle Teilnehmer einladen (1.1.).
-  let newChannel = null;
-  try {
-    newChannel = await createNextSeasonChannel(client, config, res.activated.year);
-    if (newChannel?.id) {
-      // Kanal-ID auf die neue (nun laufende) Saison schreiben: dort landen künftige
-      // Deathpool-Nachrichten.
-      db.getDb()
-        .prepare(`UPDATE seasons SET announce_channel_id = ? WHERE id = ?`)
-        .run(String(newChannel.id), res.activated.id);
-    }
-  } catch (e) {
-    await logError(client, config, e, { where: "year-rollover createChannel" });
+  // Kurze Bestätigung im (neuen) Deathpool-Kanal — Fehler nicht stumm schlucken (F04).
+  let ackChannelId = null;
+  if (newChannel?.id) {
+    ackChannelId = newChannel.id;
+  } else {
+    ackChannelId = db.resolveDeathpoolChannel(config) || config.channelAllDeaths || null;
   }
-
-  // Kurze Bestätigung im (neuen) Deathpool-Kanal — Fehler nicht stumm schlucken.
-  const targetId =
-    newChannel?.id || config.channelAllDeaths || config.channelDeathpool;
-  const channel = targetId ? await client.channels.fetch(targetId).catch(() => null) : null;
+  const channel = ackChannelId
+    ? await client.channels.fetch(ackChannelId).catch(() => null)
+    : null;
   if (channel?.isTextBased()) {
     try {
+      const ackText = newChannel
+        ? `🆕 **Neue Saison ${res.activated.year} live** — Kanal <#${newChannel.id}> ist erstellt, alle Teilnehmer sind eingeladen.`
+        : newChannelFailed
+          ? `🔄 **Saisonwechsel:** ${res.archived.year} archiviert — **${res.activated.year} ist live**. (Wechsel ohne neuen Kanal — Kanal-Anlage fehlgeschlagen.)`
+          : `🔄 **Saisonwechsel:** ${res.archived.year} archiviert — **${res.activated.year} ist live**.`;
       await channel.send({
-        content: newChannel
-          ? `🆕 **Neue Saison ${res.activated.year} live** — Kanal <#${newChannel.id}> ist erstellt, alle Teilnehmer sind eingeladen.`
-          : `🔄 **Saisonwechsel:** ${res.archived.year} archiviert — **${res.activated.year} ist live**.`,
+        content: ackText,
         allowedMentions: { parse: [] },
       });
     } catch (e) {
-      await logError(client, config, e, { where: "year-rollover switch-ack send" });
+      // F04: ehrliche Rückgabe statt das Versagen zu verschlucken.
+      await logError(client, config, e, {
+        where: "year-rollover switch-ack send",
+        detail: `channel=${ackChannelId}`,
+      });
     }
+  } else {
+    const err = new Error(
+      `runYearRollover: Switch-Bestätigung nicht gesendet (kein sendbarer Kanal, targetId=${ackChannelId})`
+    );
+    await logError(client, config, err, { where: "year-rollover switch-ack" });
   }
 
-  return { switched: true, archived: res.archived, activated: res.activated };
+  return { switched: true, archived: res.archived, activated: res.activated, channel: newChannel?.id || null };
 }
 
 /**
@@ -148,8 +170,10 @@ async function runYearRollover(client, config, { force = false, now = null } = {
  * der Wechsel committet wurde, sonst null (F03). Fehlgeschlagene sends werden
  * geloggt und liefern false statt still zu verschwinden.
  */
-async function postReview(client, config, season, liveYear) {
-  const targetId = config.channelAllDeaths || config.channelDeathpool;
+async function postReview(client, config, season, liveYear, preferredChannelId = null) {
+  // F06: Bilanz in den NEUEN Kanal, wenn einer erstellt wurde — sonst der
+  // gewohnte Deathpool-/All-Deaths-Kanal (gespeicherte ID zuerst, Env-Fallback).
+  const targetId = preferredChannelId || db.resolveDeathpoolChannel(config) || config.channelAllDeaths || null;
   const channel = targetId ? await client.channels.fetch(targetId).catch(() => null) : null;
   if (!channel?.isTextBased()) return false;
   const review = season ? db.seasonReview(season.id) : null;
@@ -158,7 +182,10 @@ async function postReview(client, config, season, liveYear) {
   try {
     await channel.send({ content: text, allowedMentions: { parse: [] } });
   } catch (e) {
-    await logError(client, config, e, { where: "year-rollover postReview" });
+    await logError(client, config, e, {
+      where: "year-rollover postReview",
+      detail: `channel=${targetId}`,
+    });
     return false;
   }
   return true;
@@ -190,26 +217,45 @@ async function createNextSeasonChannel(client, config, year) {
     }
   }
   if (!guild?.channels?.create) {
-    console.warn(
-      "[year-rollover] keine Guild (weder DISCORD_GUILD_ID noch aus Deathpool-Kanal ableitbar) — Kanal-Erstellung übersprungen"
+    const err = new Error(
+      "Keine Guild (weder DISCORD_GUILD_ID noch aus Deathpool-Kanal ableitbar) — Kanal-Erstellung übersprungen"
     );
+    // F15: logError statt stillem console.warn (Guild-ID mitloggen, auch
+    // abgeleitet) — kein stilles Überspringen.
+    await logError(client, config, err, {
+      where: "year-rollover createChannel guild",
+      detail: `guild=${guild?.id || config.discordGuildId || "none"} deriveFrom=${config.channelDeathpool || config.channelAllDeaths || "none"}`,
+    });
     return null;
   }
   const name = `deathpool-${year}`;
-  const existing = guild.channels.cache.find((c) => c.name === name);
+
+  // F15: bestehenden Kanal robust per channels.fetch (frisch von der API, nicht
+  // nur Cache) + Namens-/Typfilter auflösen — kalter Cache → kein zweites
+  // deathpool-{YEAR} anlegen. NUR GuildText zählt: ein Voice-/Kategorie-Kanal
+  // desselben Namens ist KEIN Deathpool.
+  let existing = null;
+  try {
+    const all = await guild.channels.fetch();
+    existing = all.find((c) => c.name === name && c.type === ChannelType.GuildText) || null;
+  } catch (e) {
+    // Kanal-Auflösung fehlgeschlagen → NICHT still weiterlaufen (F15).
+    await logError(client, config, e, {
+      where: "year-rollover createChannel fetch",
+      detail: `guild=${guild.id} name=${name}`,
+    });
+    existing = null;
+  }
   if (existing) {
     console.log(`[year-rollover] Kanal ${name} existiert bereits`);
+    // F15: Overwrites auf den AKTUELLEN Spielerstand nachziehen (wer neu
+    // eingeladen wurde, muss den Kanal sehen/darauf schreiben).
+    await syncChannelOverwrites(existing, config);
     return existing;
   }
 
   // Alle Spieler (Teilnehmer) bekommen Sicht + Schreibrecht.
-  const players = db.getDb().prepare("SELECT discord_user_id, display_name FROM players").all() || [];
-  const overwrites = players
-    .filter((p) => p.discord_user_id)
-    .map((p) => ({
-      id: p.discord_user_id,
-      allow: ["ViewChannel", "SendMessages"],
-    }));
+  const overwrites = currentPlayerOverwrites();
 
   const channel = await guild.channels.create({
     name,
@@ -220,12 +266,63 @@ async function createNextSeasonChannel(client, config, year) {
 
   await logEvent(client, config, {
     kind: "season-channel-created",
-    summary: `Kanal ${name} erstellt (${players.length} Spieler eingeladen)`,
+    summary: `Kanal ${name} erstellt (${overwrites.length} Spieler eingeladen)`,
     userId: config.adminId,
-    detail: `guild=${config.discordGuildId} players=${players.length}`,
+    detail: `guild=${guild.id} players=${overwrites.length}`,
   });
   return channel;
 }
+
+/** Aktuelle Spielerliste als permissionOverwrites (ViewChannel + SendMessages). */
+function currentPlayerOverwrites() {
+  const players = db.getDb().prepare("SELECT discord_user_id, display_name FROM players").all() || [];
+  return players
+    .filter((p) => p.discord_user_id)
+    .map((p) => ({
+      id: p.discord_user_id,
+      allow: ["ViewChannel", "SendMessages"],
+    }));
+}
+
+/**
+ * F15: Overwrites eines bestehenden Deathpool-Kanals auf den AKTUELLEN
+ * Spielerstand nachziehen. Rückgabe true wenn mind. eine Änderung gepingt wurde,
+ * false wenn nichts zu tun war oder das Edit fehlschlug (Fehler wird geloggt).
+ */
+async function syncChannelOverwrites(channel, config) {
+  const desired = currentPlayerOverwrites();
+  try {
+    const existingOw = (channel.permissionOverwrites?.cache || []);
+    const existingFor = (id) =>
+      Array.isArray(existingOw)
+        ? existingOw.find((o) => String(o.id) === String(id))
+        : existingOw.get(String(id));
+    let changed = 0;
+    for (const d of desired) {
+      const o = existingFor(d.id);
+      const hasView =
+        o?.allow?.has?.("ViewChannel") ??
+        (Array.isArray(o?.allow) && o.allow.includes("ViewChannel"));
+      const hasSend =
+        o?.allow?.has?.("SendMessages") ??
+        (Array.isArray(o?.allow) && o.allow.includes("SendMessages"));
+      if (o && hasView && hasSend) continue; // schon passend
+      await channel.permissionOverwrites.edit(d.id, d.allow, {
+        type: 1, // PermissionOverwriteType.Member
+        reason: `Deathpool ${channel.name}: Spieler ${d.id} Zugriff nachgezogen (year-rollover)`,
+      });
+      changed++;
+    }
+    return changed > 0;
+  } catch (e) {
+    await logError(client, config, e, {
+      where: "year-rollover syncChannelOverwrites",
+      detail: `channel=${channel.id}`,
+    });
+    return false;
+  }
+}
+
 
 /**
  * Erinnerung an den Admin (01.11. & 01.12.), wenn die neue Saison noch nicht

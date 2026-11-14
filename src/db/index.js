@@ -156,6 +156,31 @@ function setSeasonAnnounce(seasonId, { channelId, note }) {
   return db.prepare("SELECT * FROM seasons WHERE id = ?").get(seasonId);
 }
 
+// F06: Deathpool-Versandkanal der (laufenden) Saison setzen. Wird vom Rollover
+// nach erfolgreicher Kanal-Anlage befüllt — getrennt vom Anmeldungskanal.
+function setSeasonDeathpoolChannel(seasonId, channelId) {
+  db.prepare("UPDATE seasons SET deathpool_channel_id = ? WHERE id = ?").run(
+    channelId ? String(channelId) : null,
+    seasonId
+  );
+  return db.prepare("SELECT * FROM seasons WHERE id = ?").get(seasonId);
+}
+
+// F06: Der effektive Deathpool-Versandkanal — die in der laufenden Saison
+// gespeicherte deathpool_channel_id gewinnt vor dem Env-Fallback. Gibt die
+// ID zurück (String) oder null, wenn weder gespeichert noch konfiguriert.
+function resolveDeathpoolChannel(config) {
+  let running = null;
+  try {
+    running = getActiveSeason();
+  } catch {
+    running = null;
+  }
+  const stored = running?.deathpool_channel_id;
+  if (stored) return stored;
+  return config?.channelDeathpool || null;
+}
+
 function archiveRunningSeason(seasonId) {
   const info = db
     .prepare(
@@ -1856,6 +1881,8 @@ module.exports = {
   getAnnouncedSeason,
   openAnnouncedSeason,
   setSeasonAnnounce,
+  setSeasonDeathpoolChannel,
+  resolveDeathpoolChannel,
   archiveRunningSeason,
   activateAnnouncedSeason,
   assertAnnouncedSeason,

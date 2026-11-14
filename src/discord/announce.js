@@ -74,7 +74,10 @@ async function processDeathpoolHit(
 
   if (!announce) return result;
 
-  const channel = await client.channels.fetch(config.channelDeathpool).catch(() => null);
+  const channelId = db.resolveDeathpoolChannel(config);
+  const channel = channelId
+    ? await client.channels.fetch(channelId).catch(() => null)
+    : null;
   if (!channel?.isTextBased()) {
     console.error("[announce] deathpool channel missing");
     return result;
@@ -144,7 +147,10 @@ async function processDeathpoolHit(
 }
 
 async function announceRetraction(client, config, { celeb, awards }) {
-  const channel = await client.channels.fetch(config.channelDeathpool).catch(() => null);
+  const channelId = db.resolveDeathpoolChannel(config);
+  const channel = channelId
+    ? await client.channels.fetch(channelId).catch(() => null)
+    : null;
   if (!channel?.isTextBased()) return;
 
   const lines = awards.map((a) => {
@@ -313,8 +319,11 @@ async function announceAllDeath(client, config, entry, { isDeOnly = false, brief
 async function announceDailySummary(client, config) {
   if (!db.isLive()) return;
 
-  const targetId = config.channelAllDeaths || config.channelDeathpool;
-  const channel = await client.channels.fetch(targetId).catch(() => null);
+  // F06: Tagesbericht in den Deathpool-Versandkanal (gespeicherte ID oder Env).
+  const channelId = db.resolveDeathpoolChannel(config);
+  const channel = channelId
+    ? await client.channels.fetch(channelId).catch(() => null)
+    : null;
   if (!channel?.isTextBased()) return;
 
   const rows = db.deathsSinceHours(26);
@@ -444,7 +453,10 @@ async function announceSimulatedDeath(
     winners = [],
   } = {}
 ) {
-  const channel = await client.channels.fetch(config.channelDeathpool).catch(() => null);
+  const channelId = db.resolveDeathpoolChannel(config);
+  const channel = channelId
+    ? await client.channels.fetch(channelId).catch(() => null)
+    : null;
   if (!channel?.isTextBased()) {
     console.error("[announce] deathpool channel missing");
     return;

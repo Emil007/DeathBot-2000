@@ -66,7 +66,6 @@ function makeFakeClient(channel) {
     },
   };
 }
-
 // ---- F01: todayInVienna ----
 
 test("todayInVienna formats in Europe/Vienna (F01)", () => {
@@ -328,11 +327,13 @@ test("createNextSeasonChannel creates deathpool-{year} and invites players", asy
   db.upsertPlayer({ displayName: "Beta", discordUserId: "2002" });
   const created = [];
   const fakeGuild = {
+    id: "guild-1",
     channels: {
-      cache: { find: () => undefined },
+      // F15: fetch() liefert die aktuellen Guild-Kanäle (kein Treffer → anlegen)
+      fetch: async () => [],
       create: async (opts) => {
         created.push(opts);
-        return { id: "chan-123", name: opts.name };
+        return { id: "chan-123", name: opts.name, permissionOverwrites: { cache: new Map() } };
       },
     },
   };
@@ -357,8 +358,9 @@ test("createNextSeasonChannel derives guild from deathpool channel (no guild id)
   const created = [];
   const fakeGuild = {
     name: "Greggs Server",
+    id: "guild-derive-1",
     channels: {
-      cache: { find: () => undefined },
+      fetch: async () => [],
       create: async (opts) => {
         created.push(opts);
         return { id: "chan-456", name: opts.name };
@@ -375,4 +377,182 @@ test("createNextSeasonChannel derives guild from deathpool channel (no guild id)
   const ch = await createNextSeasonChannel(client, cfg, 2028);
   assert.ok(ch, "channel created via derived guild");
   assert.strictEqual(created[0].name, "deathpool-2028");
+});
+
+// ---- F06: Kanal wirklich benutzen ----
+
+test("F06: runYearRollover writes new channel id to deathpool_channel_id, NOT announce_channel_id", async () => {
+  resetToRunningCurrentYear();
+  const runningBefore = db.getActiveSeason();
+  db.openAnnouncedSeason({
+    year: runningBefore.year + 1,
+    startDate: `${runningBefore.year + 1}-01-01`,
+    channelId: "777",
+    note: null,
+  });
+  // Kanal-Anlage: fake guild erstellt deathpool-{year}
+  const created = [];
+  const fakeGuild = {
+    id: "guild-1",
+    channels: {
+      fetch: async () => [],
+      create: async (opts) => {
+        created.push(opts);
+        return { id: "newchan-9", name: opts.name, permissionOverwrites: { cache: new Map() } };
+      },
+    },
+  };
+  const client = {
+    guilds: { fetch: async () => fakeGuild },
+    channels: {
+      fetch: async (id) => makeFakeChannel([]), // für review + ack
+    },
+  };
+  const cfg = { ...config, discordGuildId: "guild-1" };
+  const res = await runYearRollover(client, cfg, { force: true });
+  assert.strictEqual(res.switched, true);
+
+  const activated = db.getActiveSeason();
+  assert.strictEqual(activated.year, runningBefore.year + 1);
+  assert.strictEqual(activated.deathpool_channel_id, "newchan-9", "new id in deathpool_channel_id");
+  assert.strictEqual(activated.announce_channel_id, "777", "announce_channel_id unchanged (Anmeldungskanal)");
+});
+
+test("F06: resolveDeathpoolChannel prefers stored id over env fallback", () => {
+  const running = db.getActiveSeason();
+  db.setSeasonDeathpoolChannel(running.id, "stored-chan-42");
+  assert.strictEqual(db.resolveDeathpoolChannel(config), "stored-chan-42");
+  // Env-Fallback greift erst ohne gespeicherte ID
+  db.setSeasonDeathpoolChannel(running.id, null);
+  assert.strictEqual(db.resolveDeathpoolChannel(config), config.channelDeathpool);
+});
+
+// ---- F15: Kanal-Anlage härten ----
+
+test("F15: existing same-name GuildText channel is reused, overwrites synced for a NEW player", async () => {
+  db.getDb().exec("DELETE FROM players");
+  db.upsertPlayer({ displayName: "Old", discordUserId: "1001" });
+  const edited = [];
+  const existingChannel = {
+    id: "exist-1",
+    name: "deathpool-2027",
+    type: 0, // GuildText
+    permissionOverwrites: {
+      cache: new Map([
+        ["1001", { id: "1001", allow: { has: (p) => ["ViewChannel", "SendMessages"].includes(p) } }],
+      ]),
+      edit: async (userId, allow, opts) => {
+        edited.push({ userId, allow, opts });
+      },
+    },
+  };
+  const created = [];
+  const fakeGuild = {
+    id: "guild-1",
+    channels: {
+      fetch: async () => [existingChannel],
+      create: async (opts) => {
+        created.push(opts);
+        return { id: "dup", name: opts.name };
+      },
+    },
+  };
+  const cfg = { ...config, discordGuildId: "guild-1" };
+  const client = { guilds: { fetch: async () => fakeGuild } };
+
+  // Neuer Spieler erst NACH der Anfangsliste — er fehlt im Kanal-Overwrite.
+  db.upsertPlayer({ displayName: "Newbie", discordUserId: "9999" });
+
+  const ch = await createNextSeasonChannel(client, cfg, 2027);
+  assert.strictEqual(ch.id, "exist-1", "existing channel reused");
+  assert.strictEqual(created.length, 0, "create must NOT be called");
+  // Overwrites für den NEUEN Spieler nachgezogen
+  assert.strictEqual(edited.length, 1, "exactly one overwrite edit");
+  assert.strictEqual(edited[0].userId, "9999");
+  assert.ok(edited[0].allow.includes("ViewChannel") && edited[0].allow.includes("SendMessages"));
+});
+
+test("F15: voice channel with same name is NOT reused (creates text channel)", async () => {
+  db.getDb().exec("DELETE FROM players");
+  const created = [];
+  const fakeGuild = {
+    id: "guild-1",
+    channels: {
+      fetch: async () => [{ id: "voice-1", name: "deathpool-2027", type: 2 }], // GUILD_VOICE
+      create: async (opts) => {
+        created.push(opts);
+        return { id: "text-1", name: opts.name };
+      },
+    },
+  };
+  const cfg = { ...config, discordGuildId: "guild-1" };
+  const client = { guilds: { fetch: async () => fakeGuild } };
+  const ch = await createNextSeasonChannel(client, cfg, 2027);
+  assert.strictEqual(ch.id, "text-1", "text channel created despite same-named voice channel");
+  assert.strictEqual(created.length, 1);
+  assert.strictEqual(created[0].type, 0);
+});
+
+test("F15: create failure triggers logError and confirmation text („Wechsel ohne neuen Kanal”)", async () => {
+  resetToRunningCurrentYear();
+  const runningBefore = db.getActiveSeason();
+  db.openAnnouncedSeason({
+    year: runningBefore.year + 1,
+    startDate: `${runningBefore.year + 1}-01-01`,
+    channelId: "777",
+    note: null,
+  });
+  const sent = [];
+  const fakeGuild = {
+    id: "guild-1",
+    channels: {
+      fetch: async () => [],
+      create: async () => {
+        throw new Error("Missing Permissions / Kanal konnte nicht erstellt werden");
+      },
+    },
+  };
+  const client = {
+    guilds: { fetch: async () => fakeGuild },
+    channels: {
+      // review + ack gehen an den konventionellen Zielkanal (kein neuer Kanal)
+      fetch: async () => makeFakeChannel(sent),
+    },
+  };
+  const cfg = { ...config, discordGuildId: "guild-1" };
+
+  const res = await runYearRollover(client, cfg, { force: true });
+  assert.strictEqual(res.switched, true, "switch still commits");
+  // Bestätigung nennt den Fehlschlag
+  const ack = sent.find((p) => p.content && p.content.includes("Saisonwechsel"));
+  assert.ok(ack, "switch-ack posted");
+  assert.ok(ack.content.includes("Wechsel ohne neuen Kanal"), "ack mentions failed channel setup");
+  // Kein Kanal wurde gespeichert
+  assert.strictEqual(db.getActiveSeason().deathpool_channel_id, null);
+});
+
+// ---- F06: announce.js + Tagesbericht nutzen den gespeicherten Kanal ----
+
+test("F06: announceDailySummary sends to the stored deathpool channel, not the env fallback", async () => {
+  const { announceDailySummary } = require("../src/discord/announce");
+  const running = db.getActiveSeason();
+  db.setSeasonLive(true);
+  db.setSeasonDeathpoolChannel(running.id, "stored-summary-1");
+
+  const fetched = [];
+  const sent = [];
+  const client = {
+    channels: {
+      fetch: async (id) => {
+        fetched.push(id);
+        return makeFakeChannel(sent);
+      },
+    },
+  };
+  await announceDailySummary(client, config);
+  assert.ok(fetched.includes("stored-summary-1"), "daily summary targets stored channel id");
+  assert.ok(!fetched.includes(config.channelDeathpool), "env deathpool must NOT be used while stored id exists");
+  assert.strictEqual(sent.length, 1, "summary message posted");
+
+  db.setSeasonDeathpoolChannel(running.id, null);
 });

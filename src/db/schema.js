@@ -11,6 +11,7 @@ CREATE TABLE IF NOT EXISTS seasons (
   phase TEXT,
   announce_channel_id TEXT,
   announce_note TEXT,
+  deathpool_channel_id TEXT,
   created_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
@@ -211,6 +212,10 @@ function migrate(db) {
   if (!seasonCols.has("live")) db.exec(`ALTER TABLE seasons ADD COLUMN live INTEGER NOT NULL DEFAULT 0`);
   if (!seasonCols.has("announce_channel_id"))
     db.exec(`ALTER TABLE seasons ADD COLUMN announce_channel_id TEXT`);
+  // F06: Deathpool-Versandkanal (nach dem 01.01. der neue deathpool-{YEAR}-Kanal),
+  // getrennt vom Anmeldungskanal (announce_channel_id).
+  if (!seasonCols.has("deathpool_channel_id"))
+    db.exec(`ALTER TABLE seasons ADD COLUMN deathpool_channel_id TEXT`);
   if (!seasonCols.has("announce_note"))
     db.exec(`ALTER TABLE seasons ADD COLUMN announce_note TEXT`);
   if (!seasonCols.has("phase")) {
