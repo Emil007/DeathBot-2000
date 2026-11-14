@@ -52,3 +52,8 @@ services:
       CUSTOM_PHRASES: "no"
       # CUSTOM_PHRASES: "mix"
       # CUSTOM_PHRASES: "only"
+      # Eingebaute Phrasebank wählen:
+      #   new    = src/phrases/builtin-phrases.json      (Standard, die gemeine 241er-Bank)
+      #   old    = src/phrases/builtin-phrases_old.json  (die bisherige 542er-Bank)
+      #   custom = nur data/custom_phrases.txt (ohne eingebaute Sätze)
+      PHRASES_BANK: "new"

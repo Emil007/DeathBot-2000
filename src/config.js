@@ -23,11 +23,21 @@ function intEnv(name, fallback) {
 
 const CUSTOM_MODES = new Set(["no", "mix", "only"]);
 
+// PHRASES_BANK wählt, welche eingebaute Phrasebank geladen wird:
+//   new    = src/phrases/builtin-phrases.json      (Standard, die gemeine 241er-Bank)
+//   old    = src/phrases/builtin-phrases_old.json  (die bisherige 542er-Bank)
+//   custom = nur die data/custom_phrases.txt (CUSTOM_PHRASES=only-äquivalent)
+const PHRASES_BANKS = new Set(["new", "old", "custom"]);
+
 function loadConfig() {
   const dataDir = optional("DATA_DIR", path.join(process.cwd(), "data"));
   const customPhrases = optional("CUSTOM_PHRASES", "no").toLowerCase();
   if (!CUSTOM_MODES.has(customPhrases)) {
     throw new Error(`CUSTOM_PHRASES must be one of: no, mix, only (got ${customPhrases})`);
+  }
+  const phrasesBank = optional("PHRASES_BANK", "new").toLowerCase();
+  if (!PHRASES_BANKS.has(phrasesBank)) {
+    throw new Error(`PHRASES_BANK must be one of: new, old, custom (got ${phrasesBank})`);
   }
 
   return {
@@ -52,6 +62,7 @@ function loadConfig() {
     backupsDir: path.join(dataDir, "backups"),
     restoreDir: path.join(dataDir, "restore"),
     customPhrasesMode: customPhrases,
+    phrasesBank,
     alertEmoji: optional("ALERT_EMOJI", "⚰️"),
     alertEmojiRepeat: intEnv("ALERT_EMOJI_REPEAT", 3),
     // Maximale Namen/Karten pro Spieler-Einreichung — der Tipp-Assistent kappt

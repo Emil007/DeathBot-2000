@@ -5,11 +5,19 @@ const path = require("path");
 let builtin = null;
 let customCache = { mtimeMs: 0, lines: [] };
 
-function loadBuiltin() {
-  if (builtin) return builtin;
-  const p = path.join(__dirname, "builtin-phrases.json");
-  builtin = JSON.parse(fs.readFileSync(p, "utf8"));
-  return builtin;
+function builtinFileFor(bank) {
+  // PHRASES_BANK: new = Standard (241er), old = bisherige (542er), custom = Datei-only
+  if (bank === "old") return path.join(__dirname, "builtin-phrases_old.json");
+  return path.join(__dirname, "builtin-phrases.json");
+}
+
+function loadBuiltin(config) {
+  if (builtin && builtin.bank === (config && config.phrasesBank)) return builtin.data;
+  const bank = config && config.phrasesBank ? config.phrasesBank : "new";
+  const p = builtinFileFor(bank);
+  const data = JSON.parse(fs.readFileSync(p, "utf8"));
+  builtin = { bank, data };
+  return data;
 }
 
 function loadCustom(filePath) {
@@ -31,7 +39,16 @@ function loadCustom(filePath) {
 }
 
 function resolveBank(config) {
-  const built = loadBuiltin();
+  // PHRASES_BANK=custom → nur die data-Datei (wie CUSTOM_PHRASES=only)
+  if (config && config.phrasesBank === "custom") {
+    const custom = loadCustom(config.customPhrasesPath);
+    if (!custom.length) {
+      console.warn("[phrases] PHRASES_BANK=custom but custom file empty/missing — falling back to new bank");
+      return loadBuiltin(config);
+    }
+    return custom;
+  }
+  const built = loadBuiltin(config);
   const custom = loadCustom(config.customPhrasesPath);
   const mode = config.customPhrasesMode;
 
