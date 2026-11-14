@@ -277,6 +277,17 @@ async function tryConsumePickMessage(ctx, msg) {
         summary: "Tipp von Nicht-Mitglied des Announce-Kanals abgelehnt.",
         userId: msg.author.id,
       });
+    } else if (part.reason === "unavailable") {
+      // F16: Discord-Mitgliedschaft gerade nicht abrufbar (429/Timeout). Nicht
+      // als „kein Mitglied“ werten, aber auch nichts speichern — sonst fräße die
+      // Störung die Namen-Paste. Kurz antworten und die Nachricht verbrauchen,
+      // damit der Prefix-Parser sie nicht weiter anfasst.
+      await msg.author
+        .send(
+          "Discord ist gerade nicht erreichbar (Mitgliedschafts-Check klappt nicht). Schick deine Namen gleich noch einmal — nichts ist verloren gegangen."
+        )
+        .catch(() => {});
+      return true;
     }
     return false;
   }
