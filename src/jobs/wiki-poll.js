@@ -477,6 +477,20 @@ async function runWikiPollInner(client, config, { mode = "live" } = {}) {
     await processRetractions(client, config, poolEntries);
   }
 
+  // M2+: Pre-Start-Todeswarnungen für announced-Picks (bis Saisonstart).
+  // Nach jeder Deathpool-Verarbeitung, damit frisch entdeckte(e) Tode dem
+  // Einreicher sofort per DM gemeldet werden — unabhängig vom Poll-Modus.
+  let warned = 0;
+  try {
+    const { warnAnnouncedPreStartDeaths } = require("../discord/pick-assistant");
+    warned = await warnAnnouncedPreStartDeaths({ client, config });
+    if (warned) {
+      console.log(new Date().toISOString(), `[poll] pre-start death warnings sent: ${warned}`);
+    }
+  } catch (e) {
+    console.warn("[poll] pre-start death warn failed", e.message);
+  }
+
   return {
     hits,
     seeded: false,

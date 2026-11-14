@@ -1,0 +1,487 @@
+const { EmbedBuilder } = require("discord.js");
+const db = require("../db");
+const { pickPhrase } = require("../phrases");
+const { fetchBestImage } = require("../wiki/page-image");
+const {
+  fetchDeathBrief,
+  resolveDeathImage,
+  personNameFromText,
+  normalizeName,
+  parseDeathDateText,
+  stripTrailingDeathDate,
+} = require("../wiki/death-brief");
+
+function emojiBanner(config) {
+  return Array(config.alertEmojiRepeat).fill(config.alertEmoji).join(" ");
+}
+
+/** Format "8. Oktober 2026" from entry.{day,month,year} — month from entry or now. */
+function formatDeathDate(entry) {
+  if (!entry || entry.day == null) return null;
+  const month = entry.month != null ? entry.month : new Date().getMonth();
+  const year = entry.year || new Date().getFullYear();
+  const MONTHS_DE = [
+    "Januar", "Februar", "März", "April", "Mai", "Juni",
+    "Juli", "August", "September", "Oktober", "November", "Dezember",
+  ];
+  return `${entry.day}. ${MONTHS_DE[month] || ""} ${year}`;
+}
+
+/**
+ * Apply death + optional public announce.
+ * Uses age_at_pick for scoring (100 - age), not wiki age.
+ */
+async function processDeathpoolHit(
+  client,
+  config,
+  { celeb, entry, wikiAge },
+  { announce = true, confirmed = false, source = "wiki" } = {}
+) {
+  const result = db.applyDeath(celeb.id, {
+    confirmed,
+    source,
+    diedAt: new Date().toISOString().slice(0, 10),
+    wikiUrl: entry?.url || null,
+  });
+
+  if (!announce) return result;
+
+  const channel = await client.channels.fetch(config.channelDeathpool).catch(() => null);
+  if (!channel?.isTextBased()) {
+    console.error("[announce] deathpool channel missing");
+    return result;
+  }
+
+  const { awards, score, age } = result;
+  const winnerNames = awards.map((a) => a.player.display_name);
+  const scoreLines = awards.map(
+    (a) =>
+      `<@${a.player.discord_user_id}> **+${a.points}** (Gesamt **${a.total}**)`
+  );
+
+  const roast = pickPhrase(config, db, {
+    name: celeb.name,
+    age,
+    score,
+    winners: winnerNames.length ? winnerNames.join(", ") : "niemand",
+  });
+
+  const image =
+    (await fetchBestImage(
+      celeb.wiki_url || (entry?.lang === "en" ? entry.url : null),
+      celeb.wiki_url_de || (entry?.lang === "de" ? entry.url : null) || entry?.url,
+      config.userAgent
+    )) || null;
+
+  const ageLine =
+    age != null
+      ? `Alter (Pool-Start): **${age}** → Punkte **${score}** (=100−Alter)`
+      : "Alter unbekannt → 0 Punkte";
+  const wikiAgeLine =
+    wikiAge != null && wikiAge !== age ? `Alter (Wiki-Text): ${wikiAge}` : null;
+
+  const embed = new EmbedBuilder()
+    .setColor(0x1a1a1a)
+    .setTitle(`${celeb.name} ist tot`)
+    .setDescription(roast)
+    .addFields(
+      {
+        name: "Details",
+        value: [ageLine, wikiAgeLine, entry?.url ? `[Wikipedia](${entry.url})` : null]
+          .filter(Boolean)
+          .join("\n"),
+      },
+      {
+        name: "Deathpool",
+        value: scoreLines.length
+          ? scoreLines.join("\n")
+          : "_Niemand hatte diesen Pick._",
+      }
+    )
+    .setTimestamp(new Date());
+
+  // Thumbnail sits beside the text (Discord layout); full-width setImage is too large
+  if (image) embed.setThumbnail(image);
+
+  await channel.send({
+    content: `${emojiBanner(config)} **Deathpool-Treffer**`,
+    embeds: [embed],
+    allowedMentions: {
+      parse: [],
+      users: awards.map((a) => a.player.discord_user_id),
+    },
+  });
+
+  return result;
+}
+
+async function announceRetraction(client, config, { celeb, awards }) {
+  const channel = await client.channels.fetch(config.channelDeathpool).catch(() => null);
+  if (!channel?.isTextBased()) return;
+
+  const lines = awards.map((a) => {
+    const player = db.getDb().prepare("SELECT * FROM players WHERE id = ?").get(a.player_id);
+    const total = player ? db.playerTotal(player.id) : "?";
+    return player
+      ? `<@${player.discord_user_id}> **−${a.points}** (Gesamt **${total}**)`
+      : `player ${a.player_id} −${a.points}`;
+  });
+
+  await channel.send({
+    content: [
+      `↩️ **Rücknahme** — ${celeb.name} steht nicht mehr (zuverlässig) auf den Wiki-Todeslisten.`,
+      `Innerhalb von ${config.deathConfirmDays} Tagen widerrufen. Punkte zurückgebucht:`,
+      lines.length ? lines.join("\n") : "_keine Punkte_",
+    ].join("\n"),
+    allowedMentions: {
+      parse: [],
+      users: awards
+        .map((a) => db.getDb().prepare("SELECT discord_user_id FROM players WHERE id = ?").get(a.player_id)?.discord_user_id)
+        .filter(Boolean),
+    },
+  });
+}
+
+async function announceAllDeath(client, config, entry, { isDeOnly = false, brief: preBrief = null } = {}) {
+  if (!config.channelAllDeaths) return;
+  const channel = await client.channels.fetch(config.channelAllDeaths).catch(() => null);
+  if (!channel?.isTextBased()) return;
+
+  // redName: the person has no own article — pageUrl only produced the image.
+  // The card is built from the death-list entry; description shows the beruf
+  // (the most useful line we have) and Kurzinfo must not repeat it.
+  const redName = !!(entry && entry.redName);
+
+  // M2: ein bereits im Poll aufgelöster brief (qid, isHuman, pageMissing) wird
+  // wiederverwendet statt doppelt gefetcht zu werden. Sonst wie bisher.
+  const brief =
+    preBrief ||
+    (await fetchDeathBrief(entry.url, config.userAgent, {
+      listText: entry.text,
+      beruf: entry.beruf || null,
+      redName: !!entry.redName,
+    }));
+
+  // If the linked article is NOT a person (band/org, e.g. "Died Pretty" for
+  // Chris Welsh), keep the human name from the death-list line as card title.
+  const listName = personNameFromText(entry.text);
+  const name =
+    brief.isHuman === false && listName
+      ? listName
+      : brief.name || listName;
+
+  const detailLines = [];
+  // Death date always goes into the Kurzinfo: use the scraped day/month/year
+  // flags first, else parse the death-line text itself ("…, 8. Oktober") with
+  // the page-URL year as default.
+  const textDate = parseDeathDateText(entry.text);
+  const deathDateStr =
+    formatDeathDate(entry) ||
+    (textDate ? formatDeathDate({ year: entry.year, ...textDate }) : null);
+  if (deathDateStr) detailLines.push(`Gestorben: **${deathDateStr}**`);
+  if (brief.lifespan || brief.age != null) {
+    detailLines.push(
+      [
+        brief.lifespan,
+        brief.age != null ? `gestorben mit **${brief.age}**` : null,
+      ]
+        .filter(Boolean)
+        .join(" · ")
+    );
+  } else if (brief.age != null) {
+    detailLines.push(`Alter: **${brief.age}**`);
+  }
+  if (brief.knownFor && !(redName && !brief.summary)) {
+    detailLines.push(`Bekannt für: ${brief.knownFor}`);
+  }
+
+  // Death-list blurb minus leading "Name, age," — extra context (country, role).
+  // Strip the death-line name first: the article title (card name) can differ.
+  let listNote = null;
+  if (entry.text) {
+    let rest = String(entry.text)
+      .replace(/\[\d+\]/g, "")
+      .replace(/[\u200b-\u200f\u00ad\ufeff]/g, "")
+      .trim();
+    for (const n of [listName, name]) {
+      if (!n) continue;
+      // listName has trailing artifacts (†, ", orphan diacritics) removed
+      const nameRe = new RegExp(
+        `^\\s*${n.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}[\\u0300-\\u036f*†‡"'+]*\\s*`,
+        "i"
+      );
+      if (nameRe.test(rest)) {
+        rest = rest.replace(nameRe, "");
+        break;
+      }
+    }
+    rest = rest.replace(/^[,:\-–]\s*/, "");
+    rest = rest.replace(/^\(?\s*\d{2,3}\s*\)?\s*[,;]?\s*/, "").trim();
+    // The Gestorben line already shows the date: no trailing "…, 8. Oktober".
+    if (deathDateStr) rest = stripTrailingDeathDate(rest);
+    const sameAs = (s) => rest.toLowerCase() === String(s || "").toLowerCase();
+    if (rest.length >= 12 && !sameAs(brief.summary) && !sameAs(brief.knownFor)) {
+      listNote = rest.length > 220 ? rest.slice(0, 219).trim() + "…" : rest;
+    }
+  }
+
+  const description =
+    brief.summary ||
+    (redName ? brief.knownFor : null) ||
+    listNote ||
+    "_Neuer Eintrag auf der Wikipedia-Todesliste._";
+
+  // F05: Das Link-Feld zeigt NUR auf eine Personen-Seite (isHuman + Seite
+  // vorhanden). Band-/Org-/Sammelseiten und fehlende Artikel erscheinen dort
+  // nie — stattdessen die Listen-URL oder ein Hinweis.
+  let linkValue;
+  if (brief.isHuman === true && !brief.pageMissing) {
+    linkValue = `[Wikipedia](${brief.url || entry.url})`;
+  } else if (entry.listUrl) {
+    linkValue = `[Wikipedia-Liste](${entry.listUrl})`;
+  } else if (brief.pageMissing) {
+    linkValue = "Kein eigener Wikipedia-Artikel";
+  } else {
+    linkValue = `[Wikipedia](${brief.url || entry.url})`;
+  }
+  const embed = new EmbedBuilder()
+    .setColor(isDeOnly ? 0x3d4f5c : 0x2b3a42)
+    .setTitle(isDeOnly ? `🇩🇪 ${name}` : `🌍 ${name}`)
+    .setDescription(description)
+    .addFields(
+      ...(detailLines.length
+        ? [{ name: "Kurzinfo", value: detailLines.join("\n").slice(0, 1000) }]
+        : []),
+      ...(listNote && listNote !== description
+        ? [{ name: "Wikipedia-Liste", value: listNote.slice(0, 1000) }]
+        : []),
+      {
+        name: "Link",
+        value: linkValue,
+      }
+    )
+    .setTimestamp(new Date());
+
+  const image = await resolveDeathImage(brief, entry, config.userAgent);
+  if (image) embed.setThumbnail(image);
+
+  await channel.send({
+    embeds: [embed],
+    allowedMentions: { parse: [] },
+  });
+
+  try {
+    const { recordAllDeathAnnounce } = require("./presence");
+    await recordAllDeathAnnounce(client, config, db);
+  } catch (e) {
+    console.warn("[presence] update failed", e.message);
+  }
+}
+
+async function announceDailySummary(client, config) {
+  if (!db.isLive()) return;
+
+  const targetId = config.channelAllDeaths || config.channelDeathpool;
+  const channel = await client.channels.fetch(targetId).catch(() => null);
+  if (!channel?.isTextBased()) return;
+
+  const rows = db.deathsSinceHours(26);
+  if (!rows.length) {
+    await channel.send({
+      content: "📋 **Tagesbericht** — Seit gestern: keine neuen Tode. Langweilig.",
+      allowedMentions: { parse: [] },
+    });
+    return;
+  }
+
+  // Jede Person genau 1×: EN zuerst, DE nur wenn keine EN-Variante vorliegt.
+  // Namen werden bereinigt (Sonderzeichen am Ende) + akzent-insensitiv
+  // normalisiert, damit EN- und DE-Artikel derselben Person (z.B. Verne
+  // Allison) nicht doppelt auftauchen.
+  const listName = (e) => personNameFromText(e.name) || e.entry_id;
+  const normName = (e) => normalizeName(listName(e));
+  const en = [];
+  const enSeen = new Set();
+  for (const r of rows) {
+    if (r.lang !== "en") continue;
+    const k = normName(r);
+    if (enSeen.has(k)) continue;
+    enSeen.add(k);
+    en.push(r);
+  }
+  const deOnly = [];
+  const deSeen = new Set();
+  for (const r of rows) {
+    if (r.lang === "en") continue;
+    const k = normName(r);
+    if (enSeen.has(k)) continue; // EN-Variante existiert → DE weglassen
+    if (deSeen.has(k)) continue; // gleiche DE-Variante schon drin
+    deSeen.add(k);
+    deOnly.push(r);
+  }
+  const uniqueTotal = en.length + deOnly.length;
+  // URLs in <> suppress Discord's link preview/embed on every summary line.
+  const link = (e) => `[${listName(e)}](<${e.url}>)`;
+
+  // Assemble the summary as FULL LINES. Discord's hard cap is 2000 chars;
+  // we cut only at line boundaries so a markdown link is never left open
+  // mid-URL (previously slice(0,1900) severed the last line, which read as
+  // a stray symbol at the end of the report).
+  const lines = [];
+  lines.push(`📋 **Tagesbericht** — ${uniqueTotal} neue Einträge seit gestern`);
+  if (en.length) {
+    lines.push("");
+    lines.push("🌍 **International:**");
+    en.slice(0, 20).forEach((e) => lines.push(`• ${link(e)}`));
+    if (en.length > 20) lines.push(`… +${en.length - 20}`);
+  }
+  if (deOnly.length) {
+    lines.push("");
+    lines.push("🇩🇪 **Nur DE / Regional:**");
+    deOnly.slice(0, 15).forEach((e) => lines.push(`• ${link(e)}`));
+    if (deOnly.length > 15) lines.push(`… +${deOnly.length - 15}`);
+  }
+
+  const MAX = 1900;
+  let body = "";
+  let omitted = 0;
+  for (let i = 0; i < lines.length; i++) {
+    const next = body === "" ? lines[i] : `${body}\n${lines[i]}`;
+    if (next.length > MAX) {
+      for (let j = i; j < lines.length; j++) {
+        if (lines[j].startsWith("• ")) omitted++;
+      }
+      break;
+    }
+    body = next;
+  }
+  if (omitted > 0) {
+    body += `\n\n… +${omitted} Einträge ausgeblendet (Zeichenlimit)`;
+  }
+
+  await channel.send({
+    content: body,
+    allowedMentions: { parse: [] },
+  });
+}
+
+function formatReconcileSummary(hits, season) {
+  const lines = [
+    `📋 **Reconcile** (setup / pre-live — no channel announcements)`,
+    `Season start: **${season.start_date || "?"}** | Live: **${season.live ? "yes" : "no"}**`,
+    `Newly marked dead: **${hits.length}**`,
+    "",
+  ];
+  const mismatches = [];
+  for (const h of hits.slice(0, 40)) {
+    const awardStr = h.result.awards
+      .map((a) => `${a.player.display_name} +${a.points}`)
+      .join(", ");
+    lines.push(
+      `💀 **${h.celeb.name}** — pool age ${h.result.age ?? "?"} → ${h.result.score} pts` +
+        (h.wikiAge != null ? ` (wiki age ${h.wikiAge})` : "") +
+        (awardStr ? ` | ${awardStr}` : " | nobody")
+    );
+    if (
+      h.wikiAge != null &&
+      h.result.age != null &&
+      Math.abs(Number(h.wikiAge) - Number(h.result.age)) >= 3
+    ) {
+      mismatches.push(`${h.celeb.name}: pool ${h.result.age} vs wiki ${h.wikiAge}`);
+    }
+  }
+  if (hits.length > 40) lines.push(`… +${hits.length - 40}`);
+  if (mismatches.length) {
+    lines.push("", "⚠️ Large pool-age vs wiki-age gaps:");
+    mismatches.slice(0, 15).forEach((m) => lines.push(`• ${m}`));
+  }
+  lines.push("", "Next: `/scores`, then `/go` if not already live.");
+  return lines.join("\n").slice(0, 1900);
+}
+
+async function announceSimulatedDeath(
+  client,
+  config,
+  {
+    name,
+    age,
+    url,
+    urlDe = null,
+    inPool = false,
+    alreadyDead = false,
+    winners = [],
+  } = {}
+) {
+  const channel = await client.channels.fetch(config.channelDeathpool).catch(() => null);
+  if (!channel?.isTextBased()) {
+    console.error("[announce] deathpool channel missing");
+    return;
+  }
+
+  const score = age != null ? db.scoreForAge(age) : 0;
+  const winnerNames = (winners || []).map((w) => w.displayName).filter(Boolean);
+  const roast = pickPhrase(config, db, {
+    name,
+    age,
+    score: score || "—",
+    winners: winnerNames.length ? winnerNames.join(", ") : "niemand",
+  });
+
+  const ageLine =
+    age != null
+      ? `Alter (Pool-Start): **${age}** → Punkte **${score}** (=100−Alter)`
+      : "Alter unbekannt → 0 Punkte";
+
+  // Names only — never <@id> (no pings in simulation)
+  let deathpoolValue;
+  if (!inPool) {
+    deathpoolValue = "_Simulation — nicht im Deathpool (keine Punkte)._";
+  } else if (alreadyDead) {
+    deathpoolValue = "_Schon tot markiert — Simulation vergibt nichts._";
+  } else if (winnerNames.length) {
+    deathpoolValue = winnerNames.map((n) => `**${n}** +${score} _(Simulation)_`).join("\n");
+  } else {
+    deathpoolValue = "_Niemand hatte diesen Pick._";
+  }
+
+  const embed = new EmbedBuilder()
+    .setColor(0x4a0000)
+    .setTitle(`${name} ist tot`)
+    .setDescription(roast)
+    .addFields(
+      {
+        name: "Details",
+        value: [ageLine, url ? `[Wikipedia](${url})` : null].filter(Boolean).join("\n"),
+      },
+      {
+        name: "Deathpool",
+        value: deathpoolValue,
+      }
+    )
+    .setTimestamp(new Date());
+
+  const enUrl = url && /en\.wikipedia/i.test(url) ? url : null;
+  const deUrl =
+    urlDe || (url && /de\.wikipedia/i.test(url) ? url : null) || (!enUrl ? url : null);
+  const image = await fetchBestImage(enUrl || url, deUrl, config.userAgent);
+  if (image) embed.setThumbnail(image);
+
+  await channel.send({
+    content: `${emojiBanner(config)} **Simulation** (kein DB-Write · keine Pings)`,
+    embeds: [embed],
+    // Explicitly empty — do not ping even if a phrase somehow contains an id
+    allowedMentions: { parse: [], users: [], roles: [] },
+  });
+}
+
+module.exports = {
+  processDeathpoolHit,
+  announceRetraction,
+  announceAllDeath,
+  announceDailySummary,
+  announceSimulatedDeath,
+  formatReconcileSummary,
+  // back-compat alias
+  announceDeathpool: (client, config, m) =>
+    processDeathpoolHit(client, config, { ...m, wikiAge: m.age }, { announce: true, confirmed: false }),
+};

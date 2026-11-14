@@ -22,6 +22,7 @@ const { logEvent } = require("./log");
 const DONE_RE = /^(fertig|done|end|liste fertig)$/i;
 const REMOVE_RE = /^entfern\w*\s+(\d+)$/i;
 const CHANGE_RE = /^(?:änder|aendere|ändere|change)\s+(\d+)\s+(.+)$/i;
+const UNLOCK_RE = /^(unlock|entsperren|oeffnen|öffnen)$/i;
 
 /** In-Memory-Queue: ein Wiki-Auflösungs-Lauf pro User, nicht parallel. */
 const busyUsers = new Set();
@@ -35,21 +36,26 @@ function classifyProposal(proposal) {
   return { linkStatus: "linked" };
 }
 
-function draftEmbed(entries, season) {
+function draftEmbed(entries, season, draftStatus = "draft") {
   const lines = entries.length
     ? entries.map((e, i) => {
         const link = e.wiki_url ? `[Wiki](${e.wiki_url})` : "ohne Artikel";
         const age = e.proposed_age != null ? ` · Alter ${e.proposed_age}` : "";
-        return `${i + 1}. **${e.raw_name}** — ${link}${age}${e.link_status === "ambiguous" ? " ⚠️" : ""}`;
+        const dead = e.is_alive === 0 ? " · ☠️ vor Start gestorben" : "";
+        return `${i + 1}. **${e.raw_name}** — ${link}${age}${e.link_status === "ambiguous" ? " ⚠️" : ""}${dead}`;
       })
     : ["_(noch keine Namen)_"];
   const embed = new EmbedBuilder()
-    .setColor(0x222a33)
+    .setColor(draftStatus === "finalized" ? 0x1f8b4c : 0x222a33)
     .setTitle(`Deine Tipps für Saison ${season?.year || "?"} (Start ${season?.start_date || "?"})`)
     .setDescription(
       [
-        "Schick Namen einzeln oder als Liste (eine Zeile / Semikolon / Strich).",
-        "`entfernen 3` · `ändern 3 Neuer Name` · `fertig`/`done`, wenn die Liste passt.",
+        draftStatus === "finalized"
+          ? "🔒 **Liste eingefroren** — Personen, die vor dem Saisonstart sterben, werden dir hier gemeldet; mit `unlock` kannst du bis zum Start jederzeit ändern."
+          : "Schick Namen einzeln oder als Liste (eine Zeile / Semikolon / Strich).",
+        draftStatus === "finalized"
+          ? "`unlock` (bearbeiten) · `fertig` war schon"
+          : "`entfernen 3` · `ändern 3 Neuer Name` · `fertig`/`done`, wenn die Liste passt.",
         "",
         ...lines,
       ].join("\n")
@@ -83,7 +89,7 @@ function buildPickSelect(entries) {
 }
 
 async function respondPick(ctx, channel, userId, season, extra = []) {
-  const player = db
+  let player = db
     .getDb()
     .prepare("SELECT * FROM players WHERE discord_user_id = ?")
     .get(String(userId));
@@ -94,8 +100,8 @@ async function respondPick(ctx, channel, userId, season, extra = []) {
     player = db.getDb().prepare("SELECT * FROM players WHERE id = ?").get(info.lastInsertRowid);
   }
   const draft = db.getOrCreateDraft(player.id, season.id);
-  const entries = db.listDraftEntries(draft.id);
-  const payload = { embeds: [draftEmbed(entries, season)] };
+  const entries = draft.status === "finalized" ? enrichDeadFlags(listDraftEntriesForFinalized(player.id, season.id)) : db.listDraftEntries(draft.id);
+  const payload = { embeds: [draftEmbed(entries, season, draft.status)] };
   const select = buildPickSelect(entries);
   if (select) payload.components = [select];
   if (channel.send) {
@@ -103,6 +109,25 @@ async function respondPick(ctx, channel, userId, season, extra = []) {
   } else if (channel.reply) {
     await channel.reply(payload);
   }
+}
+
+/** Finalisierte Liste: die angelegten picks (inkl. Sterbe-Status) anzeigen. */
+function listDraftEntriesForFinalized(playerId, seasonId) {
+  return db.getAnnouncedSeasonPicksForPlayer(playerId, seasonId).map((p) => ({
+    id: p.celeb_id,
+    raw_name: p.celeb_name,
+    wiki_url: p.wiki_url,
+    is_alive: p.is_alive,
+    link_status: "linked",
+    position: p.id,
+  }));
+}
+
+function enrichDeadFlags(entries) {
+  return entries.map((e) => ({
+    ...e,
+    isAlive: e.is_alive,
+  }));
 }
 
 /** Kandidaten-Auswahl aus einem pka:pick-Select verarbeiten. */
@@ -190,6 +215,40 @@ async function tryConsumePickMessage(ctx, msg) {
   const body = msg.content.trim();
 
   // feste Kommandos
+  if (UNLOCK_RE.test(body)) {
+    const player = db
+      .getDb()
+      .prepare("SELECT * FROM players WHERE discord_user_id = ?")
+      .get(String(msg.author.id));
+    if (!player) {
+      await msg.reply("Noch keine Liste angelegt.");
+      return true;
+    }
+    const draft = db.getDraftForPlayer(player.id, season.id);
+    if (draft?.status !== "finalized") {
+      await msg.reply("Deine Liste ist nicht eingefroren — du kannst sie jederzeit direkt bearbeiten.");
+      return true;
+    }
+    const res = db.unlockDraftForPlayer(player.id, season.id);
+    if (res.unlocked) {
+      await logEvent(ctx.client, ctx.config, {
+        kind: "pick-unlock",
+        summary: `Draft entsperrt (Saison ${season.year})`,
+        userId: msg.author.id,
+      });
+      await msg.reply(
+        [
+          `🔓 Deine Liste für **${season.year}** ist wieder offen.`,
+          "Du kannst Namen ändern/entfernen/hinzufügen und mit `fertig` erneut einfrieren.",
+        ].join("\n")
+      );
+      await respondPick(ctx, msg.channel, msg.author.id, season);
+    } else {
+      await msg.reply("Entsperren fehlgeschlagen (" + res.error + ").");
+    }
+    return true;
+  }
+
   if (DONE_RE.test(body)) {
     const player = db
       .getDb()
@@ -379,4 +438,54 @@ async function resolvePendingSynchronous(ctx, channel, userId, season, draftId, 
   }
 }
 
-module.exports = { tryConsumePickMessage, handlePickInteraction, respondPick, buildPickSelect, classifyProposal };
+/**
+ * Pre-Start-Todeswarnungen versenden: findet ungewarnete announced-Picks,
+ * deren Celeb vor dem Saisonstart gestorben ist, und kontaktiert den Einreicher
+ * per DM einmalig. Aufruf nach jeder Deathpool-/Retractions-Verarbeitung, solange
+ * die announced-Saison noch live=0 ist.
+ */
+async function warnAnnouncedPreStartDeaths(ctx) {
+  const season = db.getAnnouncedSeason();
+  if (!season || season.live !== 0) return 0;
+  const rows = db.getAnnouncedPreStartDeathsUnwarned(season.id);
+  if (!rows.length) return 0;
+  let sent = 0;
+  for (const r of rows) {
+    try {
+      if (r.user_discord_id) {
+        try {
+          const user = await ctx.client.users.fetch(r.user_discord_id);
+          await user.send(
+            [
+              `⚠️ **${r.celeb_name}** — einer deiner Tipps für Saison **${season.year}** ist **vor dem Saisonstart gestorben** (${r.celeb_died_at || "Todesdatum unklar"}).`,
+              `Schreib mir \`unlock\`, ersetze den Namen und frier die Liste wieder ein — bis zum Start (${season.start_date || "Saisonstart"}) ist das jederzeit möglich.`,
+            ].join("\n")
+          );
+          sent++;
+        } catch (e) {
+          console.warn("[pick] death-warn DM failed", r.celeb_name, e.message);
+        }
+      }
+      db.markAnnouncedDeathWarned(season.id, r.player_id, r.celeb_id);
+    } catch (e) {
+      console.warn("[pick] death-warn row failed", r.celeb_name, e.message);
+    }
+  }
+  if (rows.length) {
+    const { logEvent } = require("./log");
+    await logEvent(ctx.client, ctx.config, {
+      kind: "pick-death-warn",
+      summary: `${rows.length} Pre-Start-Tode an Tipp-Einreicher gemeldet (Saison ${season.year})`,
+    });
+  }
+  return sent;
+}
+
+module.exports = {
+  tryConsumePickMessage,
+  handlePickInteraction,
+  respondPick,
+  buildPickSelect,
+  classifyProposal,
+  warnAnnouncedPreStartDeaths,
+};

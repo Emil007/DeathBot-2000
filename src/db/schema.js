@@ -77,6 +77,19 @@ CREATE TABLE IF NOT EXISTS picks (
   FOREIGN KEY (season_id) REFERENCES seasons(id) ON DELETE CASCADE
 );
 
+-- Pre-Start-Todeswarnung für announced-Picks: pro (Saison, Celeb, Player) genau
+-- einmal melden, damit der 2027er-Selbstbedienungs-Flow nie doppelt stört.
+CREATE TABLE IF NOT EXISTS pick_death_warnings (
+  season_id INTEGER NOT NULL,
+  player_id INTEGER NOT NULL,
+  celeb_id INTEGER NOT NULL,
+  warned_at TEXT NOT NULL DEFAULT (datetime('now')),
+  PRIMARY KEY (season_id, player_id, celeb_id),
+  FOREIGN KEY (season_id) REFERENCES seasons(id) ON DELETE CASCADE,
+  FOREIGN KEY (player_id) REFERENCES players(id) ON DELETE CASCADE,
+  FOREIGN KEY (celeb_id) REFERENCES celebs(id) ON DELETE CASCADE
+);
+
 CREATE TABLE IF NOT EXISTS celeb_aka (
   celeb_id INTEGER NOT NULL,
   alias TEXT NOT NULL,

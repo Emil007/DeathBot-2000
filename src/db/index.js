@@ -865,6 +865,17 @@ function addDraftNames(draftId, names) {
   return pos - maxPos;
 }
 
+/** Maximale Namen in einem Draft (Karte selbst, 25 eingebettete Felder -> Sicherheit). */
+const MAX_DRAFT_NAME_CHARS = 600;
+
+/** Maximale Gesamtlänge aller rohen Namen (Discord-Limit + UI-Handling). */
+function draftCharBudget(draftId) {
+  const row = db
+    .prepare("SELECT COALESCE(SUM(LENGTH(raw_name)), 0) AS total FROM pick_draft_entries WHERE draft_id = ?")
+    .get(draftId);
+  return row ? row.total : 0;
+}
+
 function removeDraftEntry(entryId) {
   const info = db.prepare("DELETE FROM pick_draft_entries WHERE id = ?").run(entryId);
   return info.changes > 0;
@@ -968,6 +979,65 @@ function finalizeDraft(playerId, seasonId) {
       .run(draft.id);
     return { reviewIds: [...new Set(reviewIds)], added };
   })();
+}
+
+function unlockDraftForPlayer(playerId, seasonId) {
+  assertAnnouncedSeason(seasonId);
+  return db.transaction(() => {
+    const draft = db
+      .prepare("SELECT * FROM pick_drafts WHERE player_id = ? AND season_id = ?")
+      .get(playerId, seasonId);
+    if (!draft) return { error: "no-draft" };
+    if (draft.status !== "finalized") return { error: "not-locked" };
+    db.prepare(
+      `UPDATE pick_drafts SET status = 'draft', updated_at = datetime('now') WHERE id = ?`
+    ).run(draft.id);
+    clearPicksForPlayer(playerId, seasonId);
+    return { unlocked: true };
+  })();
+}
+
+function getAnnouncedSeasonPicksForPlayer(playerId, seasonId) {
+  return db
+    .prepare(
+      `SELECT pk.*, c.name AS celeb_name, c.wiki_url, c.is_alive, c.died_at
+       FROM picks pk JOIN celebs c ON c.id = pk.celeb_id
+       WHERE pk.player_id = ? AND pk.season_id = ?
+       ORDER BY c.name COLLATE NOCASE`
+    )
+    .all(playerId, seasonId);
+}
+
+/**
+ * Ungewarnete Pre-Start-Tode in announced-Picks: Celebs, die vor dem
+ * Saisonstart gestorben sind, aber noch NICHT in pick_death_warnings stehen.
+ * Liefert Zeilen für den DM-Versand in announced Season (live=0).
+ */
+function getAnnouncedPreStartDeathsUnwarned(seasonId) {
+  const season = db.prepare("SELECT * FROM seasons WHERE id = ?").get(seasonId);
+  if (!season || season.live !== 0) return [];
+  return db
+    .prepare(
+      `SELECT pk.player_id, pk.celeb_id, c.name AS celeb_name, c.died_at AS celeb_died_at,
+              u.discord_user_id AS user_discord_id, w.season_id AS warned_season
+       FROM picks pk
+       JOIN celebs c ON c.id = pk.celeb_id
+       LEFT JOIN players u ON u.id = pk.player_id
+       LEFT JOIN pick_death_warnings w
+         ON w.season_id = pk.season_id AND w.player_id = pk.player_id AND w.celeb_id = pk.celeb_id
+       WHERE pk.season_id = ?
+         AND c.is_alive = 0
+         AND (c.died_at IS NULL OR c.died_at <= ?)
+         AND w.season_id IS NULL`
+    )
+    .all(seasonId, season.start_date);
+}
+
+function markAnnouncedDeathWarned(seasonId, playerId, celebId) {
+  db.prepare(
+    `INSERT OR IGNORE INTO pick_death_warnings (season_id, player_id, celeb_id)
+     VALUES (?, ?, ?)`
+  ).run(seasonId, playerId, celebId);
 }
 
 function getAliveCelebsForAuto() {
@@ -1593,6 +1663,10 @@ module.exports = {
   getDraftForPlayer,
   linkCelebForAnnouncedSeason,
   finalizeDraft,
+  unlockDraftForPlayer,
+  getAnnouncedSeasonPicksForPlayer,
+  getAnnouncedPreStartDeathsUnwarned,
+  markAnnouncedDeathWarned,
   setPickAgeAtPick,
   celebHasRunningPick,
   nameKey,

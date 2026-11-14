@@ -36,7 +36,7 @@ function splitBySeparators(text) {
 }
 
 /**
- * @returns {{ names: string[], error?: string, duplicates: string[] }}
+ * @returns {{ names: string[], error?: string, duplicates: string[], truncated?: boolean }}
  */
 function parsePickList(text) {
   if (!text || !String(text).trim()) {
@@ -46,12 +46,21 @@ function parsePickList(text) {
   const names = [];
   const duplicates = [];
   const seen = new Set();
+  const MAX_NAMES = 30;
+  const MAX_TOTAL_CHARS = 600;
+  let totalChars = 0;
   for (const t of tokens) {
     const k = nameKey(t);
     if (!k) continue;
     if (seen.has(k)) {
       duplicates.push(t);
       continue;
+    }
+    totalChars += t.length;
+    // Harte Budgets: übermäßige Pasts kappen, damit Embed + Wiki-Auflösung
+    // stabil bleiben (und ein Upsert nicht lächerlich groß wird).
+    if (totalChars > MAX_TOTAL_CHARS || names.length >= MAX_NAMES) {
+      return { names, duplicates, truncated: true };
     }
     seen.add(k);
     names.push(t);
