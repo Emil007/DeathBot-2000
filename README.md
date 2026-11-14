@@ -116,6 +116,7 @@ Non-admins may **see** admin slash commands in Discord’s picker (Discord limit
 | `DEATH_CONFIRM_DAYS` | Days before a hit is locked (`7`) |
 | `CHANNEL_ALL_DEATHS` | Optional factual feed |
 | `CHANNEL_ADMIN` | Optional ops channel; empty = DM-first |
+| `CHANNEL_LOG` | Optional log channel for inputs/changes/errors (no scan-run logs) |
 | `CUSTOM_PHRASES` | `no` / `mix` / `only` (+ `data/custom_phrases.txt`) |
 | `TZ` | Cron + “killed today” status day boundary |
 

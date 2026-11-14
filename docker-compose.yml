@@ -18,6 +18,10 @@ services:
       # Optional admin ops channel (wiki/age review + long admin summaries). Empty = DM-first:
       # CHANNEL_ADMIN: "PUT_ADMIN_CHANNEL_ID_HERE"
       CHANNEL_ADMIN: ""
+      # Optional log channel: inputs, changes and errors incl. technical details.
+      # NOTE: wiki scan runs are NEVER logged here (owner rule). Empty = disabled:
+      # CHANNEL_LOG: "PUT_LOG_CHANNEL_ID_HERE"
+      CHANNEL_LOG: ""
       # Optional: documented only — Discord cannot hide slash cmds by ADMIN_ID alone
       # ADMIN_ROLE_ID: ""
       WIKI_POLLER_MINUTES: "30"

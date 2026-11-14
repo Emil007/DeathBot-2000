@@ -178,7 +178,7 @@ function pruneBackups(config, { keep = 14 } = {}) {
   return { kept: files.slice(0, keep).map((f) => f.name), removed };
 }
 
-function startAutoBackup(config) {
+function startAutoBackup(config, client) {
   // Nightly backup (local TZ from process / compose TZ)
   cron.schedule("0 2 * * *", () => {
     try {
@@ -189,8 +189,20 @@ function startAutoBackup(config) {
         pkg.name,
         `kept=${prune.kept.length} removed=${prune.removed.length}`
       );
+      // Nacht-Backup ist KEIN Wiki-Scan -> darf in den Logkanal.
+      if (client) {
+        const { logEvent } = require("../discord/log");
+        logEvent(client, config, {
+          kind: "backup",
+          summary: `Nacht-Backup: ${pkg.name} (kept=${prune.kept.length} removed=${prune.removed.length})`,
+        }).catch(() => {});
+      }
     } catch (e) {
       console.error("[backup] nightly failed", e.message);
+      if (client) {
+        const { logError } = require("../discord/log");
+        logError(client, config, e, { where: "nightly backup" }).catch(() => {});
+      }
     }
   });
   console.log("[backup] nightly scheduled at 02:00 (keep last 14)");

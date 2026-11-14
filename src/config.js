@@ -38,6 +38,7 @@ function loadConfig() {
     channelDeathpool: required("CHANNEL_DEATHPOOL"),
     channelAllDeaths: optional("CHANNEL_ALL_DEATHS", ""),
     channelAdmin: optional("CHANNEL_ADMIN", ""),
+    channelLog: optional("CHANNEL_LOG", ""),
     adminRoleId: optional("ADMIN_ROLE_ID", ""),
     wikiPollerMinutes: intEnv("WIKI_POLLER_MINUTES", 30),
     dailySummaryHour: intEnv("DAILY_SUMMARY_HOUR", 9),

@@ -11,3 +11,8 @@ data/custom_phrases.txt
 *.log
 .DS_Store
 review_feedback.md
+scratch/**/*.sqlite
+scratch/**/*.sqlite-*
+scratch/**/run.jsonl
+scratch/**/run-v2.jsonl
+scratch/**/result*.txt

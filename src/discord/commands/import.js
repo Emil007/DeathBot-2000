@@ -3,6 +3,7 @@ const db = require("../../db");
 const { parseSheetTable } = require("../import-sheet");
 const { queueCelebsForReview } = require("../celeb-review");
 const { usageReply } = require("../usage");
+const { logEvent } = require("../log");
 
 const pending = new Map();
 const DONE = /^(done|fertig|end)$/i;
@@ -132,6 +133,13 @@ async function finalize(ctx, msg, wait, text) {
       .filter(Boolean)
       .join("\n")
   );
+
+  await logEvent(ctx.client, ctx.config, {
+    kind: "import",
+    summary: `Admin-Import abgeschlossen → <@${wait.playerDiscordId}> (${wait.displayName})`,
+    userId: ctx?.adminId || ctx.config.adminId,
+    detail: `picks=${added} deadAwarded=${deadAwarded} review=${reviewIds.length} errors=${errors.length} season=${db.getActiveSeason().id}`,
+  });
 
   if (reviewIds.length) {
     const { resolveAdminTarget } = require("../admin-notify");

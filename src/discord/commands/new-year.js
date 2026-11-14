@@ -1,5 +1,6 @@
 const { createPackage } = require("../../backup");
 const db = require("../../db");
+const { logEvent } = require("../log");
 
 function parseDate(s) {
   if (!/^\d{4}-\d{2}-\d{2}$/.test(s)) return null;
@@ -94,6 +95,13 @@ const cmd = {
         "3. `/go` — Live ab jetzt (All-Deaths nur ab diesem Moment)",
       ].join("\n")
     );
+
+    await logEvent(ctx.client, ctx.config, {
+      kind: "new-year",
+      summary: `Neue Saison id ${newSeasonId} (Start ${startDate}) — alter Pool archived, Backup ${pkg.name}`,
+      userId: ctx.config.adminId,
+      detail: `oldSeason=${oldSeason.year} newSeason=${newSeasonId} wipe=yes`,
+    });
   },
 };
 

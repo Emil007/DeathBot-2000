@@ -1,0 +1,23 @@
+{
+  "name": "deathbot-2000",
+  "version": "1.0.0",
+  "description": "Gregg the Grim Reaper — Discord celebrity death pool bot",
+  "main": "src/index.js",
+  "scripts": {
+    "start": "node src/index.js",
+    "generate-phrases": "node scripts/generate-phrases.js",
+    "test": "node test/run.js",
+    "prune-junk": "node scripts/prune-junk-announcements.js"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "adm-zip": "^0.5.16",
+    "axios": "^1.7.9",
+    "better-sqlite3": "^12.11.1",
+    "cheerio": "^1.0.0",
+    "discord.js": "^14.16.3",
+    "node-cron": "^3.0.3"
+  }
+}

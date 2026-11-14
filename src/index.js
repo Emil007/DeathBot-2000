@@ -14,6 +14,7 @@ const {
   tryConsumeReviewUrl,
 } = require("./discord/celeb-review");
 const { fromInteraction } = require("./discord/msg-adapter");
+const { logEvent, logError } = require("./discord/log");
 const { registerSlashCommands } = require("./discord/slash");
 const { suggestCommands } = require("./discord/usage");
 const { startWikiPoller } = require("./jobs/wiki-poll");
@@ -58,7 +59,7 @@ async function main() {
     // Let the gateway settle before the heavy startup seed (avoids missed 3s slash acks)
     setTimeout(() => startWikiPoller(client, config), 1500);
     startDailySummary(client, config);
-    startAutoBackup(config);
+    startAutoBackup(config, client);
     startPresence(client, config, db);
   });
 
@@ -95,6 +96,10 @@ async function main() {
         return;
       }
       console.error("[interaction]", e);
+      await logError(client, config, e, {
+        where: `interaction ${interaction.commandName || interaction.customId || "?"}`,
+        userId: interaction.user?.id,
+      });
       const text = `Fehler: ${e.message}`;
       if (interaction.isRepliable()) {
         if (interaction.deferred || interaction.replied) {
@@ -113,12 +118,14 @@ async function main() {
       if (await tryConsumeReviewUrl(ctx, msg)) return;
     } catch (e) {
       console.error("[review url]", e);
+      await logError(client, config, e, { where: "tryConsumeReviewUrl", userId: msg.author?.id });
     }
 
     try {
       if (await importCmd.tryConsumePaste(ctx, msg)) return;
     } catch (e) {
       console.error("[import paste]", e);
+      await logError(client, config, e, { where: "tryConsumePaste", userId: msg.author?.id });
     }
 
     if (!msg.content.startsWith(config.prefix)) return;
@@ -151,6 +158,7 @@ async function main() {
       await runCommand(ctx, cmd, parts, msg);
     } catch (e) {
       console.error(`[cmd ${name}]`, e);
+      await logError(client, config, e, { where: `cmd ${name}`, userId: msg.author?.id });
       await msg.reply(`Fehler: ${e.message}`).catch(() => {});
     }
   });
