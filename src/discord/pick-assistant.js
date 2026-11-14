@@ -14,7 +14,7 @@ const {
 const db = require("../db");
 const { parsePickList } = require("./pick-parse");
 const { canParticipate } = require("./membership");
-const { proposeWikiForName } = require("../wiki/page-lookup");
+const { proposeWikiForName, lookupUrl } = require("../wiki/page-lookup");
 const { queueCelebsForReview, sendNextReview } = require("./celeb-review");
 const { resolveAdminTarget } = require("./admin-notify");
 const { logEvent } = require("./log");
@@ -23,6 +23,9 @@ const DONE_RE = /^(fertig|done|end|liste fertig)$/i;
 const REMOVE_RE = /^entfern\w*\s+(\d+)$/i;
 const CHANGE_RE = /^(?:änder|aendere|ändere|change)\s+(\d+)\s+(.+)$/i;
 const UNLOCK_RE = /^(unlock|entsperren|oeffnen|öffnen)$/i;
+const LINK_URL_RE = /^link\s+(\d+)\s+(\S+\.wikipedia\.org\/wiki\/\S+)$/i;
+const WRONG_RE = /^(?:falsch|nein|wrong|nicht richtig|falsche)\s*(?:\s*(\d+))?$/i;
+const WIKI_URL_RE = /^(?:https?:\/\/)?(?:en|de)\.wikipedia\.org\/wiki\/[^\s]+$/i;
 
 /** In-Memory-Queue: ein Wiki-Auflösungs-Lauf pro User, nicht parallel. */
 const busyUsers = new Set();
@@ -213,6 +216,131 @@ async function tryConsumePickMessage(ctx, msg) {
   const season = part.season;
 
   const body = msg.content.trim();
+
+  // Hilfe: ein nackter Wikipedia-Link in der DM löst den nächsten ungeklärten
+  // Eintrag auf („er ist es”) — ohne dass der User nummeriert.
+  if (WIKI_URL_RE.test(body) && !LINK_URL_RE.test(body)) {
+    const player = db
+      .getDb()
+      .prepare("SELECT * FROM players WHERE discord_user_id = ?")
+      .get(String(msg.author.id));
+    if (!player) {
+      await msg.reply("Noch keine Liste angelegt.");
+      return true;
+    }
+    const draft = db.getDraftForPlayer(player.id, season.id);
+    if (!draft || draft.status !== "draft") {
+      await msg.reply("Kein offener Draft — schick erst Namen, oder `unlock`.");
+      return true;
+    }
+    const entries = db.listDraftEntries(draft.id);
+    // nächster Eintrag, der nicht sauber verlinkt ist
+    const target = targetForUrlPaste(entries);
+    if (!target) {
+      await msg.reply("Alle Einträge sind bereits verlinkt — nutze `link <Nummer> <URL>`, um einen gezielt zu ändern.");
+      return true;
+    }
+    // Kurz auf laufende Auto-Auflösung warten, damit keine Überschreibung passiert
+    if (busyUsers.has(msg.author.id)) {
+      await msg.reply("Moment, ich löse noch Namen auf — gleich nochmal schicken (oder `fertig` warten).");
+      return true;
+    }
+    busyUsers.add(msg.author.id);
+    try {
+      const proposal = await lookupUrl(ctx.config.userAgent, body, season.start_date, null);
+      db.setDraftEntryLinked(target.id, {
+        wikiUrl: proposal.wikiUrl,
+        wikiNorm: proposal.wikiNorm,
+        qid: proposal.qid,
+        proposedAge: proposal.proposedAge,
+        linkStatus: "linked",
+      });
+      await logEvent(ctx.client, ctx.config, {
+        kind: "pick-link-url",
+        summary: `${target.raw_name} → ${body} (Saison ${season.year})`,
+        userId: msg.author.id,
+      });
+    } catch (err) {
+      await msg.reply(
+        `Mit dieser URL konnte nichts verlinkt werden (**${err.message}**). Nur en./de.wikipedia.org/wiki/…-Links zu Personen funktionieren.`
+      );
+    } finally {
+      busyUsers.delete(msg.author.id);
+    }
+    await respondPick(ctx, msg.channel, msg.author.id, season);
+    return true;
+  }
+
+  // „falsch 3” / „nein” — automatisch verlinkten Eintrag als nicht gemeint markieren
+  if (WRONG_RE.test(body)) {
+    const player = db
+      .getDb()
+      .prepare("SELECT * FROM players WHERE discord_user_id = ?")
+      .get(String(msg.author.id));
+    const draft = player && db.getDraftForPlayer(player.id, season.id);
+    if (!draft || draft.status !== "draft") {
+      await msg.reply("Kein offener Draft.");
+      return true;
+    }
+    const entries = db.listDraftEntries(draft.id);
+    const match = body.match(WRONG_RE);
+    const num = match?.[1] ? Number(match[1]) : null;
+    const target = num ? entries[num - 1] : entries.find((e) => e.link_status === "linked" || e.link_status === "ambiguous");
+    if (!target) {
+      await msg.reply("Kein verlinkter Eintrag gefunden. Nutze `falsch <Nummer>`.");
+      return true;
+    }
+    // Link entfernen → wieder pending zur Neu-Auflösung (gemeint war ein anderer
+    // oder keiner: User kann neu wählen oder per Link-Paste auflösen).
+    db.replaceDraftEntryName(target.id, target.raw_name);
+    await logEvent(ctx.client, ctx.config, {
+      kind: "pick-wrong",
+      summary: `${target.raw_name} als falsch markiert (Link entfernt)`,
+      userId: msg.author.id,
+    });
+    await msg.reply(`⚠️ ${target.raw_name} zur Korrektur zurückgesetzt. Schick einen Wikipedia-Link, wähle aus der Liste, oder lösche den Eintrag.`);
+    await respondPick(ctx, msg.channel, msg.author.id, season);
+    // NICHT auto-auflösen: Der User hat „falsch” gesagt — er entscheidet, was
+    // als Nächstes passiert (URL, Auswahl, entfernen).
+    return true;
+  }
+
+  // „link 3 <url>” — explizit Eintrag Nr. N mit URL verknüpfen
+  if (LINK_URL_RE.test(body)) {
+    const m = body.match(LINK_URL_RE);
+    const num = Number(m[1]);
+    const url = m[2];
+    const player = db
+      .getDb()
+      .prepare("SELECT * FROM players WHERE discord_user_id = ?")
+      .get(String(msg.author.id));
+    const draft = player && db.getDraftForPlayer(player.id, season.id);
+    if (!draft || draft.status !== "draft") {
+      await msg.reply("Kein offener Draft.");
+      return true;
+    }
+    const entries = db.listDraftEntries(draft.id);
+    const target = entries[num - 1];
+    if (!target) {
+      await msg.reply(`Kein Eintrag Nr. **${num}**.`);
+      return true;
+    }
+    try {
+      const proposal = await lookupUrl(ctx.config.userAgent, url, season.start_date, null);
+      db.setDraftEntryLinked(target.id, {
+        wikiUrl: proposal.wikiUrl,
+        wikiNorm: proposal.wikiNorm,
+        qid: proposal.qid,
+        proposedAge: proposal.proposedAge,
+        linkStatus: "linked",
+      });
+      await msg.reply(`🔗 ${target.raw_name} → **${proposal.title || url}**`);
+    } catch (err) {
+      await msg.reply(`Mit dieser URL konnte nichts verlinkt werden (**${err.message}**).`);
+    }
+    await respondPick(ctx, msg.channel, msg.author.id, season);
+    return true;
+  }
 
   // feste Kommandos
   if (UNLOCK_RE.test(body)) {
@@ -481,6 +609,16 @@ async function warnAnnouncedPreStartDeaths(ctx) {
   return sent;
 }
 
+/** Nächster ungeklärter Eintrag, den eine nackte URL-Paste auflöst. */
+function targetForUrlPaste(entries) {
+  return (
+    entries.find((e) => e.link_status === "pending") ||
+    entries.find((e) => e.link_status === "ambiguous" || e.link_status === "unlinked") ||
+    entries.find((e) => e.link_status !== "linked") ||
+    null
+  );
+}
+
 module.exports = {
   tryConsumePickMessage,
   handlePickInteraction,
@@ -488,4 +626,8 @@ module.exports = {
   buildPickSelect,
   classifyProposal,
   warnAnnouncedPreStartDeaths,
+  targetForUrlPaste,
+  WIKI_URL_RE,
+  LINK_URL_RE,
+  WRONG_RE,
 };

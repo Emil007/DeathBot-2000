@@ -46,9 +46,9 @@ function parsePickList(text) {
   const names = [];
   const duplicates = [];
   const seen = new Set();
-  const MAX_NAMES = 30;
-  const MAX_TOTAL_CHARS = 600;
-  let totalChars = 0;
+  // Maximale Kartenzahl pro Spieler: 50. Mehr Namen in einer Paste werden
+  // sauber gekappt (embed bleibt ~2000 Zeichen, Discord-fähig).
+  const MAX_NAMES = 50;
   for (const t of tokens) {
     const k = nameKey(t);
     if (!k) continue;
@@ -56,10 +56,7 @@ function parsePickList(text) {
       duplicates.push(t);
       continue;
     }
-    totalChars += t.length;
-    // Harte Budgets: übermäßige Pasts kappen, damit Embed + Wiki-Auflösung
-    // stabil bleiben (und ein Upsert nicht lächerlich groß wird).
-    if (totalChars > MAX_TOTAL_CHARS || names.length >= MAX_NAMES) {
+    if (names.length >= MAX_NAMES) {
       return { names, duplicates, truncated: true };
     }
     seen.add(k);

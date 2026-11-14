@@ -29,13 +29,11 @@ after(() => {
   fs.rmSync(tmp, { recursive: true, force: true });
 });
 
-test("parser: huge paste is truncated at 30 names / 600 chars", () => {
-  const many = Array.from({ length: 45 }, (_, i) => `Name ${i + 1}`).join("; ");
+test("parser: huge paste is truncated at 50 names", () => {
+  const many = Array.from({ length: 70 }, (_, i) => `Name ${i + 1}`).join("; ");
   const res = parsePickList(many);
   assert.strictEqual(res.truncated, true);
-  assert.ok(res.names.length <= 30);
-  // Alle gültigen Tokens vor dem Cut landen im Result (keine Lücken beim Zählen)
-  assert.ok(res.names.length >= 20);
+  assert.strictEqual(res.names.length, 50);
 });
 
 test("parser: normal list not truncated", () => {
@@ -109,4 +107,33 @@ test("pre-start death warning rows", () => {
   db.markAnnouncedDeathWarned(season.id, pid, cid);
   const again = db.getAnnouncedPreStartDeathsUnwarned(season.id);
   assert.ok(!again.some((r) => r.celeb_id === cid), "warned rows must not repeat");
+});
+
+const assistant = require("../src/discord/pick-assistant");
+
+test("url-target: bare URL binds to next non-linked entry", () => {
+  const entries = [
+    { id: 1, link_status: "linked" },
+    { id: 2, link_status: "ambiguous" },
+    { id: 3, link_status: "pending" },
+    { id: 4, link_status: "unlinked" },
+  ];
+  assert.strictEqual(assistant.targetForUrlPaste(entries).id, 3, "pending first");
+  const withPendingGone = entries.filter((e) => e.id !== 3);
+  assert.strictEqual(assistant.targetForUrlPaste(withPendingGone).id, 2, "then ambiguous");
+  const onlyUnlinked = entries.filter((e) => e.id === 4);
+  assert.strictEqual(assistant.targetForUrlPaste(onlyUnlinked).id, 4);
+  const allLinked = entries.filter((e) => e.id === 1);
+  assert.strictEqual(assistant.targetForUrlPaste(allLinked), null, "all linked -> no target");
+});
+
+test("command regexes match user input", () => {
+  assert.ok(assistant.WIKI_URL_RE.test("https://en.wikipedia.org/wiki/Keanu_Reeves"));
+  assert.ok(assistant.WIKI_URL_RE.test("de.wikipedia.org/wiki/Karl_Lagerfeld"));
+  assert.ok(!assistant.WIKI_URL_RE.test("Keanu Reeves"));
+  assert.ok(assistant.LINK_URL_RE.test("link 3 https://en.wikipedia.org/wiki/X"));
+  assert.ok(assistant.LINK_URL_RE.test("link 2 de.wikipedia.org/wiki/X"));
+  assert.ok(assistant.WRONG_RE.test("falsch"));
+  assert.ok(assistant.WRONG_RE.test("falsch 3"));
+  assert.ok(assistant.WRONG_RE.test("nein 2"));
 });
