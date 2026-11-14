@@ -134,6 +134,17 @@ async function runYearRollover(client, config, { force = false, now = null } = {
     throw e;
   }
 
+  // Saison-Start-Backup: nach erfolgreichem Aktivieren der NEUEN Saison ein
+  // ewig bleibenles Backup (retain=true → data/backups/season-start/), damit im
+  // schlimmsten Fall wenigstens die Tipps der neuen Saison sicher sind.
+  // Nicht vom nächtlichen Prune gelöscht. Fehler hier blockiert den Wechsel NICHT.
+  try {
+    const startPkg = createPackage(config, { reason: "season-start", retain: true });
+    console.log("[year-rollover] Saison-Start-Backup:", startPkg.name);
+  } catch (e) {
+    await logError(client, config, e, { where: "year-rollover season-start backup" });
+  }
+
   // F21: gemeinsame Nacharbeit (Cron +/new-year activate): Kanal anlegen,
   // deathpool_channel_id setzen, Bilanz der ARCHIVIERTEN Saison posten.
   const fin = await finalizeYearSwitch(client, config, res.archived.id, res.activated.year);

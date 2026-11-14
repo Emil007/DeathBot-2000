@@ -8,12 +8,17 @@ function timestamp() {
   return new Date().toISOString().replace(/[:.]/g, "-");
 }
 
-function createPackage(config, { reason = "backup" } = {}) {
-  fs.mkdirSync(config.backupsDir, { recursive: true });
+function createPackage(config, { reason = "backup", retain = false } = {}) {
+  // retain=true → Ablage in data/backups/season-start/ (ewig aufbewahrt, nie vom
+  // nächtlichen Prune gelöscht). Für das Saison-Start-Backup mit den Tipps.
+  const dir = retain
+    ? path.join(config.backupsDir, "season-start")
+    : config.backupsDir;
+  fs.mkdirSync(dir, { recursive: true });
   const season = db.getActiveSeason();
   const stats = db.statsSnapshot();
   const name = `season-${season.year}-${timestamp()}-${reason}.zip`;
-  const outPath = path.join(config.backupsDir, name);
+  const outPath = path.join(dir, name);
 
   // Ensure WAL checkpointed into main file
   db.getDb().pragma("wal_checkpoint(TRUNCATE)");
@@ -151,18 +156,20 @@ function restorePackage(config, fileName) {
 
 function pruneBackups(config, { keep = 14 } = {}) {
   fs.mkdirSync(config.backupsDir, { recursive: true });
+  // Nur die Wurzel des backupsDir rotieren; der Unterordner season-start/ (die
+  // ewig aufbewahrten Saison-Start-Backups mit den Tipps) wird NIEMALS gelöscht.
   const files = fs
-    .readdirSync(config.backupsDir)
-    .filter((f) => f.endsWith(".zip"))
-    .map((f) => {
-      const p = path.join(config.backupsDir, f);
+    .readdirSync(config.backupsDir, { withFileTypes: true })
+    .filter((e) => e.isFile() && e.name.endsWith(".zip"))
+    .map((e) => {
+      const p = path.join(config.backupsDir, e.name);
       let mtimeMs = 0;
       try {
         mtimeMs = fs.statSync(p).mtimeMs;
       } catch {
         /* ignore */
       }
-      return { name: f, path: p, mtimeMs };
+      return { name: e.name, path: p, mtimeMs };
     })
     .sort((a, b) => b.mtimeMs - a.mtimeMs);
 
