@@ -1,6 +1,6 @@
 const { test } = require("node:test");
 const assert = require("node:assert");
-const { parsePickList, nameKey } = require("../src/discord/pick-parse");
+const { parsePickList, nameKey, isSmallTalkLine } = require("../src/discord/pick-parse");
 
 test("one name per line", () => {
   const { names } = parsePickList("Alice\nBob\nCarol");
@@ -87,4 +87,16 @@ test("F10: duplicates still do not count into recognized overhang", () => {
   assert.deepStrictEqual(names, ["A1", "A2"]);
   assert.strictEqual(duplicates.length, 1);
   assert.strictEqual(recognized, 3, "A3 is unique overhang (A1-dup does not count)");
+});
+
+test("smalltalk and greetings are not clear names", () => {
+  for (const line of ["hallo", "  Hallo ", "hi", "hey", "moin", "servus", "hilfe", "help", "danke", "ok", "okay", "ja", "nein", "öffnen", "oeffnen"]) {
+    assert.strictEqual(isSmallTalkLine(line), true, line);
+  }
+  assert.strictEqual(isSmallTalkLine("wie geht's?"), true);
+  assert.strictEqual(isSmallTalkLine("was geht bei dir"), true);
+  assert.strictEqual(isSmallTalkLine("guten Morgen"), true);
+  assert.strictEqual(isSmallTalkLine("guten"), false);
+  assert.strictEqual(isSmallTalkLine("Angela Merkel"), false);
+  assert.strictEqual(isSmallTalkLine("fertig"), false);
 });

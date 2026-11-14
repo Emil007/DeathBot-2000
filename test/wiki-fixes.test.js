@@ -449,3 +449,130 @@ test("announce redName card: title=person, description=beruf, image, no Bekannt-
   assert.match(kurz, /Gestorben: \*\*8\. Oktober 2026\*\*/);
   assert.doesNotMatch(kurz, /Bekannt für/, "no duplicate knownFor when it is the description");
 });
+
+// --- category batch / 429 is not a life sign ---------------------------------
+
+const {
+  findDeathsByCategory,
+  celebStillMarkedDead,
+} = require("../src/wiki/category-death");
+
+test("category titles are read in batches of 50 with cllimit=max and one client per language", async () => {
+  const calls = [];
+  let creates = 0;
+  axios.create = () => {
+    creates += 1;
+    return {
+      async get(_url, { params } = {}) {
+        calls.push(params);
+        return { status: 200, data: { query: { pages: {} } } };
+      },
+    };
+  };
+  const celebs = [];
+  for (let i = 0; i < 51; i++) {
+    celebs.push({
+      id: i + 1,
+      wiki_url: `https://en.wikipedia.org/wiki/Person_${i}`,
+      wiki_url_de: `https://de.wikipedia.org/wiki/Person_${i}`,
+    });
+  }
+  await findDeathsByCategory("ua", celebs, { delayMs: 0, tz: "Europe/Vienna" });
+  // One client per language, not per URL (51 EN + 51 DE). Each language is two batches.
+  assert.strictEqual(creates, 2, "one HTTP client per language for the run");
+  const catCalls = calls.filter((p) => p?.prop === "categories");
+  const sizes = catCalls.map((p) => String(p.titles).split("|").length).sort((a, b) => b - a);
+  assert.deepStrictEqual(sizes, [50, 50, 1, 1]);
+  assert.ok(catCalls.every((p) => p.cllimit === "max"));
+  assert.ok(!calls.some((p) => String(p.rvprop || "").includes("content")));
+});
+
+test("a clean category response without a death category is really alive", async () => {
+  axios.create = () => ({
+    async get() {
+      return {
+        status: 200,
+        data: {
+          query: {
+            pages: {
+              1: { title: "Still Alive", categories: [{ title: "Category:Living people" }] },
+            },
+          },
+        },
+      };
+    },
+  });
+  const rows = await findDeathsByCategory(
+    "ua",
+    [{ id: 7, wiki_url: "https://en.wikipedia.org/wiki/Still_Alive" }],
+    { delayMs: 0 }
+  );
+  assert.strictEqual(rows[0].dead, false);
+  assert.ok(!rows[0].error);
+});
+
+test("failed HTTP status is never a clean alive (404)", async () => {
+  axios.create = () => ({
+    async get() {
+      return { status: 404, data: "" };
+    },
+  });
+  const rows = await findDeathsByCategory(
+    "ua",
+    [{ id: 8, wiki_url: "https://en.wikipedia.org/wiki/Missing_Person" }],
+    { delayMs: 0 }
+  );
+  assert.strictEqual(rows[0].dead, false);
+  assert.strictEqual(rows[0].error, "http-404");
+  assert.strictEqual(rows[0].dead === false && !rows[0].error, false);
+});
+
+test("validateStatus does not accept 429", async () => {
+  let cfg;
+  axios.create = (options) => {
+    cfg = options;
+    return {
+      async get() {
+        return { status: 200, data: { query: { pages: {} } } };
+      },
+    };
+  };
+  await findDeathsByCategory(
+    "ua",
+    [{ id: 9, wiki_url: "https://en.wikipedia.org/wiki/Cfg_Person" }],
+    { delayMs: 0 }
+  );
+  assert.strictEqual(cfg.validateStatus(429), false);
+  assert.strictEqual(cfg.validateStatus(200), true);
+  assert.strictEqual(cfg.validateStatus(503), false);
+});
+
+test("429 without a successful retry is an error, not a life sign", async () => {
+  const urls = [];
+  axios.create = () => ({
+    async get(url) {
+      urls.push(String(url));
+      // Body looks like a death if a caller skips the status and reads HTML.
+      return {
+        status: 429,
+        data: '<div id="catlinks">Category:2027_deaths</div>',
+      };
+    },
+  });
+  const celeb = { id: 3, name: "Rate Limited", wiki_url: "https://en.wikipedia.org/wiki/Rate_Limited" };
+  const [rows, still] = await Promise.all([
+    findDeathsByCategory("ua", [celeb], { delayMs: 0, tz: "Europe/Vienna" }),
+    celebStillMarkedDead("ua", celeb),
+  ]);
+  const row = rows[0];
+  assert.strictEqual(row.error, "http-429");
+  assert.strictEqual(row.dead, false);
+  // Worst case: reading only `dead === false` would silently treat the outage as alive.
+  assert.strictEqual(row.dead === false && !row.error, false);
+  assert.ok(row.error);
+  assert.strictEqual(still.dead, false);
+  assert.strictEqual(still.error, "http-429");
+  assert.notStrictEqual(still.dead, true);
+  assert.ok(urls.every((u) => u.includes("/w/api.php")), urls.join("\n"));
+  assert.ok(!urls.some((u) => /\/wiki\/Rate_Limited/.test(u)), "429 must not fall through to HTML");
+});

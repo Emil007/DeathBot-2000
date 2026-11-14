@@ -2,15 +2,121 @@ const { createPackage } = require("../../backup");
 const db = require("../../db");
 const { logEvent, logError } = require("../log");
 const { runWikiPoll } = require("../../jobs/wiki-poll");
-const { finalizeYearSwitch } = require("../../jobs/year-rollover");
+const { runYearRollover } = require("../../jobs/year-rollover");
 const { formatReconcileSummary } = require("../announce");
 const { resolveAdminTarget } = require("../admin-notify");
+const DATE_INVALID =
+  "Datum muss YYYY-MM-DD sein, und es muss ein echtes Kalenderdatum sein.";
 
-function parseDate(s) {
-  if (!/^\d{4}-\d{2}-\d{2}$/.test(s)) return null;
-  const d = new Date(s + "T00:00:00Z");
-  if (Number.isNaN(d.getTime())) return null;
+function loadTime() {
+  try {
+    return require("../../db/time");
+  } catch (e) {
+    if (e.code !== "MODULE_NOT_FOUND" || !String(e.message).includes("db/time")) throw e;
+    return null;
+  }
+}
+
+function parseCalendarDate(s) {
+  const shared = loadTime();
+  if (shared) return shared.parseCalendarDate(s);
+  if (typeof s !== "string" || !/^\d{4}-\d{2}-\d{2}$/.test(s)) return null;
+  const y = Number(s.slice(0, 4));
+  const m = Number(s.slice(5, 7));
+  const d = Number(s.slice(8, 10));
+  const utc = new Date(Date.UTC(y, m - 1, d));
+  if (utc.getUTCFullYear() !== y || utc.getUTCMonth() !== m - 1 || utc.getUTCDate() !== d) return null;
   return s;
+}
+
+function calendarYear(instant, timeZone) {
+  const shared = loadTime();
+  if (shared) return shared.calendarYear(instant, timeZone);
+  const parts = new Intl.DateTimeFormat("en-CA", {
+    timeZone,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+  }).formatToParts(instant);
+  const y = parts.find((p) => p.type === "year");
+  return Number(y && y.value);
+}
+
+function mentionOpts() {
+  try {
+    return require("../safe-text").mentionOpts();
+  } catch (e) {
+    if (e.code !== "MODULE_NOT_FOUND" || !String(e.message).includes("safe-text")) throw e;
+    return { allowedMentions: { parse: [] } };
+  }
+}
+
+function isTokenBurned(err) {
+  const code = err?.code ?? err?.rawError?.code;
+  return Number(code) === 50027;
+}
+
+function switchFailureText(err) {
+  const stack = String(err?.stack || "");
+  if (stack.includes("createPackage") || stack.includes("year-rollover backup")) {
+    return `Backup fehlgeschlagen: ${err.message}`;
+  }
+  return `Aktivierung fehlgeschlagen: ${err.message}`;
+}
+
+async function ackSwitch(msg) {
+  try {
+    await msg.reply("Wechsel läuft.");
+  } catch (e) {
+    if (isTokenBurned(e)) return;
+    throw e;
+  }
+}
+
+/**
+ * Schaltet nur über runYearRollover (Mutex liegt in M5). Beobachtet den
+ * Kanal-Send der Abschlussbilanz, falls der Rückgabewert kein posted-Flag hat.
+ */
+async function runYearRolloverObserved(client, config, force) {
+  let observedPosted = false;
+  const channels = client?.channels;
+  const hadOwn = Boolean(channels && Object.prototype.hasOwnProperty.call(channels, "fetch"));
+  const prevFetch = channels?.fetch;
+  if (typeof prevFetch === "function") {
+    channels.fetch = async (...args) => {
+      const ch = await prevFetch.apply(channels, args);
+      if (!ch || typeof ch.send !== "function") return ch;
+      return new Proxy(ch, {
+        get(target, prop, receiver) {
+          if (prop === "send") {
+            return (payload) => {
+              const content =
+                payload && typeof payload === "object" && payload.content != null
+                  ? String(payload.content)
+                  : typeof payload === "string"
+                    ? payload
+                    : "";
+              if (content.includes("Abschlussbilanz")) observedPosted = true;
+              return target.send(payload);
+            };
+          }
+          const value = Reflect.get(target, prop, receiver);
+          return typeof value === "function" ? value.bind(target) : value;
+        },
+      });
+    };
+  }
+  try {
+    const result = await runYearRollover(client, config, { force: Boolean(force) });
+    const explicit = result && (result.posted ?? result.reviewPosted ?? result.fin?.posted);
+    const reviewPosted = typeof explicit === "boolean" ? explicit : observedPosted;
+    return { result, reviewPosted };
+  } finally {
+    if (channels && typeof prevFetch === "function") {
+      if (hadOwn) channels.fetch = prevFetch;
+      else delete channels.fetch;
+    }
+  }
 }
 
 /**
@@ -122,7 +228,7 @@ const cmd = {
     if (!isActivate && !isWipe) {
       await msg.reply(
         [
-          "🆕 **Saison-Wechsel und Eröffnung**",
+          "🆕 **Saison-Wechsel und Eröffnung** — erst ankündigen, am Start begraben.",
           "",
           "• **Eröffnung:** `/announce-season announce_channel:#Kanal` — legt die kommende Saison an und postet das Teilnahme-Embed (**die laufende Runde läuft weiter**).",
           "• **Wechsel am Saisonstart:** `/new-year activate:true` — archiviert die laufende Saison (Daten + Punkte-Snapshot bleiben), schaltet die announced-Saison live.",
@@ -153,120 +259,131 @@ const cmd = {
         return;
       }
 
-      let pkg;
-      try {
-        pkg = createPackage(ctx.config, { reason: "season-switch" });
-      } catch (e) {
-        await logError(ctx.client, ctx.config, e, { where: "new-year activate backup" });
-        await msg.reply(`Backup fehlgeschlagen: ${e.message}`);
-        return;
-      }
+      await ackSwitch(msg);
 
       const archivedSeason = db.getActiveSeason();
-      let res;
+      let switched;
       try {
-        res = db.activateAnnouncedSeason();
+        switched = await runYearRolloverObserved(ctx.client, ctx.config, force);
       } catch (e) {
-        await logError(ctx.client, ctx.config, e, { where: "new-year activate" });
-        await msg.reply(`Aktivierung fehlgeschlagen: ${e.message} (Backup: \`${pkg.name}\`)`);
+        await logError(ctx.client, ctx.config, e, { where: "new-year activate", userId: ctx.config.adminId });
+        await msg.reply(switchFailureText(e));
         return;
       }
 
-      // Stiller Reconcile auf der neuen Saison; kein Seed (Feed läuft weiter).
+      const result = switched?.result;
+      if (!result || result.switched !== true) {
+        if (result?.reason === "no-announced") {
+          await msg.reply("Wechsel ist schon durch.");
+          return;
+        }
+        if (result?.reason === "not-yet") {
+          await msg.reply(
+            result.start
+              ? `Wechsel erst ab dem Saisonstart (**${result.start}**) möglich. \`force:true\` nur für Testläufe.`
+              : "Kein Startdatum gesetzt."
+          );
+          return;
+        }
+        await msg.reply(`Aktivierung fehlgeschlagen: ${result?.reason || "unbekannt"}`);
+        return;
+      }
+
+      const archived = result.archived;
+      const activated = result.activated;
+      const reviewPosted = Boolean(switched.reviewPosted);
+      const channelId = result.channel || activated?.deathpool_channel_id || null;
+
+      // Reconcile erst nach dem Wechsel, nicht davor. Kein Seed.
       let reconcileHits = [];
       try {
         const r = await runWikiPoll(ctx.client, ctx.config, { mode: "reconcile" });
-        reconcileHits = r.hits || [];
+        reconcileHits = r?.hits || [];
       } catch (e) {
         await logError(ctx.client, ctx.config, e, { where: "new-year reconcile", userId: ctx.config.adminId });
       }
-      const snapCount = db
-        .getDb()
-        .prepare("SELECT COUNT(*) c FROM season_point_snapshots WHERE season_id = ?")
-        .get(archivedSeason.id).c;
-
-      // F21: Dieselbe Nacharbeit wie der Cron — Kanal anlegen, ID in
-      // deathpool_channel_id (NICHT announce_channel_id), Bilanz der ARCHIVIERTEN
-      // Saison mit Live-Satz posten. Fehlschlag wird unten ehrlich genannt.
-      let fin = null;
-      let newChannelFailed = false;
-      let reviewPosted = false;
-      try {
-        fin = await finalizeYearSwitch(ctx.client, ctx.config, res.archived.id, res.activated.year);
-        newChannelFailed = Boolean(fin?.newChannelFailed);
-        reviewPosted = Boolean(fin?.posted);
-      } catch (e) {
-        // finalizeYearSwitch wirft nur bei createNextSeasonChannel-Durchbrüchen
-        // (nicht abgefangene Fehler) — loggen und im Antworttext nennen.
-        newChannelFailed = true;
-        await logError(ctx.client, ctx.config, e, { where: "new-year activate finalize", userId: ctx.config.adminId });
-      }
-      if (!reviewPosted) {
-        await logError(
-          ctx.client,
-          ctx.config,
-          new Error("new-year activate: Abschlussbilanz wurde nicht gesendet"),
-          { where: "new-year postReview failed", userId: ctx.config.adminId, detail: `archived=${res.archived.id}` }
-        );
-      }
+      const snapCount = archived
+        ? db
+            .getDb()
+            .prepare("SELECT COUNT(*) c FROM season_point_snapshots WHERE season_id = ?")
+            .get(archived.id).c
+        : 0;
 
       await logEvent(ctx.client, ctx.config, {
         kind: "season-switch",
-        summary: `Saisonwechsel ${archivedSeason.year} → ${res.activated.year}`,
+        summary: `Saisonwechsel ${archivedSeason?.year} → ${activated?.year}`,
         userId: ctx.config.adminId,
-        detail: `archived=${res.archived.id} activated=${res.activated.id} backup=${pkg?.name} snapshots=${snapCount} reconcile=${reconcileHits.length}`,
+        detail: `archived=${archived?.id} activated=${activated?.id} snapshots=${snapCount} reconcile=${reconcileHits.length} review=${reviewPosted}`,
       });
 
       const summary = formatReconcileSummary(reconcileHits, db.getActiveSeason());
       const target = await resolveAdminTarget(ctx, { preferDmUser: msg.author });
       try {
-        if (target?.send) await target.send(summary);
+        if (target?.send) await target.send({ content: summary, ...mentionOpts() });
       } catch {
         /* ignore */
       }
 
-      await msg.reply(
-        [
-          `✅ **Saison ${res.archived.year} archiviert** — **Saison ${res.activated.year} ist live**`,
-          `• Archiv: id ${res.archived.id} (Punkte-Snapshot: ${snapCount} Spieler)`,
-          `• Live: id ${res.activated.id}, Start **${res.activated.start_date}**`,
-          `• Deathpool-Kanal: ${fin?.newChannel ? `<#${fin.newChannel.id}>` : newChannelFailed ? "**Anlage fehlgeschlagen** (gesehen in Logs)" : "kein neuer Kanal angelegt"}`,
-          `• Abschlussbilanz: ${reviewPosted ? "gepostet" : "**nicht gesendet** (Details in den Logs)"}`,
-          "• Picks/Celebs beider Saisons bleiben erhalten, Kontostand startet bei 0",
-          `• Stiller Abgleich: **${reconcileHits.length}** Nachträge (Details per DM/Admin)`,
-          "• All-Deaths-Feed läuft weiter (kein neuer Seed)",
-          force ? "⚠️ Wechsel vor dem Startdatum (force)." : "",
-        ]
-          .filter(Boolean)
-          .join("\n")
-      );
+      const channelBit = channelId
+        ? `<#${channelId}>`
+        : "**Anlage fehlgeschlagen** (gesehen in Logs)";
+      try {
+        await msg.reply(
+          [
+            `✅ **Saison ${archived.year} archiviert** — **Saison ${activated.year} ist live.** Das alte Jahr liegt, das neue wartet auf Namen.`,
+            `• Archiv: id ${archived.id} (Punkte-Snapshot: ${snapCount} Spieler)`,
+            `• Live: id ${activated.id}, Start **${activated.start_date}**`,
+            `• Deathpool-Kanal: ${channelBit}`,
+            `• Abschlussbilanz: ${reviewPosted ? "gepostet" : "**nicht gesendet** (Details in den Logs)"}`,
+            "• Picks/Celebs beider Saisons bleiben erhalten, Kontostand startet bei 0",
+            `• Stiller Abgleich: **${reconcileHits.length}** Nachträge (Details per DM/Admin)`,
+            "• All-Deaths-Feed läuft weiter (kein neuer Seed)",
+            force ? "⚠️ Wechsel vor dem Startdatum (force)." : "",
+          ]
+            .filter(Boolean)
+            .join("\n")
+        );
+      } catch (e) {
+        if (!isTokenBurned(e)) throw e;
+        await logError(ctx.client, ctx.config, e, { where: "new-year activate reply", userId: ctx.config.adminId });
+      }
       return;
     }
 
     // ---- WIPE (Notfall) ----
+    const flags = new Set(["activate", "force", "wipe", "confirm"]);
+    const dateArgs = args.filter((a) => !flags.has(String(a).toLowerCase()));
+    let year;
+    let startDate;
+    if (dateArgs.length) {
+      const parsed = dateArgs.map((a) => parseCalendarDate(String(a)));
+      if (parsed.some((d) => !d)) {
+        await msg.reply(DATE_INVALID);
+        return;
+      }
+      startDate = parsed[0];
+      year = Number(startDate.slice(0, 4));
+    } else {
+      year = calendarYear(new Date(), ctx.config.tz);
+      startDate = `${year}-01-01`;
+    }
+
     const guard = assertWipeAllowed();
     if (!guard.ok) {
       await msg.reply(guard.reason);
       return;
     }
 
-    const dateArg = args.find((a) => /^\d{4}-\d{2}-\d{2}$/.test(a));
-    const year = dateArg ? parseInt(dateArg.slice(0, 4), 10) : new Date().getFullYear();
-    const startDate = dateArg ? parseDate(dateArg) : `${year}-01-01`;
+    let pkg;
+    try {
+      pkg = createPackage(ctx.config, { reason: "new-year" });
+    } catch (e) {
+      await logError(ctx.client, ctx.config, e, { where: "new-year wipe backup", userId: ctx.config.adminId });
+      await msg.reply(`Backup fehlgeschlagen: ${e.message}`);
+      return;
+    }
 
-    const pkg = createPackage(ctx.config, { reason: "new-year" });
     const { oldSeason, newSeasonId } = db.clearSeasonForNewYear(year, startDate);
-
-    db.getDb().exec(`
-      DELETE FROM death_awards;
-      DELETE FROM picks;
-      DELETE FROM celeb_aka;
-      DELETE FROM celeb_blacklist;
-      DELETE FROM celebs;
-      DELETE FROM player_bonuses;
-      DELETE FROM pick_draft_entries;
-      DELETE FROM pick_drafts;
-    `);
 
     await logEvent(ctx.client, ctx.config, {
       kind: "new-year-wipe",
@@ -281,7 +398,7 @@ const cmd = {
         `• Backup: \`${pkg.name}\``,
         `• Neue Saison id ${newSeasonId}, Start **${startDate}**, live=**nein**`,
         "",
-        "1. `/import` bzw. `{prefix}import @User`",
+        `1. \`${ctx.config.prefix}import @User\``,
         "2. `/check` — stiller Wiki-Abgleich, Zusammenfassung per DM",
         "3. `/go` — Live ab jetzt",
       ].join("\n")

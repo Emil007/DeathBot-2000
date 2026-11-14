@@ -1,7 +1,34 @@
 const db = require("../../db");
-const { lookupUrl, normalizeWikiUrl } = require("../../wiki/page-lookup");
+const pageLookup = require("../../wiki/page-lookup");
+const { normalizeWikiUrl } = pageLookup;
 const { announceSimulatedDeath } = require("../announce");
 const { usageReply } = require("../usage");
+const { mentionOpts, sanitizeDisplayName } = loadSafeText();
+
+function loadSafeText() {
+  try {
+    const t = require("../safe-text");
+    if (typeof t.mentionOpts === "function" && typeof t.sanitizeDisplayName === "function") return t;
+  } catch (e) {
+    if (e.code !== "MODULE_NOT_FOUND") throw e;
+  }
+  return {
+    mentionOpts: () => ({ allowedMentions: { parse: [] } }),
+    sanitizeDisplayName(raw) {
+      let s = raw == null ? "" : String(raw);
+      s = s.replace(/\p{Cc}/gu, "").replace(/[\u2028\u2029]/g, "");
+      s = s.replace(/[*_~|`<>@()[\]]/g, "");
+      s = s.replace(/\s+/gu, " ").trim();
+      const chars = Array.from(s);
+      if (chars.length > 80) s = chars.slice(0, 80).join("").trim();
+      return s || "\u201EUnbenannt\u201C";
+    },
+  };
+}
+
+async function say(msg, content) {
+  await msg.reply({ content, ...mentionOpts() });
+}
 
 const cmd = {
   name: "simulate",
@@ -31,16 +58,16 @@ const cmd = {
   async run(ctx, args, msg) {
     const urlArg = args.find((a) => /wikipedia\.org\/wiki\//i.test(a)) || args[0];
     if (!urlArg || !normalizeWikiUrl(urlArg)) {
-      await msg.reply(usageReply(cmd, ctx.config));
+      await say(msg, usageReply(cmd, ctx.config));
       return;
     }
 
     const season = db.getActiveSeason();
     let meta;
     try {
-      meta = await lookupUrl(ctx.config.userAgent, urlArg, season.start_date, null);
+      meta = await pageLookup.lookupUrl(ctx.config.userAgent, urlArg, season.start_date, null);
     } catch (e) {
-      await msg.reply(`Lookup fehlgeschlagen: ${e.message}`);
+      await say(msg, `Lookup fehlgeschlagen: ${e.message}`);
       return;
     }
 
@@ -57,8 +84,9 @@ const cmd = {
         }))
       : [];
 
+    const name = sanitizeDisplayName(celeb?.name || meta.title || "Unbekannt");
     await announceSimulatedDeath(ctx.client, ctx.config, {
-      name: celeb?.name || meta.title || "Unbekannt",
+      name,
       age,
       url: meta.wikiUrl || urlArg,
       urlDe: meta.wikiUrlDe || null,
@@ -66,8 +94,9 @@ const cmd = {
       alreadyDead: celeb ? !celeb.is_alive : false,
       winners,
     });
-    await msg.reply(
-      `Simulation gesendet: **${celeb?.name || meta.title}**` +
+    await say(
+      msg,
+      `Simulation gesendet: **${name}**` +
         (celeb ? " _(wäre im Pool — DB unverändert, keine Pings)_" : " _(nicht im Pool)_") +
         " · kein DB-Write."
     );

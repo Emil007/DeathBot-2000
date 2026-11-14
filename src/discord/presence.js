@@ -1,9 +1,8 @@
 const { ActivityType } = require("discord.js");
 
 /**
- * Bot custom status: "Already N people killed today!"
- * Counts all-deaths channel posts for the local calendar day (0:00–24:00 in TZ).
- * Seed/reconcile bulk marks do NOT count — only real channel announces.
+ * Custom-Status: Leichen des lokalen Kalendertags (0:00–24:00 in TZ).
+ * Seed/Reconcile-Markierungen zählen nicht — nur echte Kanal-Ansagen.
  */
 
 function todayKey(timeZone) {
@@ -50,9 +49,9 @@ function writeDayCount(db, timeZone, count) {
 
 function statusText(count) {
   const n = Math.max(0, Math.floor(Number(count) || 0));
-  if (n === 0) return "lurking.... bloody cats!";
-  const people = n === 1 ? "Person" : "People";
-  return `Already ${n} ${people} killed today!`;
+  if (n === 0) return "Heute noch niemand. Die Sense wartet.";
+  if (n === 1) return "Heute schon 1 Leiche. Der Tag ist jung.";
+  return `Heute schon ${n} Leichen. Die Sense ist pünktlich.`;
 }
 
 async function applyPresence(client, count) {

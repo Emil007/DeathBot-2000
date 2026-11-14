@@ -401,6 +401,7 @@ test("F10: second paste of same name does not add a second line and reports Dupl
 
   // erste DM: Merkel
   await sendPick(ctx, msg, "Merkel");
+  await settle();
   let entries = db.listDraftEntries(draft.id);
   assert.strictEqual(entries.length, 1, "first Merkel lands in draft");
   const firstId = entries[0].id;
@@ -425,6 +426,7 @@ test("F10: different accent case is still the same name across DMs", async () =>
     .run().lastInsertRowid;
   const draft = db.getOrCreateDraft(pid, season.id);
   await sendPick(ctx, msg, "Jürgen Müller");
+  await settle();
   await sendPick(ctx, msg, "Jurgen Muller");
   await settle();
   assert.strictEqual(db.listDraftEntries(draft.id).length, 1, "accent-normalized duplicate must fold");
@@ -698,16 +700,11 @@ test("F22: link N while busy -> claimed URL resolved, all entries finalized (no 
 });
 
 /**
- * F22 zweites Loch: Eine DM, die exakt im respondPick-Fenster (nach der
- * Schleife, vor dem `finally`) eintrifft, setzt rerunUsers, wird aber vom
- * do/while nicht mehr gesehen. Das `finally` muss nach dem Löschen der Flags
- * GENAU EINEN Nachlauf starten, der die neuen pending-Zeilen auflöst.
- *
- * Der respondPick-Send wird hier mit einem künstlich vermaschten Channel
- * verlangsamt und beobachtet: der Test wartet, bis der Lauf bei respondPick
- * angekommen ist, schickt dann die neue DM, und lässt danach alles fertiglaufen.
+ * Paste im respondPick-Fenster, solange busyUsers den User noch hat:
+ * die Zeile wird nicht gespeichert (M12). Die Namen, die der Lauf schon
+ * hatte, werden trotzdem zu Ende zugeordnet.
  */
-test("F22: DM in the respondPick window triggers exactly one finally rerun that resolves leftovers", async () => {
+test("F22: paste while busy is not stored; in-flight names still resolve", async () => {
   const season = db.getAnnouncedSeason();
   const { ctx, msg } = fakeCtx("F22buser", "F22b");
   const pid = db
@@ -734,7 +731,13 @@ test("F22: DM in the respondPick window triggers exactly one finally rerun that 
     const originalSend = msg.channel.send.bind(msg.channel);
     msg.channel.send = async (...args) => {
       // respondPick sendet ein Embed — das ist das Fenster nach der Schleife.
-      if (String(args[0]?.content ?? "").startsWith("Auflösung") === false) {
+      // Fortschritt heißt seit M12 „Ordne zu…“ / „Zuordnung fertig.“, nicht „Auflösung“.
+      const content = String(args[0]?.content ?? "");
+      const progress =
+        content.startsWith("Ordne zu") ||
+        content.startsWith("Zuordnung") ||
+        content.startsWith("Auflösung");
+      if (!progress) {
         enteredRespondPick.open();
       }
       await new Promise((r) => setTimeout(r, 8));
@@ -748,19 +751,21 @@ test("F22: DM in the respondPick window triggers exactly one finally rerun that 
     // Warten, bis der Lauf die Schleife beendet hat und bei respondPick ist.
     await enteredRespondPick.promise;
 
-    // Jetzt die neue Namen-DM: sie sieht busyUsers noch gesetzt und schreibt
-    // ihre Zeile + fordert rerun an.
+    // Namen-Paste, während der Lauf noch busy ist: nicht speichern (M12).
     const addRes = await sendPick(ctx, msg, "Dritte F22b");
     assert.strictEqual(addRes, true);
+    const busyText = msg.channel.replies.map((r) => String(r[0]?.content ?? r[0])).join("\n");
+    assert.match(busyText, /Zuordnung fertig/);
 
-    // Rest des Laufs + finally-Nachlauf abschließen.
+    // Rest des Laufs abschließen. Die schon im Draft stehenden Namen werden fertig.
     await started;
     await settle();
 
     const entries = db.listDraftEntries(draft.id);
     const rest = entries.filter((e) => e.link_status === "pending");
-    assert.strictEqual(rest.length, 0, "no entry stays pending after finally rerun (F22 second hole)");
-    assert.strictEqual(entries.length, 3, "third name present");
+    assert.strictEqual(rest.length, 0, "no entry stays pending after the in-flight run");
+    assert.strictEqual(entries.length, 2, "paste while busy is not stored");
+    assert.ok(!entries.some((e) => e.raw_name === "Dritte F22b"));
     assert.strictEqual(assistant.busyUsers.has("F22buser"), false, "busy cleared after finally rerun");
     assert.strictEqual(assistant.rerunUsers.has("F22buser"), false, "rerun drained");
   } finally {
@@ -916,4 +921,254 @@ test("F26: command-line inside a multi-line DM is rejected loudly, peers still s
   assert.ok(!names.includes("ändern 3 Neuer Name"), "command line not stored as name");
   const text = msg.channel.replies.map((r) => String(r[0]?.content ?? r[0])).join("\n");
   assert.match(text, /Befehl/i, "command line named in the reply, not silently swallowed");
+});
+
+function replyText(msg) {
+  return msg.channel.replies.map((r) => String(r[0]?.content ?? r[0])).join("\n");
+}
+
+test("closed, not-open and channel-missing get their sentence and do not add names", async () => {
+  const origPart = membership.canParticipate;
+  const origAdd = db.addDraftNames;
+  let adds = 0;
+  db.addDraftNames = (...args) => {
+    adds += 1;
+    return origAdd(...args);
+  };
+  const season = db.getAnnouncedSeason();
+  const cases = [
+    [{ ok: false, reason: "closed", season: { year: 2026 } }, "Die Tippzeit für 2026 ist vorbei, deine Liste ist zu."],
+    [{ ok: false, reason: "not-open" }, "Die Anmeldung ist noch nicht offen. Sobald sie aufgeht, schreibst du die Namen hierher."],
+    [{ ok: false, reason: "channel-missing" }, "Den Anmeldekanal gibt es nicht mehr. Sag einem Admin Bescheid, ich habe nichts gespeichert."],
+  ];
+  try {
+    for (const [part, sentence] of cases) {
+      adds = 0;
+      const { ctx, msg } = fakeCtx("gate-" + part.reason, "Gate");
+      membership.canParticipate = async () => part;
+      const res = await sendPick(ctx, msg, "Angela Merkel");
+      assert.strictEqual(res, true, part.reason);
+      assert.strictEqual(adds, 0, part.reason + " must not add names");
+      assert.ok(replyText(msg).includes(sentence), replyText(msg));
+    }
+    assert.ok(season);
+  } finally {
+    membership.canParticipate = origPart;
+    db.addDraftNames = origAdd;
+  }
+});
+
+test("hallo and Merkel, Angela do not call addDraftNames", async () => {
+  const origAdd = db.addDraftNames;
+  let adds = 0;
+  db.addDraftNames = (...args) => {
+    adds += 1;
+    return origAdd(...args);
+  };
+  try {
+    const { ctx, msg } = fakeCtx("smalltalk-m12", "Small");
+    const hallo = await sendPick(ctx, msg, "hallo");
+    assert.strictEqual(hallo, true);
+    assert.match(replyText(msg), /nicht als Namen gelesen/);
+    assert.ok(!/Komma klebt/.test(replyText(msg)));
+    msg.channel.replies.length = 0;
+    const comma = await sendPick(ctx, msg, "Merkel, Angela");
+    assert.strictEqual(comma, true);
+    assert.match(replyText(msg), /Komma klebt/);
+    assert.match(replyText(msg), /Angela Merkel/);
+    assert.strictEqual(adds, 0);
+    assert.strictEqual(playerId("smalltalk-m12"), null);
+  } finally {
+    db.addDraftNames = origAdd;
+  }
+});
+
+test("öffnen alone does not change a finalized draft", async () => {
+  const season = db.getAnnouncedSeason();
+  const { ctx, msg } = fakeCtx("offen-m12", "Offen");
+  const pid = db
+    .getDb()
+    .prepare("INSERT INTO players (display_name, discord_user_id, base_points) VALUES ('Offen','offen-m12','0')")
+    .run().lastInsertRowid;
+  const draft = db.getOrCreateDraft(pid, season.id);
+  db.addDraftNames(draft.id, ["Bleibt So"]);
+  const entry = db.listDraftEntries(draft.id)[0];
+  db.setDraftEntryLinked(entry.id, {
+    wikiUrl: "https://en.wikipedia.org/wiki/Bleibt_So",
+    wikiNorm: "en:bleibt_so",
+    qid: "QBLEIBT",
+    proposedAge: 40,
+    linkStatus: "linked",
+  });
+  const fin = db.finalizeDraft(pid, season.id);
+  assert.ok(fin.added === 1);
+  const picksBefore = db.getAnnouncedSeasonPicksForPlayer(pid, season.id).length;
+  const res = await sendPick(ctx, msg, "öffnen");
+  assert.strictEqual(res, true);
+  assert.strictEqual(db.getDraftForPlayer(pid, season.id).status, "finalized");
+  assert.strictEqual(db.getAnnouncedSeasonPicksForPlayer(pid, season.id).length, picksBefore);
+  assert.ok(!/ohne Tipps/.test(replyText(msg)));
+});
+
+test("first fertig with unlinked names the person and does not freeze; second fertig does", async () => {
+  const season = db.getAnnouncedSeason();
+  const active = db.getActiveSeason();
+  const { ctx, msg } = fakeCtx("unlink-m12", "Unlink");
+  const pid = db
+    .getDb()
+    .prepare("INSERT INTO players (display_name, discord_user_id, base_points) VALUES ('Unlink','unlink-m12','0')")
+    .run().lastInsertRowid;
+  const draft = db.getOrCreateDraft(pid, season.id);
+  db.addDraftNames(draft.id, ["Angela Merkel"]);
+  const entry = db.listDraftEntries(draft.id)[0];
+  db.setDraftEntryLinked(entry.id, {
+    linkStatus: "unlinked",
+    qid: null,
+    wikiNorm: "",
+    wikiUrl: "",
+  });
+  // Laufender Pick, damit der zweite fertig keine Wiki-Suche in der Review anstößt.
+  const cid = db
+    .getDb()
+    .prepare(
+      `INSERT INTO celebs (name, name_key, is_alive, wiki_confirmed, exclude_from_auto)
+       VALUES ('Angela Merkel', 'angela merkel', 1, 0, 0)`
+    )
+    .run().lastInsertRowid;
+  const holder = db
+    .getDb()
+    .prepare("INSERT INTO players (display_name, discord_user_id, base_points) VALUES ('Holder','holder-m12','0')")
+    .run().lastInsertRowid;
+  db.getDb().prepare("INSERT INTO picks (player_id, celeb_id, season_id) VALUES (?, ?, ?)").run(holder, cid, active.id);
+
+  const first = await sendPick(ctx, msg, "fertig");
+  assert.strictEqual(first, true);
+  const firstText = replyText(msg);
+  assert.match(firstText, /Angela Merkel/);
+  assert.ok(!/eingefroren/i.test(firstText), firstText);
+  assert.strictEqual(db.getDraftForPlayer(pid, season.id).status, "draft");
+
+  msg.channel.replies.length = 0;
+  const second = await sendPick(ctx, msg, "fertig");
+  assert.strictEqual(second, true);
+  assert.strictEqual(db.getDraftForPlayer(pid, season.id).status, "finalized");
+});
+
+test("worst case: foreign draft rowid and select index 9 do not write", async () => {
+  const season = db.getAnnouncedSeason();
+  const owner = db
+    .getDb()
+    .prepare("INSERT INTO players (display_name, discord_user_id, base_points) VALUES ('Owner','owner-m12','0')")
+    .run().lastInsertRowid;
+  db.getDb()
+    .prepare("INSERT INTO players (display_name, discord_user_id, base_points) VALUES ('Stranger','stranger-m12','0')")
+    .run();
+  const draft = db.getOrCreateDraft(owner, season.id);
+  const candidates = [
+    { title: "Kandidat A", url: "https://en.wikipedia.org/wiki/Kandidat_A", norm: "en:kandidat_a", qid: "QA", proposedAge: 50 },
+    { title: "Kandidat B", url: "https://en.wikipedia.org/wiki/Kandidat_B", norm: "en:kandidat_b", qid: "QB", proposedAge: 51 },
+  ];
+  const entryId = db
+    .getDb()
+    .prepare(
+      `INSERT INTO pick_draft_entries
+         (draft_id, position, raw_name, link_status, wiki_url, candidates_json)
+       VALUES (?, 1, 'Gleicher Name', 'ambiguous', 'https://en.wikipedia.org/wiki/Do_Not_Touch', ?)`
+    )
+    .run(draft.id, JSON.stringify(candidates)).lastInsertRowid;
+
+  function rowSnapshot() {
+    return db.getDb().prepare("SELECT wiki_url, wiki_norm, qid, link_status, candidates_json FROM pick_draft_entries WHERE id = ?").get(entryId);
+  }
+  function interaction(userId, value) {
+    const notes = [];
+    return {
+      notes,
+      isStringSelectMenu: () => true,
+      customId: `pka:pick:${entryId}`,
+      deferred: false,
+      deferUpdate: async () => {},
+      editReply: async () => {},
+      followUp: async (payload) => {
+        notes.push(payload);
+      },
+      channel: { async send() { return { edit: async () => {} }; }, async reply() {} },
+      user: { id: String(userId) },
+      values: [String(value)],
+    };
+  }
+
+  const before = rowSnapshot();
+  const { ctx } = fakeCtx("owner-m12", "Owner");
+  const foreign = interaction("stranger-m12", 0);
+  const handled = await assistant.handlePickInteraction(ctx, foreign);
+  assert.strictEqual(handled, true);
+  assert.deepStrictEqual(rowSnapshot(), before, "foreign user must not write the row");
+  assert.match(String(foreign.notes[0]?.content || ""), /nicht deine offene Auswahl/);
+
+  const outOfRange = interaction("owner-m12", 9);
+  const handledRange = await assistant.handlePickInteraction(ctx, outOfRange);
+  assert.strictEqual(handledRange, true);
+  assert.deepStrictEqual(rowSnapshot(), before, "index 9 with two candidates must not write");
+  assert.match(String(outOfRange.notes[0]?.content || ""), /nicht deine offene Auswahl/);
+
+  db.getDb()
+    .prepare("UPDATE pick_draft_entries SET link_status = 'linked', qid = 'QA', wiki_norm = 'en:kandidat_a' WHERE id = ?")
+    .run(entryId);
+  const linked = rowSnapshot();
+  const again = interaction("owner-m12", 0);
+  const handledAgain = await assistant.handlePickInteraction(ctx, again);
+  assert.strictEqual(handledAgain, true);
+  assert.deepStrictEqual(rowSnapshot(), linked, "second click must not write");
+  assert.match(String(again.notes[0]?.content || ""), /Schon gewählt: Kandidat A/);
+});
+
+test("announce channel tells the user to use DM and stores nothing", async () => {
+  const season = db.getAnnouncedSeason();
+  const { ctx, msg } = fakeCtx("chan-m12", "Chan");
+  msg.guildId = "guild-test";
+  msg.channelId = season.announce_channel_id;
+  const res = await sendPick(ctx, msg, "Angela Merkel");
+  assert.strictEqual(res, true);
+  assert.match(replyText(msg), /Namen nur per DM/);
+  assert.strictEqual(playerId("chan-m12"), null);
+
+  msg.channel.replies.length = 0;
+  msg.channelId = "some-other-channel";
+  const other = await sendPick(ctx, msg, "Angela Merkel");
+  assert.strictEqual(other, false);
+  assert.strictEqual(msg.channel.replies.length, 0);
+
+  msg.channelId = season.announce_channel_id;
+  msg.content = "!picks";
+  const prefixed = await assistant.tryConsumePickMessage(ctx, msg);
+  assert.strictEqual(prefixed, false);
+});
+
+test("unavailable keeps the line and replays it once participation works", async () => {
+  const origPart = membership.canParticipate;
+  const season = db.getAnnouncedSeason();
+  try {
+    const { ctx, msg } = fakeCtx("replay-m12", "Replay");
+    membership.canParticipate = async () => ({ ok: false, reason: "unavailable" });
+    const blocked = await sendPick(ctx, msg, "Replay Person");
+    assert.strictEqual(blocked, true);
+    assert.match(replyText(msg), /Zeile behalten/);
+    assert.strictEqual(playerId("replay-m12"), null);
+
+    membership.canParticipate = async () => ({ ok: true, season });
+    msg.channel.replies.length = 0;
+    const again = await sendPick(ctx, msg, "hallo");
+    assert.strictEqual(again, true);
+    const pid = playerId("replay-m12");
+    const draft = db.getDraftForPlayer(pid, season.id);
+    const names = db.listDraftEntries(draft.id).map((e) => e.raw_name);
+    assert.ok(names.includes("Replay Person"), names.join(","));
+    assert.ok(!names.includes("hallo"));
+  } finally {
+    membership.canParticipate = origPart;
+    assistant.busyUsers.delete("replay-m12");
+    assistant.rerunUsers.delete("replay-m12");
+    assistant.interruptUsers.delete("replay-m12");
+  }
 });

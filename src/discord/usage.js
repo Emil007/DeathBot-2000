@@ -12,7 +12,7 @@ function uniqueCommands(commands) {
 
 function usageReply(cmd, config) {
   const p = config?.prefix || "!";
-  const lines = ["So geht’s:"];
+  const lines = ["So, und nicht anders:"];
   if (cmd.usage) {
     lines.push(cmd.usage.replaceAll("{prefix}", p));
   } else {

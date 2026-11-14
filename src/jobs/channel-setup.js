@@ -8,32 +8,150 @@ const {
 } = require("discord.js");
 const db = require("../db");
 const { logError } = require("../discord/log");
-const { createNextSeasonChannel } = require("./year-rollover");
+const { resolveAdminTarget } = require("../discord/admin-notify");
+const yearRollover = require("./year-rollover");
 
 /**
  * Interaktives Deathpool-Kanal-Setup.
  *
- * Ersetzt die CHANNEL_DEATHPOOL-Konfiguration: Beim Start wird geprüft, ob die
- * aktive Saison bereits einen verknüpften Deathpool-Kanal hat. Falls ja, ist
- * nichts zu tun. Falls nein, wird auf der Guild nach einem Kanal namens
- * `deathpool-{Jahr}` gesucht:
+ * Aktive Saison hat schon eine deathpool_channel_id → sofort fertig.
+ * Sonst einmalig den Env-Kanal (config.channelDeathpool) verknüpfen, wenn er
+ * ein GuildText dieser Guild ist. Sonst Admin-Frage. onDecided feuert erst,
+ * wenn ein Zielkanal sicher ist — nicht bei Guild-Ausfall, Fetch-Fehler oder
+ * misslungener Anlage.
  *
- *  - gefunden  → blockierende Admin-Frage (Buttons + Dropdown), ewig wartend.
- *  - nicht da  → direkt `deathpool-{Jahr}` anlegen (wie createNextSeasonChannel)
- *                und mit der aktiven Saison verknüpfen.
- *
- * WICHTIG: Der Setup läuft asynchron im Hintergrund und blockiert den Rest der
- * Start-Routine NICHT. Nur der Deathpool-Start-Nachhol (runYearRollover) wartet:
- * onDecided feuert GENAU EINMAL, sobald ein Zielkanal sicher ist (oder sofort
- * synchron, wenn die aktive Saison bereits einen Kanal hat).
- *
- * Die Setup-Läufe, deren Admin-Entscheid noch offen ist, werden in einem
- * Modul-Set registriert. Solange ein Lauf offen ist, werden eingehende
- * `dp:setup:*`-Interaktionen von handleChannelSetupInteraction() verarbeitet.
+ * Offene Läufe liegen in setup-state.js (M5). Diese Datei hält kein eigenes
+ * openSetups mehr.
  */
 
-// Season-Id -> laufender Setup-Zustand (noch nicht entschieden).
-const openSetups = new Map();
+const META_KEY = "channel_setup_open";
+const RETRY_MS = 30_000;
+
+const setupState = loadSetupState();
+
+/** Saison, deren Frage gerade steht (eine zur Zeit). */
+let trackedSeasonId = null;
+/** seasonId → onDecided, falls setup-state die Funktion nicht zurückgibt. */
+const deciders = new Map();
+/** seasonId → zuletzt bestätigter Kanalname (für „Schon erledigt“). */
+const recentlyDecided = new Map();
+/** seasonId → Dropdown-Rückfrage, zusätzlich am Eintrag. */
+const pendingPickBySeason = new Map();
+/** Saisons, deren onDecided in diesem Prozess schon lief. */
+const decidedSeasonIds = new Set();
+
+const localNameChains = new Map();
+let setupChain = Promise.resolve();
+
+let waitGen = 0;
+let onceArmed = false;
+let onceListener = null;
+let waitTimer = null;
+
+function loadSetupState() {
+  try {
+    return require("./setup-state");
+  } catch (e) {
+    if (e && (e.code === "MODULE_NOT_FOUND" || e.code === "ERR_MODULE_NOT_FOUND")) {
+      // ANNAHME: M5 ist in diesem Workspace noch nicht gemerged. Der Fallback
+      // spricht dieselbe Signatur; sobald setup-state.js liegt, wird er benutzt.
+      console.warn("[channel-setup] setup-state.js fehlt — Vertrags-Fallback, bis M5 gemerged ist.");
+      return createFallbackSetupState();
+    }
+    throw e;
+  }
+}
+
+function createFallbackSetupState() {
+  const open = new Map();
+  return {
+    markOpen(seasonId, data) {
+      const key = String(seasonId);
+      const prev = open.get(key);
+      if (prev) {
+        Object.assign(prev, data);
+        return prev;
+      }
+      const entry = { deciding: false, pendingPickId: null, ...data };
+      open.set(key, entry);
+      return entry;
+    },
+    getOpen(seasonId) {
+      return open.get(String(seasonId)) || null;
+    },
+    isAnyOpen() {
+      return open.size > 0;
+    },
+    clearOpen(seasonId) {
+      open.delete(String(seasonId));
+    },
+    retarget(oldSeasonId, newSeasonId) {
+      const oldKey = String(oldSeasonId);
+      const newKey = String(newSeasonId);
+      if (oldKey === newKey) return open.get(oldKey) || null;
+      const entry = open.get(oldKey);
+      if (!entry) return open.get(newKey) || null;
+      open.delete(oldKey);
+      const dest = open.get(newKey);
+      if (dest) {
+        Object.assign(dest, entry, { deciding: dest.deciding || entry.deciding });
+        return dest;
+      }
+      open.set(newKey, entry);
+      return entry;
+    },
+    tryBeginDecide(seasonId) {
+      const entry = open.get(String(seasonId));
+      if (!entry || entry.deciding) return false;
+      entry.deciding = true;
+      return true;
+    },
+    abortDecide(seasonId) {
+      const entry = open.get(String(seasonId));
+      if (entry) entry.deciding = false;
+    },
+    _clearAll() {
+      open.clear();
+    },
+  };
+}
+
+let mentionOptsImpl = null;
+let mentionOptsLoaded = false;
+function mentionOpts() {
+  if (!mentionOptsLoaded) {
+    mentionOptsLoaded = true;
+    try {
+      const mod = require("../discord/safe-text");
+      if (typeof mod.mentionOpts === "function") mentionOptsImpl = mod.mentionOpts;
+    } catch (e) {
+      if (e && e.code !== "MODULE_NOT_FOUND" && e.code !== "ERR_MODULE_NOT_FOUND") throw e;
+    }
+  }
+  return mentionOptsImpl ? mentionOptsImpl() : { allowedMentions: { parse: [] } };
+}
+
+function lockChannelName(name, fn) {
+  const impl =
+    typeof yearRollover.withChannelNameLock === "function"
+      ? yearRollover.withChannelNameLock
+      : fallbackNameLock;
+  return Promise.resolve(impl(String(name), fn));
+}
+
+function fallbackNameLock(name, fn) {
+  const key = String(name);
+  const prev = localNameChains.get(key) || Promise.resolve();
+  const run = prev.then(() => fn(), () => fn());
+  localNameChains.set(
+    key,
+    run.then(
+      () => {},
+      () => {}
+    )
+  );
+  return run;
+}
 
 function isChannelSetupCustomId(customId) {
   return (
@@ -46,119 +164,253 @@ function isChannelSetupCustomId(customId) {
 }
 
 function isOpen(seasonId) {
-  return openSetups.has(String(seasonId));
+  if (seasonId == null) return false;
+  return !!setupState.getOpen(String(seasonId));
 }
 
-/**
- * Die Guild des Bots ermitteln: zuerst explizite DISCORD_GUILD_ID, sonst die
- * erste Guild, die der Client sehen kann (Guilds-Intent gesetzt). null, wenn
- * keine Guild gefunden wird.
- */
-async function resolveGuild(client, config) {
-  if (config.discordGuildId) {
-    const g = await client.guilds.fetch(config.discordGuildId).catch(() => null);
-    if (g) return g;
-  }
-  try {
-    const list = await client.guilds.fetch();
-    let g = null;
-    if (list?.first) g = list.first();
-    else if (Array.isArray(list)) g = list[0];
-    else if (list?.id) g = list; // Fake/robust: einzelne Guild-Instanz
-    if (g) {
-      // .fetch() über die Liste kann magere Objekte liefern — nachladen.
-      if (g.channels?.cache) return g;
-      const full = await client.guilds.fetch(g.id).catch(() => null);
-      if (full) return full;
-    }
-  } catch {
-    /* keine Guild erreichbar */
-  }
-  return null;
+function errorCode(err) {
+  if (err == null || typeof err !== "object") return null;
+  const raw = err.code ?? err.rawError?.code ?? err.status ?? err.httpStatus ?? null;
+  return raw == null ? null : raw;
 }
 
-/** Alle GuildText-Kanäle der Guild (type 0), sortiert nach Namen. */
-function listGuildTextChannels(guild) {
-  const out = [];
-  const cache = guild?.channels?.cache;
-  if (cache?.values) {
-    for (const c of cache.values()) {
-      if (c?.type === ChannelType.GuildText) out.push(c);
-    }
-  } else if (Array.isArray(guild?.channels)) {
-    for (const c of guild.channels) {
-      if (c?.type === ChannelType.GuildText) out.push(c);
-    }
-  }
-  out.sort((a, b) => String(a.name || "").localeCompare(String(b.name || "")));
-  return out;
+function is10003(err) {
+  return Number(errorCode(err)) === 10003;
 }
 
-/**
- * Baut die blockierende Admin-Frage: Button „Diesen nehmen" (customId
- * `dp:setup:use:<channelId>`) + Button „Neuen Kanal anlegen" sowie ein
- * Dropdown mit allen GuildText-Kanälen der Guild (customId `dp:setup:pick`).
- */
-function buildSetupComponents(guild, year, found) {
-  const textChannels = listGuildTextChannels(guild);
-  const buttonsRow = new ActionRowBuilder().addComponents(
-    new ButtonBuilder()
-      .setCustomId(found ? `dp:setup:use:${found.id}` : "dp:setup:new")
-      .setLabel("Diesen nehmen")
-      .setStyle(ButtonStyle.Primary),
-    new ButtonBuilder()
-      .setCustomId("dp:setup:new")
-      .setLabel("Neuen Kanal anlegen")
-      .setStyle(ButtonStyle.Success)
-  );
-  const rows = [buttonsRow];
-  if (textChannels.length) {
-    const options = textChannels.slice(0, 25).map((c) =>
-      new StringSelectMenuOptionBuilder()
-        .setLabel(`#${String(c.name).slice(0, 100)}`)
-        .setValue(String(c.id)) // Value = Kanal-ID (Spec)
-    );
-    const menu = new StringSelectMenuBuilder()
-      .setCustomId("dp:setup:pick")
-      .setPlaceholder(`Anderen Kanal wählen (${textChannels.length})`)
-      .addOptions(options);
-    rows.push(new ActionRowBuilder().addComponents(menu));
-  }
-  return rows;
+function isMissingPermissions(code) {
+  return Number(code) === 50013;
 }
 
-/** Sende-Ziel der Setup-Frage: CHANNEL_ADMIN-Kanal, sonst DM an den Admin. */
-async function resolveSetupTarget(client, config) {
-  if (config.channelAdmin) {
-    const ch = await client.channels.fetch(config.channelAdmin).catch(() => null);
-    if (ch?.isTextBased?.() || ch?.send) return { channel: ch, dm: false };
-  }
-  if (config.adminId) {
-    const user = await client.users.fetch(config.adminId).catch(() => null);
-    if (user?.createDM) {
-      const dm = await user.createDM().catch(() => null);
-      if (dm?.send) return { channel: dm, dm: true };
-    }
-  }
-  return null;
+function displayChannelName(raw) {
+  const cleaned = String(raw ?? "")
+    .replace(/[\u0000-\u001F\u007F]/g, " ")
+    .replace(/[*_~|`<>@[\]()]/g, "")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, 80);
+  return cleaned || "Unbenannt";
 }
 
-/** Verknüpft einen Kanal mit der aktiven Saison (best effort, loggt Fehler). */
-async function linkChannel(client, config, seasonId, channelId, label) {
-  try {
-    db.setSeasonDeathpoolChannel(String(seasonId), String(channelId));
-    console.log(`[channel-setup] Deathpool-Kanal ${label} (${channelId}) mit Saison verknüpft`);
-  } catch (e) {
-    console.error("[channel-setup] setSeasonDeathpoolChannel failed:", e.message);
-    await logError(client, config, e, {
-      where: "channel-setup link",
-      detail: `season=${seasonId} channel=${channelId}`,
+function channelGuildId(channel) {
+  if (!channel) return null;
+  return channel.guildId || channel.guild?.id || channel.guild_id || null;
+}
+
+function isGuildText(channel, guild) {
+  if (!channel || channel.type !== ChannelType.GuildText) return false;
+  const gid = channelGuildId(channel);
+  // Abweichende Guild-Id ist ein fremder Kanal. Fehlt die Id, stammt der
+  // Kanal aus dem guild-scoped Fetch (Tests lassen sie oft weg).
+  if (guild?.id && gid && String(gid) !== String(guild.id)) return false;
+  return true;
+}
+
+function normalizeList(fetched) {
+  if (!fetched) return [];
+  if (Array.isArray(fetched)) return fetched.filter(Boolean);
+  if (typeof fetched.values === "function") return [...fetched.values()].filter(Boolean);
+  if (typeof fetched.forEach === "function") {
+    const out = [];
+    fetched.forEach((c) => {
+      if (c) out.push(c);
     });
+    return out;
+  }
+  return [];
+}
+
+function sortByName(list) {
+  return [...list].sort((a, b) => String(a.name || "").localeCompare(String(b.name || ""), "de"));
+}
+
+function findNamed(list, needle) {
+  const want = String(needle).toLowerCase();
+  return list.find((c) => String(c.name || "").toLowerCase() === want) || null;
+}
+
+async function loadGuildTextChannels(guild) {
+  if (typeof guild?.channels?.fetch !== "function") {
+    const err = new Error("guild.channels.fetch fehlt");
+    err.unavailable = true;
+    throw err;
+  }
+  const raw = await guild.channels.fetch();
+  return normalizeList(raw).filter((c) => isGuildText(c, guild));
+}
+
+function asIdSet(raw) {
+  if (!raw) return new Set();
+  if (raw instanceof Set) return new Set([...raw].map((id) => String(id)));
+  if (Array.isArray(raw)) return new Set(raw.map((id) => String(id)));
+  return new Set();
+}
+
+function deleteSetupMeta() {
+  let handle;
+  try {
+    handle = db.getDb();
+  } catch {
+    return;
+  }
+  try {
+    handle.prepare("DELETE FROM meta WHERE key = ?").run(META_KEY);
+  } catch (e) {
+    console.error("[channel-setup] meta delete failed:", e.message);
   }
 }
 
-/** Feuert onDecided genau einmal — kapselt den Deathpool-Start-Nachhol. */
-async function callDecided(client, config, onDecided, where) {
+function closeSetup(seasonId) {
+  const id = seasonId == null ? trackedSeasonId : String(seasonId);
+  if (id) {
+    try {
+      setupState.clearOpen(id);
+    } catch (e) {
+      console.error("[channel-setup] clearOpen failed:", e.message);
+    }
+    deciders.delete(id);
+    pendingPickBySeason.delete(id);
+  }
+  if (!id || trackedSeasonId === id) trackedSeasonId = null;
+  deleteSetupMeta();
+}
+
+function publishOpen(seasonId, data) {
+  const id = String(seasonId);
+  if (trackedSeasonId && trackedSeasonId !== id) {
+    try {
+      setupState.clearOpen(trackedSeasonId);
+    } catch {
+      /* alte Frage schließen */
+    }
+    deciders.delete(trackedSeasonId);
+    pendingPickBySeason.delete(trackedSeasonId);
+  }
+  trackedSeasonId = id;
+  if (typeof data.onDecided === "function") deciders.set(id, data.onDecided);
+  let stored = null;
+  try {
+    stored = setupState.markOpen(id, data) || null;
+  } catch (e) {
+    console.error("[channel-setup] markOpen failed:", e.message);
+  }
+  try {
+    db.setMeta(META_KEY, id);
+  } catch (e) {
+    console.error("[channel-setup] channel_setup_open meta failed:", e.message);
+  }
+  return stored || setupState.getOpen(id) || data;
+}
+
+function retargetEntry(oldId, newId) {
+  const from = String(oldId);
+  const to = String(newId);
+  if (from === to) return to;
+  const cb = deciders.get(from);
+  const pending = pendingPickBySeason.get(from);
+  try {
+    setupState.retarget(from, to);
+  } catch (e) {
+    console.error("[channel-setup] retarget failed:", e.message);
+    try {
+      setupState.clearOpen(from);
+    } catch {
+      /* nicht auf die archivierte Id weiterverwenden */
+    }
+  }
+  if (!setupState.getOpen(to) && setupState.getOpen(from)) {
+    try {
+      setupState.clearOpen(from);
+    } catch {
+      /* archivierte Zeile nicht beschrieben */
+    }
+  }
+  if (cb) {
+    deciders.delete(from);
+    deciders.set(to, cb);
+  }
+  if (pending) {
+    pendingPickBySeason.delete(from);
+    pendingPickBySeason.set(to, pending);
+  }
+  trackedSeasonId = to;
+  if (setupState.getOpen(to)) {
+    try {
+      db.setMeta(META_KEY, to);
+    } catch (e) {
+      console.error("[channel-setup] meta retarget failed:", e.message);
+    }
+  }
+  return to;
+}
+
+function disarmWait() {
+  waitGen += 1;
+  onceArmed = false;
+  if (waitTimer) {
+    clearTimeout(waitTimer);
+    waitTimer = null;
+  }
+  if (onceListener) {
+    const { client, handler } = onceListener;
+    onceListener = null;
+    if (typeof client?.off === "function") client.off("guildAvailable", handler);
+    else if (typeof client?.removeListener === "function") client.removeListener("guildAvailable", handler);
+  }
+}
+
+function armUnavailableRetry(client, config, onDecided) {
+  // Einmalig nach guildAvailable, plus ein weiterer Versuch nach 30s,
+  // solange die Guild dann verfügbar ist und noch kein Kanal verknüpft ist.
+  const gen = waitGen;
+  if (!onceArmed && typeof client?.once === "function") {
+    onceArmed = true;
+    const handler = () => {
+      if (gen !== waitGen) return;
+      onceArmed = false;
+      onceListener = null;
+      runDeathpoolChannelSetup(client, config, { onDecided }).catch((e) => {
+        console.error("[channel-setup] guildAvailable retry failed:", e.message);
+      });
+    };
+    try {
+      client.once("guildAvailable", handler);
+      onceListener = { client, handler };
+    } catch (e) {
+      onceArmed = false;
+      console.error("[channel-setup] guildAvailable hook failed:", e.message);
+    }
+  }
+  if (!waitTimer) {
+    waitTimer = setTimeout(() => {
+      if (gen !== waitGen) return;
+      waitTimer = null;
+      runDeathpoolChannelSetup(client, config, { onDecided }).catch((e) => {
+        console.error("[channel-setup] 30s retry failed:", e.message);
+      });
+    }, RETRY_MS);
+    if (typeof waitTimer.unref === "function") waitTimer.unref();
+  }
+}
+
+async function replayUnannounced(client, config, where) {
+  try {
+    const announce = require("../discord/announce");
+    if (typeof announce.replayUnannounced === "function") {
+      await announce.replayUnannounced(client, config);
+    }
+  } catch (e) {
+    if (e && (e.code === "MODULE_NOT_FOUND" || e.code === "ERR_MODULE_NOT_FOUND")) return;
+    console.error(`[channel-setup] replayUnannounced (${where}) failed:`, e.message);
+    await logError(client, config, e, { where: `channel-setup replayUnannounced ${where}` });
+  }
+}
+
+async function callDecided(client, config, onDecided, where, seasonId) {
+  const key = seasonId == null ? null : String(seasonId);
+  if (key && decidedSeasonIds.has(key)) return;
+  if (key) decidedSeasonIds.add(key);
+  await replayUnannounced(client, config, where);
   if (typeof onDecided !== "function") return;
   try {
     await onDecided();
@@ -169,228 +421,803 @@ async function callDecided(client, config, onDecided, where) {
 }
 
 /**
- * Führt den interaktiven Kanal-Setup aus. Antwortet SOFORT (löst onDecided),
- * wenn die aktive Saison bereits einen Deathpool-Kanal hat. Sonst: Kanal
- * `deathpool-{Jahr}` auf der Guild suchen — gefunden → blockierende Admin-Frage,
- * nicht gefunden → direkt anlegen+verknüpfen. In JEDEM Fall feuert onDecided
- * genau einmal (synchron im Fall 1, nach dem Anlegen bzw. nach der
- * Admin-Entscheidung).
+ * Nur config.discordGuildId. Kein „erste Guild“.
+ * available === false oder Fetch-Wurf → unavailable (nichts anlegen).
  */
-async function runDeathpoolChannelSetup(client, config, { onDecided } = {}) {
+async function resolveGuild(client, config) {
+  if (!config?.discordGuildId) return { guild: null, reason: "no-id" };
+  try {
+    const guild = await client.guilds.fetch(config.discordGuildId);
+    if (!guild) return { guild: null, reason: "missing" };
+    if (guild.available === false) return { guild: null, reason: "unavailable" };
+    return { guild, reason: "ok" };
+  } catch (e) {
+    return { guild: null, reason: "unavailable", error: e };
+  }
+}
+
+async function resolveSetupTarget(client, config) {
+  // preferDmUser immer mitgeben, auch wenn CHANNEL_ADMIN gesetzt aber nicht sendbar ist.
+  let preferDmUser = null;
+  if (config.adminId) {
+    try {
+      const user = await client.users.fetch(config.adminId);
+      if (user?.createDM) preferDmUser = user;
+    } catch (e) {
+      console.warn("[channel-setup] Admin-User nicht ladbar:", e.message);
+    }
+  }
+  try {
+    const channel = await resolveAdminTarget({ client, config }, { preferDmUser });
+    if (channel?.send) return channel;
+  } catch (e) {
+    console.error("[channel-setup] Admin-Ziel fehlgeschlagen:", e.message);
+    await logError(client, config, e, { where: "channel-setup resolveSetupTarget" });
+  }
+  return null;
+}
+
+function buildQuestionText({ year, found, textCount }) {
+  const lines = [];
+  if (found?.name) {
+    const name = displayChannelName(found.name);
+    lines.push(
+      `Hey, da läuft schon eine Season (${year}) und ich hab den Kanal #${name} gefunden — soll ich den nehmen, einen anderen, oder einen neuen machen?`
+    );
+    lines.push(
+      `Drei Wege: \`#${name}\` nehmen, einen anderen Kanal aus der Liste wählen, oder einen neuen anlegen.`
+    );
+  } else {
+    lines.push(
+      `Hey, da läuft schon eine Season (${year}) und ich hab keinen Kanal #deathpool-${year} gefunden — soll ich einen aus der Liste nehmen oder einen neuen machen?`
+    );
+    lines.push(
+      `Drei Wege: einen Kanal aus der Liste wählen, #deathpool-${year} neu anlegen, oder mir die Kanal-ID schreiben.`
+    );
+  }
+  if (textCount > 25) {
+    lines.push(
+      `Es gibt ${textCount} Textkanäle, hier sind die ersten 25 nach Name. Der gesuchte fehlt: schreib mir die Kanal-ID.`
+    );
+  }
+  lines.push("Ohne einen Klick bleibt der Deathpool-Nachhol liegen.");
+  return lines.join("\n");
+}
+
+function buildQuestion(year, found, textChannels) {
+  const sorted = sortByName(textChannels);
+  const shown = sorted.slice(0, 25);
+  const buttons = [];
+  if (found?.id) {
+    buttons.push(
+      new ButtonBuilder()
+        .setCustomId(`dp:setup:use:${found.id}`)
+        .setLabel(`#${found.name} nehmen`.slice(0, 80))
+        .setStyle(ButtonStyle.Primary)
+    );
+  }
+  buttons.push(
+    new ButtonBuilder()
+      .setCustomId("dp:setup:new")
+      .setLabel("Neuen Kanal anlegen")
+      .setStyle(ButtonStyle.Success)
+  );
+  const rows = [new ActionRowBuilder().addComponents(...buttons)];
+  if (shown.length) {
+    const menu = new StringSelectMenuBuilder()
+      .setCustomId("dp:setup:pick")
+      .setPlaceholder(`Anderen Kanal wählen (${sorted.length})`.slice(0, 150))
+      .addOptions(
+        shown.map((c) =>
+          new StringSelectMenuOptionBuilder()
+            .setLabel(`#${String(c.name || "kanal").slice(0, 99)}`.slice(0, 100))
+            .setValue(String(c.id))
+        )
+      );
+    rows.push(new ActionRowBuilder().addComponents(menu));
+  }
+  const offeredChannelIds = new Set(sorted.map((c) => String(c.id)));
+  if (found?.id) offeredChannelIds.add(String(found.id));
+  return {
+    rows,
+    offeredChannelIds,
+    content: buildQuestionText({ year, found, textCount: sorted.length }),
+  };
+}
+
+function successText(name) {
+  const safe = displayChannelName(name);
+  const label = `#${safe}`;
+  return (
+    `Deathpool-Kanal ist **${label}**. Treffer und die Jahresbilanz gehen dorthin.\n` +
+    `Verknüpft: #${safe}. Damit ist die Frage zu.`
+  );
+}
+
+function createFailureText(year, code) {
+  if (isMissingPermissions(code)) return "Mir fehlt das Recht, Kanäle anzulegen.";
+  return `Kanal-Anlage für deathpool-${year} fehlgeschlagen (Details in den Logs).`;
+}
+
+function alreadyExistsText(name) {
+  const safe = displayChannelName(name);
+  return `#${safe} gibt es schon. Den nehmen, oder einen anderen aus der Liste. Einen zweiten mit demselben Namen lege ich nicht an.`;
+}
+
+function decideName(entry, year) {
+  if (entry?.found?.name) return displayChannelName(entry.found.name);
+  return `deathpool-${year || entry?.year || ""}`;
+}
+
+function noEntryText(active) {
+  const id = active?.id == null ? null : String(active.id);
+  if (id && recentlyDecided.has(id)) return `Schon erledigt: #${recentlyDecided.get(id)}.`;
+  if (active?.deathpool_channel_id) return "Schon erledigt.";
+  return "Kanal-Setup ist nicht mehr offen (vermutlich nach einem Neustart). Solange kein Kanal verknüpft ist, kommt die Frage beim nächsten Start wieder.";
+}
+
+function interpretCreate(result) {
+  if (result == null) {
+    return { channel: null, alreadyExists: false, failed: true, existing: null, code: null, error: null };
+  }
+  const looksLikeEnvelope =
+    result.alreadyExists === true ||
+    result.failed === true ||
+    (Object.prototype.hasOwnProperty.call(result, "channel") && result.type == null && result.name == null);
+  if (looksLikeEnvelope) {
+    const ch = result.channel && result.channel.id ? result.channel : null;
+    return {
+      channel: ch,
+      alreadyExists: result.alreadyExists === true,
+      failed: result.failed === true || (result.alreadyExists !== true && !ch),
+      existing: result.existing || null,
+      code: result.code ?? result.error?.code ?? null,
+      error: result.error || null,
+    };
+  }
+  if (result.id) {
+    return { channel: result, alreadyExists: false, failed: false, existing: null, code: null, error: null };
+  }
+  return { channel: null, alreadyExists: false, failed: true, existing: null, code: null, error: null };
+}
+
+/**
+ * Fetch zuerst. Wirft er, wird createNextSeasonChannel nicht aufgerufen —
+ * die aktuelle Implementierung würde nach einem Fetch-Fehler sonst trotzdem anlegen.
+ */
+async function provisionChannel(client, config, guild, year, { reuse }) {
+  if (!guild || guild.available === false) {
+    return { ok: false, unavailable: true, error: new Error("guild unavailable") };
+  }
+  const needle = `deathpool-${year}`;
+  let list;
+  try {
+    list = await loadGuildTextChannels(guild);
+  } catch (error) {
+    return { ok: false, unavailable: true, error };
+  }
+  const before = findNamed(list, needle);
+  if (reuse === false && before) {
+    try {
+      await yearRollover.createNextSeasonChannel(client, config, year, { reuse: false });
+    } catch (error) {
+      console.error("[channel-setup] createNextSeasonChannel (vorhandener Name):", error.message);
+      await logError(client, config, error, {
+        where: "channel-setup createNextSeasonChannel",
+        detail: `year=${year} reuse=false`,
+      });
+    }
+    return { ok: false, alreadyExists: true, existing: before };
+  }
+  let raw;
+  try {
+    raw = await yearRollover.createNextSeasonChannel(
+      client,
+      config,
+      year,
+      reuse === false ? { reuse: false } : { reuse: true }
+    );
+  } catch (error) {
+    return { ok: false, error, code: errorCode(error) };
+  }
+  const parsed = interpretCreate(raw);
+  if (parsed.alreadyExists || (before && parsed.channel && String(parsed.channel.id) === String(before.id) && reuse === false)) {
+    return { ok: false, alreadyExists: true, existing: before || parsed.existing || parsed.channel };
+  }
+  if (parsed.failed || !parsed.channel?.id) {
+    return { ok: false, error: parsed.error, code: parsed.code ?? errorCode(parsed.error) };
+  }
+  return { ok: true, channel: parsed.channel };
+}
+
+async function linkChannel(client, config, seasonId, channelId, label) {
+  let active;
+  try {
+    active = db.getActiveSeason();
+  } catch (e) {
+    console.error("[channel-setup] getActiveSeason failed:", e.message);
+    await logError(client, config, e, { where: "channel-setup link active season" });
+    return { ok: false, seasonId: String(seasonId) };
+  }
+  if (!active?.id) return { ok: false, seasonId: String(seasonId) };
+  const targetId = retargetEntry(seasonId, active.id);
+  try {
+    db.setSeasonDeathpoolChannel(targetId, String(channelId));
+    console.log(`[channel-setup] Deathpool-Kanal ${label} (${channelId}) mit Saison ${targetId} verknüpft`);
+    return { ok: true, seasonId: targetId };
+  } catch (e) {
+    console.error("[channel-setup] setSeasonDeathpoolChannel failed:", e.message);
+    await logError(client, config, e, {
+      where: "channel-setup link",
+      detail: `season=${targetId} channel=${channelId}`,
+    });
+    return { ok: false, seasonId: targetId };
+  }
+}
+
+async function finishSetup(seasonId, client, config, linkedName) {
+  const id = String(seasonId);
+  const cb = deciders.get(id) || setupState.getOpen(id)?.onDecided || null;
+  if (linkedName) recentlyDecided.set(id, displayChannelName(linkedName));
+  closeSetup(id);
+  disarmWait();
+  await callDecided(client, config, cb, "decided", id);
+}
+
+function plainChannels(list, guild) {
+  return list.map((c) => ({
+    id: String(c.id),
+    name: String(c.name || ""),
+    type: c.type,
+    guildId: channelGuildId(c) || guild.id,
+  }));
+}
+
+async function runDeathpoolChannelSetup(client, config, opts = {}) {
+  const job = setupChain.then(() => runDeathpoolChannelSetupInner(client, config, opts));
+  setupChain = job.then(
+    () => {},
+    () => {}
+  );
+  return job;
+}
+
+async function runDeathpoolChannelSetupInner(client, config, { onDecided } = {}) {
+  try {
+    return await runDeathpoolChannelSetupBody(client, config, onDecided);
+  } catch (e) {
+    console.error("[channel-setup] setup failed:", e.message);
+    await logError(client, config, e, { where: "channel-setup" });
+    return { mode: "failed", channelId: null };
+  }
+}
+
+async function runDeathpoolChannelSetupBody(client, config, onDecided) {
   const running = db.getActiveSeason();
   const seasonId = String(running.id);
   const year = running.year;
 
-  // Fall 1: Saison hat bereits einen verknüpften Kanal → nichts tun, sofort fertig.
   if (running.deathpool_channel_id) {
-    await callDecided(client, config, onDecided, "linked");
+    const cb = (trackedSeasonId && deciders.get(trackedSeasonId)) || onDecided;
+    if (trackedSeasonId && setupState.getOpen(trackedSeasonId)) closeSetup(trackedSeasonId);
+    else deleteSetupMeta();
+    disarmWait();
+    await callDecided(client, config, cb, "linked", running.id);
     return { mode: "linked", channelId: running.deathpool_channel_id };
   }
 
-  let guild = null;
-  try {
-    guild = await resolveGuild(client, config);
-  } catch (e) {
-    await logError(client, config, e, { where: "channel-setup resolveGuild" });
-  }
-  if (!guild) {
+  const guildRes = await resolveGuild(client, config);
+  if (guildRes.reason === "no-id" || guildRes.reason === "missing") {
+    // ANNAHME: ohne Guild (keine Id oder Fetch liefert null) hängt der Start-Nachhol
+    // nicht ewig — onDecided einmal, kein Anlegen. available === false ist das nicht.
     console.warn("[channel-setup] keine Guild gefunden — Deathpool-Kanal-Setup übersprungen");
-    // Kein rausgeschobener Start-Nachhol möglich (kein Ziel). onDecided wird
-    // trotzdem einmal aufgerufen, damit runYearRollover sauber „ohne Ziel"
-    // durchlaufen kann (postReview loggt no-target false).
-    await callDecided(client, config, onDecided, "no-guild");
+    deleteSetupMeta();
+    disarmWait();
+    await callDecided(client, config, onDecided, "no-guild", seasonId);
     return { mode: "no-guild", channelId: null };
+  }
+  if (guildRes.reason !== "ok") {
+    console.warn("[channel-setup] Guild nicht verfügbar — kein Anlegen, onDecided nicht");
+    if (guildRes.error) {
+      await logError(client, config, guildRes.error, { where: "channel-setup resolveGuild" });
+    }
+    armUnavailableRetry(client, config, onDecided);
+    return { mode: "unavailable", channelId: null };
+  }
+  const guild = guildRes.guild;
+
+  let textChannels;
+  try {
+    textChannels = await loadGuildTextChannels(guild);
+  } catch (e) {
+    console.error("[channel-setup] channels.fetch failed:", e.message);
+    await logError(client, config, e, { where: "channel-setup channels.fetch", detail: `guild=${guild.id}` });
+    armUnavailableRetry(client, config, onDecided);
+    return { mode: "unavailable", channelId: null };
+  }
+
+  let forceDialog = false;
+  if (!running.deathpool_channel_id && config.channelDeathpool) {
+    const envId = String(config.channelDeathpool);
+    try {
+      const envChannel = await client.channels.fetch(envId);
+      if (isGuildText(envChannel, guild)) {
+        const linked = await linkChannel(client, config, seasonId, envChannel.id, `#${envChannel.name || envId}`);
+        if (linked.ok) {
+          const cb = deciders.get(linked.seasonId) || onDecided;
+          closeSetup(linked.seasonId);
+          disarmWait();
+          await callDecided(client, config, cb, "backfill", linked.seasonId);
+          return { mode: "linked", channelId: String(envChannel.id) };
+        }
+      } else {
+        forceDialog = true;
+      }
+    } catch (e) {
+      if (is10003(e)) {
+        forceDialog = true;
+      } else {
+        console.error("[channel-setup] Env-Kanal nicht prüfbar:", e.message);
+        await logError(client, config, e, {
+          where: "channel-setup backfill",
+          detail: `channel=${envId}`,
+        });
+        armUnavailableRetry(client, config, onDecided);
+        return { mode: "unavailable", channelId: null };
+      }
+    }
+  }
+
+  if (setupState.getOpen(seasonId)) {
+    return { mode: "waiting", channelId: null };
   }
 
   const needle = `deathpool-${year}`;
+  const found = findNamed(textChannels, needle);
 
-  // Kanal auf der Guild suchen (nur GuildText, Groß-/Kleinschreibung egal).
-  let found = null;
-  for (const c of listGuildTextChannels(guild)) {
-    if (String(c.name).toLowerCase() === needle.toLowerCase()) {
-      found = c;
-      break;
-    }
-  }
-
-  if (!found) {
-    // Fall: Kein Kanal gefunden → direkt anlegen (wie createNextSeasonChannel)
-    // und verknüpfen. Dann onDecided.
+  if (!found && !forceDialog) {
     console.log(`[channel-setup] kein #${needle} gefunden — lege Kanal an`);
-    let channel = null;
-    try {
-      channel = await createNextSeasonChannel(client, config, year);
-    } catch (e) {
-      await logError(client, config, e, {
-        where: "channel-setup createNextSeasonChannel",
-        detail: `year=${year}`,
-      });
+    const outcome = await lockChannelName(needle, () =>
+      provisionChannel(client, config, guild, year, { reuse: true })
+    );
+    if (outcome.unavailable) {
+      if (outcome.error) {
+        await logError(client, config, outcome.error, {
+          where: "channel-setup createNextSeasonChannel",
+          detail: `year=${year}`,
+        });
+      }
+      armUnavailableRetry(client, config, onDecided);
+      return { mode: "unavailable", channelId: null };
     }
-    if (channel?.id) {
-      await linkChannel(client, config, seasonId, channel.id, `#${channel.name}`);
-    } else {
-      // Anlage fehlgeschlagen (z.B. fehlende Rechte) — kein sicherer Kanal.
-      // Trotzdem einmal onDecided, damit der Start-Nachhol ohne Ziel läuft.
-      console.warn("[channel-setup] Kanal-Anlage fehlgeschlagen — kein sicherer Deathpool-Kanal");
+    if (!outcome.ok || !outcome.channel?.id) {
+      console.error("[channel-setup] Kanal-Anlage fehlgeschlagen — kein sicherer Deathpool-Kanal");
+      if (outcome.error) {
+        await logError(client, config, outcome.error, {
+          where: "channel-setup createNextSeasonChannel",
+          detail: `year=${year}`,
+        });
+      }
+      return { mode: "failed", channelId: null };
     }
-    await callDecided(client, config, onDecided, "created");
-    return { mode: "created", channelId: channel?.id || null };
+    const name = outcome.channel.name || needle;
+    const linked = await linkChannel(client, config, seasonId, outcome.channel.id, `#${name}`);
+    if (!linked.ok) return { mode: "failed", channelId: null };
+    disarmWait();
+    await callDecided(client, config, onDecided, "created", linked.seasonId);
+    return { mode: "created", channelId: String(outcome.channel.id) };
   }
 
-  // Fall: Kanal gefunden, keine Verknüpfung → blockierende Admin-Frage.
-  console.log(`[channel-setup] #${needle} gefunden — Admin-Frage, bis eine Entscheidung fällt`);
+  console.log(
+    found
+      ? `[channel-setup] #${needle} gefunden — Admin-Frage, bis eine Entscheidung fällt`
+      : "[channel-setup] Env-Kanal ungültig — Admin-Frage, bis eine Entscheidung fällt"
+  );
   const target = await resolveSetupTarget(client, config);
   if (!target) {
-    console.warn("[channel-setup] kein Admin-Ziel (kein CHANNEL_ADMIN, Admin-DM fehlgeschlagen) — nutze gefundenen Kanal");
-    await linkChannel(client, config, seasonId, found.id, `#${needle}`);
-    await callDecided(client, config, onDecided, "no-target-fallback");
-    return { mode: "found-fallback", channelId: found.id };
+    // ANNAHME: kein stilles Verknüpfen, wenn die Frage nicht rausgeht.
+    console.error("[channel-setup] kein sendbares Admin-Ziel — Frage nicht gestellt, Kanal nicht verknüpft");
+    armUnavailableRetry(client, config, onDecided);
+    return { mode: "no-target", channelId: null };
   }
 
-  const text =
-    `Hey, da läuft schon eine Season (${year}) und ich hab den Kanal #${needle} gefunden — ` +
-    "soll ich den nehmen, einen anderen, oder einen neuen machen?";
+  const foundPlain = found ? { id: String(found.id), name: String(found.name || "") } : null;
+  const question = buildQuestion(year, foundPlain, textChannels);
   let sent = null;
   try {
-    sent = await target.channel.send({
-      content: text,
-      components: buildSetupComponents(guild, year, found),
+    sent = await target.send({
+      content: question.content,
+      components: question.rows,
+      ...mentionOpts(),
     });
   } catch (e) {
     await logError(client, config, e, { where: "channel-setup send question" });
   }
   if (!sent) {
-    // Frage konnte nicht gesendet werden → nicht ewig blockieren: Fallback
-    // auf den gefundenen Kanal, dann onDecided.
-    console.warn("[channel-setup] Admin-Frage nicht gesendet — nutze gefundenen Kanal als Fallback");
-    await linkChannel(client, config, seasonId, found.id, `#${needle}`);
-    await callDecided(client, config, onDecided, "no-send-fallback");
-    return { mode: "found-fallback", channelId: found.id };
+    console.error("[channel-setup] Admin-Frage nicht gesendet — Kanal nicht verknüpft");
+    armUnavailableRetry(client, config, onDecided);
+    return { mode: "no-target", channelId: null };
   }
 
-  // Setup-Lauf registrieren: ewig warten, bis der Admin entscheidet. Solange
-  // offen, wird der Deathpool-Start-Nachhol NICHT gestartet (kein onDecided).
-  openSetups.set(seasonId, { guild, year, found, message: sent, onDecided });
+  publishOpen(seasonId, {
+    components: question.rows,
+    offeredChannelIds: question.offeredChannelIds,
+    year,
+    onDecided,
+    found: foundPlain,
+    guildId: String(guild.id),
+    textChannels: plainChannels(textChannels, guild),
+    pendingPickId: null,
+  });
+  disarmWait();
   return { mode: "waiting", channelId: null };
 }
 
-/**
- * Bearbeitet eine `dp:setup:*`-Interaktion (Buttons + Select) im
- * interactionCreate-Handler — VOR handlePickInteraction. Gibt true zurück,
- * wenn die customId zu diesem Setup gehört (dann ist sie verarbeitet), sonst false.
- */
-async function handleChannelSetupInteraction(interaction, client, config) {
-  if (typeof interaction.customId !== "string") return false;
-  const customId = interaction.customId;
-  if (!isChannelSetupCustomId(customId)) return false;
-
-  const running = db.getActiveSeason();
-  const seasonId = String(running.id);
-  const year = running.year;
-  const setup = openSetups.get(seasonId);
-
-  if (!setup) {
-    // Kein offener Lauf (z.B. nach Bot-Restart) — bestätigen und verwerfen.
-    if (interaction.isRepliable?.()) {
-      const content = "Kanal-Setup ist nicht mehr offen (vermutlich Neustart).";
-      await interaction
-        .update?.({ content, components: [] })
-        .catch(async () => {
-          await interaction.reply?.({ content, ephemeral: true }).catch(() => {});
-        });
+function memberHasRole(member, roleId) {
+  if (!member || roleId == null || roleId === "") return false;
+  const want = String(roleId);
+  const roles = member.roles;
+  if (!roles) return false;
+  if (typeof roles.cache?.has === "function") {
+    if (roles.cache.has(want) || roles.cache.has(roleId)) return true;
+    if (typeof roles.cache.values === "function") {
+      for (const role of roles.cache.values()) {
+        if (String(role?.id ?? role) === want) return true;
+      }
     }
-    return true;
   }
-  const { guild, found } = setup;
+  if (Array.isArray(roles)) return roles.some((role) => String(role?.id ?? role) === want);
+  if (Array.isArray(roles.cache)) return roles.cache.some((role) => String(role?.id ?? role) === want);
+  if (typeof roles.has === "function" && (roles.has(want) || roles.has(roleId))) return true;
+  return false;
+}
 
-  // Die Antworten dürfen nur der Admin ausführen — die Nachricht liegt im
-  // Admin-Kanal/DM, jeder Druck dort gilt (Gruppen-DM-Härtung: nur der
-  // konfigurierte Admin darf entscheiden).
-  if (interaction.user?.id && config.adminId && String(interaction.user.id) !== String(config.adminId)) {
-    await interaction
-      .reply?.({ content: "Nur der Admin kann das Kanal-Setup entscheiden.", ephemeral: true })
-      .catch(() => {});
-    return true;
-  }
+function isSetupAdmin(interaction, config) {
+  const uid = interaction.user?.id;
+  if (uid == null || uid === "") return false;
+  if (config.adminId && String(uid) === String(config.adminId)) return true;
+  if (config.adminRoleId && memberHasRole(interaction.member, config.adminRoleId)) return true;
+  return false;
+}
 
-  let action = null; // { kind: 'use'|'new'|'pick', channelId? }
-  if (customId === "dp:setup:new") {
-    action = { kind: "new" };
-  } else if (customId.startsWith("dp:setup:use:")) {
-    action = { kind: "use", channelId: customId.slice("dp:setup:use:".length) };
-  } else if (customId === "dp:setup:pick") {
-    // StringSelectMenu: die customId ist die Menü-ID, die gewählte Option kommt
-    // in values[0]. Spec: Value = Kanal-ID direkt (tolerant auch für
-    // `dp:setup:pick:<channelId>`-Werte).
-    const chosen = Array.isArray(interaction.values) ? interaction.values[0] : null;
-    action = { kind: "pick", channelId: String(chosen || "").replace(/^dp:setup:pick:/, "") };
-  } else if (customId.startsWith("dp:setup:pick:")) {
-    // toleranter Fallback (falls jemand die Option customId direkt sendet)
-    action = { kind: "pick", channelId: customId.slice("dp:setup:pick:".length) };
-  }
-
+async function replyEphemeral(interaction, content) {
+  const payload = { content, ephemeral: true, ...mentionOpts() };
   try {
-    if (action.kind === "new") {
-      // Neuen Kanal anlegen (inkl. Overwrites für alle Spieler) + verknüpfen.
-      await interaction
-        .update?.({ content: `Lege neues #deathpool-${year} an…`, components: [] })
-        .catch(() => {});
-      let channel = null;
-      try {
-        channel = await createNextSeasonChannel(client, config, year);
-      } catch (e) {
-        await logError(client, config, e, {
-          where: "channel-setup new create",
-          detail: `year=${year}`,
-        });
-      }
-      if (channel?.id) {
-        await linkChannel(client, config, seasonId, channel.id, `#${channel.name}`);
-        await interaction
-          .editReply?.({ content: `Lege neues #${channel.name} an…` })
-          .catch(() => {});
-        finishSetup(seasonId, client, config);
-      } else {
-        // Kein Kanal entstanden — Setup offen lassen (Admin kann nach Fehler
-        // erneut klicken) oder auf „Diesen nehmen" zurückgreifen.
-        await interaction
-          .editReply?.({
-            content: `Kanal-Anlage für deathpool-${year} fehlgeschlagen (Details in den Logs).`,
-            components: [],
-          })
-          .catch(() => {});
-        return true;
-      }
-    } else {
-      const channelId = action.channelId;
-      const chosen =
-        channelId === found?.id
-          ? found
-          : listGuildTextChannels(guild).find((c) => String(c.id) === String(channelId));
-      const label = chosen?.name ? `#${chosen.name}` : `Kanal ${channelId}`;
-      await linkChannel(client, config, seasonId, channelId, label);
-      await interaction
-        .update?.({ content: `Nutze ${label}`, components: [] })
-        .catch(() => {});
-      finishSetup(seasonId, client, config);
-    }
+    if (typeof interaction?.reply === "function") await interaction.reply(payload);
   } catch (e) {
-    await logError(client, config, e, { where: "channel-setup interaction", customId });
+    console.error("[channel-setup] ephemeral reply failed:", e.message);
   }
+}
+
+async function updateMessage(interaction, payload) {
+  const body = { ...payload, ...mentionOpts() };
+  if (typeof interaction?.update === "function") {
+    await interaction.update(body);
+    return;
+  }
+  if (typeof interaction?.editReply === "function") {
+    await interaction.editReply(body);
+    return;
+  }
+  if (typeof interaction?.reply === "function") await interaction.reply(body);
+}
+
+async function editSetupMessage(interaction, payload) {
+  const body = { ...payload, ...mentionOpts() };
+  if (typeof interaction?.editReply === "function") {
+    await interaction.editReply(body);
+    return;
+  }
+  if (typeof interaction?.update === "function") await interaction.update(body);
+}
+
+function currentOpen() {
+  const active = db.getActiveSeason();
+  const activeId = String(active.id);
+  let entry = setupState.getOpen(activeId);
+  let seasonId = activeId;
+  if (!entry && trackedSeasonId && trackedSeasonId !== activeId) {
+    const old = setupState.getOpen(trackedSeasonId);
+    if (old) {
+      retargetEntry(trackedSeasonId, activeId);
+      seasonId = activeId;
+      entry = setupState.getOpen(activeId) || old;
+    }
+  }
+  return { active, seasonId, entry };
+}
+
+function channelNameFromEntry(entry, channelId) {
+  const list = entry?.textChannels || [];
+  const hit = list.find((c) => String(c.id) === String(channelId));
+  if (hit?.name) return displayChannelName(hit.name);
+  if (entry?.found && String(entry.found.id) === String(channelId) && entry.found.name) {
+    return displayChannelName(entry.found.name);
+  }
+  return String(channelId);
+}
+
+function parseAction(customId, interaction) {
+  if (customId === "dp:setup:new") return { kind: "new" };
+  if (customId.startsWith("dp:setup:use:")) {
+    return { kind: "use", channelId: customId.slice("dp:setup:use:".length) };
+  }
+  if (customId === "dp:setup:pick") {
+    const chosen = Array.isArray(interaction.values) ? interaction.values[0] : null;
+    if (chosen == null || chosen === "") return null;
+    if (String(chosen).startsWith("dp:setup:pick:")) return null;
+    return { kind: "pick", channelId: String(chosen) };
+  }
+  return null;
+}
+
+async function handleChannelSetupInteraction(interaction, client, config) {
+  if (!isChannelSetupCustomId(interaction?.customId)) return false;
+  try {
+    return await handleChannelSetupInner(interaction, client, config);
+  } catch (e) {
+    console.error("[channel-setup] interaction failed:", e.message);
+    await logError(client, config, e, {
+      where: "channel-setup interaction",
+      detail: interaction?.customId,
+    });
+    if (trackedSeasonId) {
+      try {
+        setupState.abortDecide(trackedSeasonId);
+      } catch {
+        /* deciding zurück, Frage bleibt */
+      }
+    }
+    return true;
+  }
+}
+
+async function handleChannelSetupInner(interaction, client, config) {
+  const customId = interaction.customId;
+  if (!isSetupAdmin(interaction, config)) {
+    await replyEphemeral(interaction, "Nur der Admin darf das.");
+    return true;
+  }
+
+  const { active, seasonId, entry } = currentOpen();
+  if (!entry) {
+    await replyEphemeral(interaction, noEntryText(active));
+    return true;
+  }
+
+  // dp:setup:pick:<id> ist kein Schreibweg mehr, auch nicht für angebotene Ids.
+  if (customId.startsWith("dp:setup:pick:") && customId !== "dp:setup:pick") {
+    await replyEphemeral(interaction, "Kanal-Auswahl nur über die Liste. Nichts verknüpft.");
+    return true;
+  }
+
+  const action = parseAction(customId, interaction);
+  if (!action) {
+    await replyEphemeral(interaction, "Kanal-Auswahl nur über die Liste. Nichts verknüpft.");
+    return true;
+  }
+
+  if (action.kind === "pick") return handlePick(interaction, client, config, entry, seasonId, active, action.channelId);
+  if (action.kind === "new") return handleNew(interaction, client, config, entry, seasonId, active);
+  return handleLink(interaction, client, config, entry, seasonId, active, action.channelId);
+}
+
+async function handlePick(interaction, client, config, entry, seasonId, active, channelId) {
+  const id = String(channelId);
+  const offered = asIdSet(entry.offeredChannelIds);
+  const year = active.year || entry.year;
+  if (!offered.has(id)) {
+    if (!setupState.tryBeginDecide(String(seasonId))) {
+      await replyEphemeral(interaction, `Schon erledigt: #${decideName(entry, year)}.`);
+      return true;
+    }
+    setupState.abortDecide(String(seasonId));
+    await replyEphemeral(interaction, "Dieser Kanal war nicht angeboten. Nichts verknüpft.");
+    return true;
+  }
+  const pending = entry.pendingPickId || pendingPickBySeason.get(String(seasonId)) || null;
+  if (String(pending || "") !== id) {
+    entry.pendingPickId = id;
+    pendingPickBySeason.set(String(seasonId), id);
+    try {
+      setupState.markOpen(String(seasonId), entry);
+    } catch (e) {
+      console.error("[channel-setup] pending pick merken failed:", e.message);
+    }
+    const name = channelNameFromEntry(entry, id);
+    await replyEphemeral(interaction, `Wirklich #${name} als Deathpool? Dann noch einmal wählen.`);
+    return true;
+  }
+  return handleLink(interaction, client, config, entry, seasonId, active, id);
+}
+
+async function handleNew(interaction, client, config, entry, seasonId, active) {
+  const year = active.year || entry.year;
+  const seasonKey = String(seasonId);
+  const components = entry.components || [];
+  if (!setupState.tryBeginDecide(seasonKey)) {
+    await replyEphemeral(interaction, `Schon erledigt: #${decideName(entry, year)}.`);
+    return true;
+  }
+  const progress = `Lege #deathpool-${year} an. Spieler bekommen Sicht und Schreiben…`;
+  try {
+    await updateMessage(interaction, { content: progress, components: [] });
+  } catch (e) {
+    setupState.abortDecide(seasonKey);
+    console.error("[channel-setup] update before create failed:", e.message);
+    return true;
+  }
+
+  const guildRes = await resolveGuild(client, config);
+  if (guildRes.reason !== "ok") {
+    setupState.abortDecide(seasonKey);
+    await editSetupMessage(interaction, {
+      content: createFailureText(year, null),
+      components,
+    });
+    if (guildRes.reason === "unavailable") {
+      armUnavailableRetry(client, config, deciders.get(seasonKey) || entry.onDecided);
+    }
+    return true;
+  }
+
+  let outcome;
+  try {
+    outcome = await lockChannelName(`deathpool-${year}`, () =>
+      provisionChannel(client, config, guildRes.guild, year, { reuse: false })
+    );
+  } catch (e) {
+    outcome = { ok: false, error: e, code: errorCode(e) };
+  }
+
+  if (outcome.alreadyExists) {
+    setupState.abortDecide(seasonKey);
+    const name = outcome.existing?.name || `deathpool-${year}`;
+    console.log(`[channel-setup] #${name} existiert bereits — kein zweiter Kanal, nicht verknüpft`);
+    await editSetupMessage(interaction, {
+      content: alreadyExistsText(name),
+      components,
+    });
+    return true;
+  }
+  if (!outcome.ok || !outcome.channel?.id) {
+    setupState.abortDecide(seasonKey);
+    const code = outcome.code ?? errorCode(outcome.error);
+    if (outcome.error) {
+      console.error("[channel-setup] Kanal-Anlage fehlgeschlagen:", outcome.error.message || outcome.error);
+      await logError(client, config, outcome.error, {
+        where: "channel-setup new create",
+        detail: `year=${year}`,
+      });
+    } else {
+      console.error(`[channel-setup] Kanal-Anlage für deathpool-${year} fehlgeschlagen`);
+    }
+    await editSetupMessage(interaction, {
+      content: createFailureText(year, code),
+      components,
+    });
+    return true;
+  }
+
+  const name = outcome.channel.name || `deathpool-${year}`;
+  const linked = await linkChannel(client, config, seasonKey, outcome.channel.id, `#${name}`);
+  if (!linked.ok) {
+    setupState.abortDecide(seasonKey);
+    await editSetupMessage(interaction, {
+      content: createFailureText(year, null),
+      components,
+    });
+    return true;
+  }
+  try {
+    await editSetupMessage(interaction, { content: successText(name), components: [] });
+  } catch (e) {
+    console.error("[channel-setup] success edit failed:", e.message);
+  }
+  await finishSetup(linked.seasonId, client, config, name);
   return true;
 }
 
-/** Setup abschließen: open-Set entfernen und onDecided (genau einmal) feuern. */
-function finishSetup(seasonId, client, config) {
-  const entry = openSetups.get(String(seasonId));
-  if (!entry) return;
-  openSetups.delete(String(seasonId));
-  callDecided(client, config, entry.onDecided, "decided");
+async function handleLink(interaction, client, config, entry, seasonId, active, channelId) {
+  const year = active.year || entry.year;
+  const seasonKey = String(seasonId);
+  const id = String(channelId);
+  if (!setupState.tryBeginDecide(seasonKey)) {
+    await replyEphemeral(interaction, `Schon erledigt: #${decideName(entry, year)}.`);
+    return true;
+  }
+  const offered = asIdSet(entry.offeredChannelIds);
+  if (!offered.has(id)) {
+    setupState.abortDecide(seasonKey);
+    await replyEphemeral(interaction, "Dieser Kanal war nicht angeboten. Nichts verknüpft.");
+    return true;
+  }
+
+  const guildRes = await resolveGuild(client, config);
+  if (guildRes.reason !== "ok") {
+    setupState.abortDecide(seasonKey);
+    await replyEphemeral(interaction, "Discord-Guild ist gerade nicht erreichbar. Nichts verknüpft. Die Frage bleibt offen.");
+    return true;
+  }
+
+  let fresh = null;
+  try {
+    const list = await loadGuildTextChannels(guildRes.guild);
+    fresh = list.find((c) => String(c.id) === id) || null;
+  } catch (e) {
+    setupState.abortDecide(seasonKey);
+    if (is10003(e)) {
+      await replyEphemeral(interaction, "Diesen Kanal gibt es nicht mehr (10003). Nichts verknüpft.");
+      return true;
+    }
+    console.error("[channel-setup] channels.fetch vor Verknüpfung:", e.message);
+    await logError(client, config, e, { where: "channel-setup refetch before link" });
+    await replyEphemeral(interaction, "Discord antwortet gerade nicht. Nichts verknüpft. Die Frage bleibt offen.");
+    return true;
+  }
+
+  if (!fresh) {
+    setupState.abortDecide(seasonKey);
+    let gone = true;
+    try {
+      const direct = await client.channels.fetch(id);
+      if (direct && isGuildText(direct, guildRes.guild)) gone = false;
+    } catch (e) {
+      if (is10003(e)) {
+        await replyEphemeral(interaction, "Diesen Kanal gibt es nicht mehr (10003). Nichts verknüpft.");
+        return true;
+      }
+      console.error("[channel-setup] channels.fetch vor Verknüpfung:", e.message);
+      await logError(client, config, e, { where: "channel-setup refetch before link" });
+      await replyEphemeral(interaction, "Discord antwortet gerade nicht. Nichts verknüpft. Die Frage bleibt offen.");
+      return true;
+    }
+    await replyEphemeral(
+      interaction,
+      gone
+        ? "Diesen Kanal gibt es nicht mehr (10003). Nichts verknüpft."
+        : "Dieser Kanal ist kein Textkanal dieser Guild. Nichts verknüpft."
+    );
+    return true;
+  }
+
+  const name = displayChannelName(fresh.name || channelNameFromEntry(entry, id));
+  const linked = await linkChannel(client, config, seasonKey, fresh.id, `#${name}`);
+  if (!linked.ok) {
+    setupState.abortDecide(seasonKey);
+    await replyEphemeral(interaction, "Die Verknüpfung konnte nicht gespeichert werden (Details in den Logs).");
+    return true;
+  }
+  try {
+    await updateMessage(interaction, { content: successText(name), components: [] });
+  } catch (e) {
+    console.error("[channel-setup] success update failed:", e.message);
+  }
+  await finishSetup(linked.seasonId, client, config, name);
+  return true;
+}
+
+function _resetForTest() {
+  try {
+    if (typeof setupState._clearAll === "function") setupState._clearAll();
+    else if (trackedSeasonId) setupState.clearOpen(trackedSeasonId);
+  } catch {
+    /* Test-Reset */
+  }
+  trackedSeasonId = null;
+  deciders.clear();
+  recentlyDecided.clear();
+  pendingPickBySeason.clear();
+  decidedSeasonIds.clear();
+  localNameChains.clear();
+  setupChain = Promise.resolve();
+  disarmWait();
+  deleteSetupMeta();
 }
 
 module.exports = {
   runDeathpoolChannelSetup,
   handleChannelSetupInteraction,
   isOpen,
-  _openSetups: openSetups,
+  _resetForTest,
 };

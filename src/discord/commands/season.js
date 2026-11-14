@@ -1,10 +1,22 @@
 const db = require("../../db");
-const { usageReply } = require("../usage");
 
-function parseDate(s) {
-  if (!/^\d{4}-\d{2}-\d{2}$/.test(s)) return null;
-  const d = new Date(s + "T00:00:00Z");
-  if (Number.isNaN(d.getTime())) return null;
+const DATE_INVALID =
+  "Datum muss YYYY-MM-DD sein, und es muss ein echtes Kalenderdatum sein.";
+
+function parseCalendarDate(s) {
+  let shared = null;
+  try {
+    shared = require("../../db/time");
+  } catch (e) {
+    if (e.code !== "MODULE_NOT_FOUND" || !String(e.message).includes("db/time")) throw e;
+  }
+  if (shared) return shared.parseCalendarDate(s);
+  if (typeof s !== "string" || !/^\d{4}-\d{2}-\d{2}$/.test(s)) return null;
+  const y = Number(s.slice(0, 4));
+  const m = Number(s.slice(5, 7));
+  const d = Number(s.slice(8, 10));
+  const utc = new Date(Date.UTC(y, m - 1, d));
+  if (utc.getUTCFullYear() !== y || utc.getUTCMonth() !== m - 1 || utc.getUTCDate() !== d) return null;
   return s;
 }
 
@@ -44,9 +56,9 @@ const cmd = {
       );
       return;
     }
-    const d = parseDate(args[0]);
+    const d = parseCalendarDate(String(args[0]));
     if (!d) {
-      await msg.reply(usageReply(cmd, ctx.config));
+      await msg.reply(DATE_INVALID);
       return;
     }
     const current = db.getActiveSeason();
@@ -54,7 +66,7 @@ const cmd = {
     // ausschliesslich ueber /announce-season gesetzt, nie auf die aktive Zeile.
     if (current.phase === "running" && current.live === 1) {
       await msg.reply(
-        "Startdatum der laufenden Saison ist fest. Das naechste Datum setzt `/announce-season` — dieses Kommando geht nur in der Setup-Phase."
+        "Das Startdatum der laufenden Saison ist fest. Das nächste Datum setzt `/announce-season`. Dieser Befehl gilt nur in der Setup-Phase."
       );
       return;
     }

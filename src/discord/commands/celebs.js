@@ -1,11 +1,5 @@
 const db = require("../../db");
-
-async function sendChunks(msg, chunks) {
-  for (let i = 0; i < chunks.length; i++) {
-    if (i === 0) await msg.reply({ content: chunks[i], allowedMentions: { parse: [] } });
-    else await msg.channel.send({ content: chunks[i], allowedMentions: { parse: [] } });
-  }
-}
+const { sendChunks, chunkLines, sanitizeDisplayName, acceptedWikiUrl } = require("./liste");
 
 const cmd = {
   name: "celebs",
@@ -22,7 +16,7 @@ const cmd = {
   async run(ctx, args, msg) {
     const rows = db.listAllCelebs();
     if (!rows.length) {
-      await msg.reply("Noch keine Celebs. Admin: `/import`.");
+      await sendChunks(msg, ["Noch keine Celebs. Admin: `/import`."]);
       return;
     }
 
@@ -33,21 +27,12 @@ const cmd = {
       const age = c.age_at_pick != null ? ` · ${c.age_at_pick}` : "";
       const picks = c.pick_count ? ` · ${c.pick_count}×` : " · 0×";
       const wiki = c.wiki_confirmed ? (c.manual_only ? " · manual" : "") : " · ⏳";
-      return `${flag} **${c.name}**${age}${picks}${wiki}`;
+      const url = acceptedWikiUrl(c.wiki_url);
+      return `${flag} **${sanitizeDisplayName(c.name)}**${age}${picks}${wiki}${url ? ` ${url}` : ""}`;
     });
 
     const header = `**Alle Celebs** — ${rows.length} (${alive} lebend · ${dead} tot)\n`;
-    const chunks = [];
-    let body = header;
-    for (const line of lines) {
-      if ((body + line + "\n").length > 1800) {
-        chunks.push(body);
-        body = "";
-      }
-      body += line + "\n";
-    }
-    if (body) chunks.push(body);
-    await sendChunks(msg, chunks);
+    await sendChunks(msg, chunkLines(header, lines));
   },
 };
 

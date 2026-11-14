@@ -209,3 +209,161 @@ test("activateAnnouncedSeason archives running and activates announced", () => {
   assert.strictEqual(db.getActiveSeason().id, announced.id);
   assert.strictEqual(db.isLive(), true);
 });
+
+function replyText(payload) {
+  if (payload == null) return "";
+  if (typeof payload === "string") return payload;
+  return payload.content || "";
+}
+
+test("invalid dates 01.01.2027, 2027-02-29 and 2027/01/01 write no season", async () => {
+  const snap = () =>
+    JSON.stringify(
+      db
+        .getDb()
+        .prepare(
+          "SELECT id, year, start_date, phase, active, live, announce_channel_id, announce_note FROM seasons ORDER BY id"
+        )
+        .all()
+    );
+  const before = snap();
+  const announce = require("../src/discord/commands/announce-season");
+  const seasonCmd = require("../src/discord/commands/season");
+  const newYear = require("../src/discord/commands/new-year");
+  const replies = [];
+  const msg = {
+    mentions: { channels: { first: () => null } },
+    author: { id: "1" },
+    async reply(t) {
+      replies.push(replyText(t));
+    },
+  };
+  const ctx = {
+    config,
+    client: {
+      channels: {
+        fetch: async () => {
+          throw new Error("fetch must not run for a rejected date");
+        },
+      },
+    },
+  };
+  for (const d of ["01.01.2027", "2027-02-29", "2027/01/01"]) {
+    await announce.run(ctx, ["channel:should-not", `start:${d}`, "year:2035"], msg);
+    await seasonCmd.run(ctx, [d], msg);
+    await newYear.run(ctx, ["wipe", d], msg);
+  }
+  assert.strictEqual(snap(), before);
+  assert.ok(
+    replies.every((r) => r.includes("Datum muss YYYY-MM-DD sein, und es muss ein echtes Kalenderdatum sein.")),
+    replies.join(" | ")
+  );
+});
+
+test("running season keeps its start date and answers with the setup-only guard", async () => {
+  const start = db.getActiveSeason().start_date;
+  const replies = [];
+  const seasonCmd = require("../src/discord/commands/season");
+  await seasonCmd.run({ config, client: {} }, ["2028-03-01"], {
+    async reply(t) {
+      replies.push(replyText(t));
+    },
+  });
+  assert.strictEqual(
+    replies.join("\n"),
+    "Das Startdatum der laufenden Saison ist fest. Das nächste Datum setzt `/announce-season`. Dieser Befehl gilt nur in der Setup-Phase."
+  );
+  assert.strictEqual(db.getActiveSeason().start_date, start);
+});
+
+test("announce embed appends the death line and keeps the tariff", () => {
+  const { buildSeasonEmbed, DEFAULT_ANNOUNCE_TEMPLATE } = require("../src/discord/commands/announce-season");
+  assert.match(DEFAULT_ANNOUNCE_TEMPLATE, /\{START_DATE\}/);
+  assert.match(DEFAULT_ANNOUNCE_TEMPLATE, /unbekanntem Alter[\s\S]*0 Punkte/);
+  const embed = buildSeasonEmbed({
+    year: 2031,
+    startDate: "2031-01-01",
+    runningYear: 2030,
+    maxPicks: 50,
+  });
+  assert.ok(
+    embed.data.description.includes(
+      "Die Zeit des Todes naht. Deine Namen ändern daran nichts. Sie ändern nur, wer neben der Leiche steht."
+    )
+  );
+});
+
+test("ungo completion 50027 leaves the season paused", async () => {
+  assert.strictEqual(db.getAnnouncedSeason(), null);
+  db.setSeasonLive(true);
+  const wikiPollPath = require.resolve("../src/jobs/wiki-poll");
+  const prev = require.cache[wikiPollPath];
+  require.cache[wikiPollPath] = {
+    id: wikiPollPath,
+    filename: wikiPollPath,
+    loaded: true,
+    exports: { runWikiPoll: async () => ({ hits: [] }) },
+  };
+  const ungoPath = require.resolve("../src/discord/commands/ungo");
+  delete require.cache[ungoPath];
+  const ungo = require(ungoPath);
+  let n = 0;
+  try {
+    await ungo.run(
+      { config, client: { channels: { fetch: async () => null } } },
+      ["confirm"],
+      {
+        author: { id: "1" },
+        async reply() {
+          n += 1;
+          if (n >= 3) {
+            const err = new Error("Invalid Webhook Token");
+            err.code = 50027;
+            throw err;
+          }
+        },
+      }
+    );
+    assert.strictEqual(db.isLive(), false);
+    assert.ok(n >= 3);
+  } finally {
+    if (prev) require.cache[wikiPollPath] = prev;
+    else delete require.cache[wikiPollPath];
+  }
+});
+
+test("wipe throw in clearSeasonForNewYear leaves picks and new-year.js has no DELETE FROM picks", async () => {
+  const src = fs.readFileSync(path.join(__dirname, "../src/discord/commands/new-year.js"), "utf8");
+  assert.doesNotMatch(src, /DELETE\s+FROM\s+picks/);
+  assert.doesNotMatch(src, /activateAnnouncedSeason/);
+
+  db.getDb().prepare("UPDATE seasons SET phase = 'archived' WHERE phase = 'announced'").run();
+  db.getDb().prepare("UPDATE seasons SET phase = 'setup', live = 0 WHERE active = 1").run();
+  const picksBefore = db.getDb().prepare("SELECT COUNT(*) c FROM picks").get().c;
+  assert.ok(picksBefore > 0);
+
+  const orig = db.clearSeasonForNewYear;
+  let called = 0;
+  db.clearSeasonForNewYear = () => {
+    called += 1;
+    throw new Error("wipe boom");
+  };
+  const newYearPath = require.resolve("../src/discord/commands/new-year");
+  delete require.cache[newYearPath];
+  const newYear = require(newYearPath);
+  try {
+    await assert.rejects(
+      () =>
+        newYear.run(
+          { config, client: { channels: { fetch: async () => null } } },
+          ["wipe"],
+          { author: { id: "1" }, async reply() {} }
+        ),
+      /wipe boom/
+    );
+  } finally {
+    db.clearSeasonForNewYear = orig;
+  }
+  assert.strictEqual(called, 1);
+  assert.strictEqual(db.getDb().prepare("SELECT COUNT(*) c FROM picks").get().c, picksBefore);
+});

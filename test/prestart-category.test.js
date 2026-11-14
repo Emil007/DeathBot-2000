@@ -151,7 +151,7 @@ test("F24: category-year before running season → 0 points + warnable, no award
   // live=1/running durch before()). Ein 2024-deaths-Kategorie-Fund, der im
   // Dezember erkannt wird, darf in der laufenden Saison KEINE Punkte geben —
   // applyDeath muss über den preStart-Zweig (0 Punkte) laufen, weil das
-  // Kategorie-Jahr (2024-12-31) vor dem Saisonstart liegt.
+  // Kategorie-Jahr ohne Tag (2024-01-01, F18) vor dem Saisonstart liegt.
   const active = db.getActiveSeason();
   assert.ok(active && Number(active.live) === 1, "running season must be live");
 
@@ -192,10 +192,9 @@ test("F24: category-year before running season → 0 points + warnable, no award
   const hits = await findAnnouncedDeathsByCategory("test-user-agent", { delayMs: 0 });
   const mine = hits.find((h) => h.celeb.id === cid);
   assert.ok(mine, "announced sweep must catch the old-category celeb");
-  // F24a: Das Kategorie-Jahr ist am Entry gesetzt → entryDeathDateIso liefert
-  // „2024-12-31“ (month 0-basiert), NICHT den Erkennungstag.
+  // F18: Kategorie ohne Tag → 1. Januar des Kategorie-Jahres, nicht der Erkennungstag.
   const { entryDeathDateIso } = require("../src/discord/announce");
-  assert.strictEqual(entryDeathDateIso(mine.entry), "2024-12-31");
+  assert.strictEqual(entryDeathDateIso(mine.entry), "2024-01-01");
   assert.strictEqual(mine.entry.year, 2024);
 
   const { processDeathpoolHit } = require("../src/discord/announce");
@@ -207,7 +206,7 @@ test("F24: category-year before running season → 0 points + warnable, no award
     { announce: false, confirmed: false, source: "announced-prestart" }
   );
   assert.strictEqual(result.celeb.is_alive, 0, "death must be recorded");
-  assert.strictEqual(result.celeb.died_at, "2024-12-31", "died_at must carry category year");
+  assert.strictEqual(result.celeb.died_at, "2024-01-01", "died_at must carry category year as Jan 1");
   // preStart → kein Award (keine DB-Gutschrift, keine Zeile), Winner bleibt
   // im Result mit 0 Punkten.
   assert.strictEqual(
@@ -224,7 +223,7 @@ test("F24: category-year before running season → 0 points + warnable, no award
   const p = db.getDb().prepare("SELECT * FROM players WHERE id = ?").get(pid);
   assert.strictEqual(Number(p.base_points), 10);
   // F24b: Der preStart-Tod wird NUR gewarnt — der Einreicher muss die DM
-  // bekommen (died_at 2024-12-31 < announced-start 2027-01-01).
+  // bekommen (died_at 2024-01-01 < announced-start 2027-01-01).
   const warnRows = db.getAnnouncedPreStartDeathsUnwarned(ann.id);
   assert.ok(
     warnRows.some((r) => r.celeb_id === cid),
@@ -362,4 +361,115 @@ test("F27: unknown age on a real hit prints 'Alter unbekannt' (no misleading 0-P
   const details = sent[0].embeds[0].data.fields.find((f) => f.name === "Details").value;
   assert.match(details, /Alter unbekannt/, "unknown age must be called out");
   assert.doesNotMatch(details, /0 Punkte/, "no misleading 0-Punkte hint for unknown age");
+});
+
+test("untagged category year is stored as YYYY-01-01 and sits before start_date 2027-06-01", async () => {
+  const ann = db.getAnnouncedSeason();
+  assert.ok(ann, "announced season from earlier test");
+  db.getDb().prepare("UPDATE seasons SET start_date = ? WHERE id = ?").run("2027-06-01", ann.id);
+
+  const pid = db
+    .getDb()
+    .prepare("INSERT INTO players (display_name, discord_user_id, base_points) VALUES ('Untagged','6701','0')")
+    .run().lastInsertRowid;
+  const cid = db
+    .getDb()
+    .prepare(
+      `INSERT INTO celebs (name, name_key, wiki_url, wikidata_id, is_alive,
+         wiki_confirmed, exclude_from_auto, manual_only)
+       VALUES ('Untagged Twentyseven','untagged27','https://en.wikipedia.org/wiki/Untagged_Twentyseven','QUntag',1,
+         1, 1, 0)`
+    )
+    .run().lastInsertRowid;
+  db.getDb()
+    .prepare("INSERT INTO picks (player_id, celeb_id, season_id) VALUES (?, ?, ?)")
+    .run(pid, cid, ann.id);
+
+  mockDeathCategoriesByYear(cid, "https://en.wikipedia.org/wiki/Untagged_Twentyseven", 2027);
+  const hits = await findAnnouncedDeathsByCategory("test-user-agent", { delayMs: 0, tz: "Europe/Vienna" });
+  const mine = hits.find((h) => h.celeb.id === cid);
+  assert.ok(mine, "category sweep must catch the untagged 2027 death");
+  const { entryDeathDateIso } = require("../src/discord/announce");
+  assert.strictEqual(mine.entry.year, 2027);
+  assert.strictEqual(mine.entry.month, 0);
+  assert.strictEqual(mine.entry.day, 1);
+  assert.strictEqual(entryDeathDateIso(mine.entry), "2027-01-01");
+
+  const { processDeathpoolHit } = require("../src/discord/announce");
+  const fakeClient = { channels: { fetch: async () => null } };
+  const result = await processDeathpoolHit(
+    fakeClient,
+    { userAgent: "test" },
+    { celeb: mine.celeb, entry: mine.entry, wikiAge: mine.age },
+    { announce: false, confirmed: false, source: "announced-prestart" }
+  );
+  assert.strictEqual(result.celeb.died_at, "2027-01-01");
+  const start = db.getAnnouncedSeason().start_date;
+  assert.strictEqual(start, "2027-06-01");
+  assert.ok(result.celeb.died_at < start, "stored date must lie before 2027-06-01");
+  const rows = db.getAnnouncedPreStartDeathsUnwarned(ann.id);
+  assert.ok(
+    rows.some((r) => r.celeb_id === cid),
+    "2027-01-01 is before announced start 2027-06-01"
+  );
+});
+
+test("rvstart is Vienna local midnight of the season start, not UTC midnight", async () => {
+  const cid = db
+    .getDb()
+    .prepare(
+      `INSERT INTO celebs (name, name_key, wiki_url, wikidata_id, is_alive,
+         wiki_confirmed, exclude_from_auto, manual_only)
+       VALUES ('Rv Start','rvstart','https://en.wikipedia.org/wiki/Rv_Start','QRv',1,
+         1, 0, 0)`
+    )
+    .run().lastInsertRowid;
+  assert.ok(cid);
+
+  const calls = [];
+  axios.create = () => ({
+    async get(_url, { params } = {}) {
+      calls.push(params);
+      if (params?.prop === "categories") {
+        const titles = String(params.titles || "");
+        const dead = titles.includes("Rv Start");
+        return {
+          status: 200,
+          data: {
+            query: {
+              pages: {
+                1: dead
+                  ? { title: "Rv Start", categories: [{ title: "Category:2027 deaths" }] }
+                  : { title: "Other", categories: [{ title: "Category:Living people" }] },
+              },
+            },
+          },
+        };
+      }
+      if (params?.prop === "revisions") {
+        return { status: 200, data: { query: { pages: [] } } };
+      }
+      return { status: 200, data: {} };
+    },
+  });
+
+  const hits = await findPoolDeathsByCategory("test-user-agent", {
+    delayMs: 0,
+    seasonStartDate: "2027-01-01",
+    tz: "Europe/Vienna",
+  });
+  assert.ok(hits.some((h) => h.celeb.id === cid), "real category hit must reach the revision check");
+  const { entryDeathDateIso } = require("../src/discord/announce");
+  const mine = hits.find((h) => h.celeb.id === cid);
+  assert.strictEqual(entryDeathDateIso(mine.entry), "2027-01-01");
+
+  const catCalls = calls.filter((p) => p?.prop === "categories");
+  assert.ok(catCalls.length >= 1);
+  assert.ok(catCalls.every((p) => p.cllimit === "max"));
+  assert.ok(catCalls.every((p) => !String(p.rvprop || "").includes("content")));
+
+  const rev = calls.find((p) => p?.prop === "revisions");
+  assert.ok(rev, "a real hit fetches revision content");
+  assert.ok(String(rev.rvprop).includes("content"));
+  assert.strictEqual(String(rev.rvstart).replace(".000", ""), "2026-12-31T23:00:00Z");
 });

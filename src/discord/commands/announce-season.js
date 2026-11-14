@@ -5,6 +5,39 @@ const { createPackage } = require("../../backup");
 const db = require("../../db");
 const { logEvent, logError } = require("../log");
 
+const DATE_INVALID =
+  "Datum muss YYYY-MM-DD sein, und es muss ein echtes Kalenderdatum sein.";
+
+function loadTime() {
+  try {
+    return require("../../db/time");
+  } catch (e) {
+    if (e.code !== "MODULE_NOT_FOUND" || !String(e.message).includes("db/time")) throw e;
+    return null;
+  }
+}
+
+function parseCalendarDate(s) {
+  const shared = loadTime();
+  if (shared) return shared.parseCalendarDate(s);
+  if (typeof s !== "string" || !/^\d{4}-\d{2}-\d{2}$/.test(s)) return null;
+  const y = Number(s.slice(0, 4));
+  const m = Number(s.slice(5, 7));
+  const d = Number(s.slice(8, 10));
+  const utc = new Date(Date.UTC(y, m - 1, d));
+  if (utc.getUTCFullYear() !== y || utc.getUTCMonth() !== m - 1 || utc.getUTCDate() !== d) return null;
+  return s;
+}
+
+function mentionOpts() {
+  try {
+    return require("../safe-text").mentionOpts();
+  } catch (e) {
+    if (e.code !== "MODULE_NOT_FOUND" || !String(e.message).includes("safe-text")) throw e;
+    return { allowedMentions: { parse: [] } };
+  }
+}
+
 /**
  * Standard-Ankündigungstext (Gregg, Variante B, ohne ersten Satz). Nur Platz-
  * halter — Jahreszahlen/Daten kommen zur Laufzeit aus der DB/Config, damit der
@@ -83,6 +116,11 @@ function buildSeasonEmbed({ year, startDate, note, runningYear, maxPicks, templa
     const noteText = truncateForEmbed(String(note), MAX_DESCRIPTION_LENGTH - description.length - 9);
     description += `\n\n📝 **Notiz:** ${noteText.text}`;
   }
+  const deathLine =
+    "Die Zeit des Todes naht. Deine Namen ändern daran nichts. Sie ändern nur, wer neben der Leiche steht.";
+  if (!description.includes(deathLine)) {
+    description += `${description ? "\n\n" : ""}${deathLine}`;
+  }
   if (description.length > MAX_DESCRIPTION_LENGTH) {
     description = truncateForEmbed(description, MAX_DESCRIPTION_LENGTH).text;
   }
@@ -107,12 +145,12 @@ const cmd = {
   name: "announce-season",
   admin: true,
   group: "season",
-  description: "Öffnet die Anmeldung für die nächste (angekündigte) Saison",
+  description: "Öffnet die nächste Runde. Die laufende bleibt",
   usage:
     "/announce-season announce_channel:#Kanal [note:…] [year:YYYY] [start_date:YYYY-MM-DD] [repost:true]",
   examples: [
     "/announce-season announce_channel:#wettbuero",
-    "/announce-season announce_channel:#wettbuero note:Wer will mitmachen?",
+    "/announce-season announce_channel:#wettbuero note:Namen per DM. Mitleid gibt es nicht.",
     "/announce-season repost:true",
   ],
   details:
@@ -163,21 +201,53 @@ const cmd = {
     return args;
   },
   async run(ctx, args, msg) {
-    const isRepost = args.includes("repost");
+    const isRepost = args.some((a) => {
+      const s = String(a).toLowerCase();
+      return s === "repost" || s === "repost:true" || s === "repost:1";
+    });
     const getArg = (key) => {
       const a = args.find((x) => x.startsWith(`${key}:`));
       return a ? a.slice(key.length + 1) : null;
     };
+    const say = async (content) => {
+      if (content.includes("<#") || content.includes("<@")) {
+        await msg.reply({ content, ...mentionOpts() });
+        return;
+      }
+      await msg.reply(content);
+    };
     const channelMention = msg.mentions?.channels?.first?.();
     const year = Number(getArg("year") || DEFAULT_YEAR());
-    const startDate = getArg("start") || `${year}-01-01`;
+    const startArg = getArg("start");
     const note = getArg("note");
+
+    let startDate = null;
+    if (startArg != null) {
+      startDate = parseCalendarDate(startArg);
+      if (!startDate) {
+        await msg.reply(DATE_INVALID);
+        return;
+      }
+    } else if (!isRepost) {
+      startDate = parseCalendarDate(`${year}-01-01`);
+      if (!startDate) {
+        await msg.reply(DATE_INVALID);
+        return;
+      }
+    }
 
     // Kanal aus Option, aus Erwähnung oder bestehendem announced-Kanal
     let channelId = getArg("channel");
     if (!channelId && channelMention) channelId = channelMention.id;
 
     const announced = db.getAnnouncedSeason();
+
+    if (!isRepost && announced && Number(announced.year) === Number(year)) {
+      await msg.reply(
+        `${announced.year} ist schon offen (Kanal ${announced.announce_channel_id}, Start ${announced.start_date}). Zum erneuten Posten \`repost:true\`. Kanal oder Datum ändern geht nur mit \`repost:true\` und dem neuen Wert.`
+      );
+      return;
+    }
 
     if (isRepost) {
       if (!announced) {
@@ -195,7 +265,8 @@ const cmd = {
       }
       // F23: auch ein geänderter Kanal wird gespeichert — vorher blieb
       // announce_channel_id der alte, obwohl das Embed im neuen landete.
-      const chanChanged = chanId !== announced.announce_channel_id;
+      const chanChanged = String(chanId) !== String(announced.announce_channel_id);
+      const dateChanged = Boolean(startDate) && startDate !== announced.start_date;
       if (chanChanged || (note && note !== announced.announce_note)) {
         db.setSeasonAnnounce(announced.id, {
           channelId: chanId,
@@ -206,6 +277,11 @@ const cmd = {
       if (!channel?.send) {
         await msg.reply("Kanal nicht erreichbar.");
         return;
+      }
+      if (dateChanged) {
+        db.getDb()
+          .prepare("UPDATE seasons SET start_date = ? WHERE id = ? AND phase = 'announced'")
+          .run(startDate, announced.id);
       }
       const running = db.getActiveSeason();
       // F26: fehlgeschlagenes Embed darf NICHT als Erfolg gemeldet werden
@@ -220,7 +296,7 @@ const cmd = {
           runningYear: running?.year,
           maxPicks: ctx.config.maxPicksPerPlayer,
         });
-        await channel.send({ embeds: [embed], allowedMentions: { parse: [] } });
+        await channel.send({ embeds: [embed], ...mentionOpts() });
         const noteWasTruncated = embed.data.description?.includes(TRUNCATION_HINT);
         await logEvent(ctx.client, ctx.config, {
           kind: "season-repost",
@@ -233,7 +309,11 @@ const cmd = {
             : "";
         // F17: Hinweis, dass die Notiz im Embed gekürzt wurde
         const truncBit = noteWasTruncated ? `\n⚠️ Notiz zu lang — im Embed **${TRUNCATION_HINT}** abgeschnitten.` : "";
-        await msg.reply(`Embed erneut gepostet — nichts wurde angelegt oder gelöscht.${noteBit}${truncBit}`);
+        const changedBit =
+          chanChanged || dateChanged
+            ? `\nGeändert: Kanal <#${chanId}>, Start ${fresh.start_date}.`
+            : "";
+        await say(`Embed erneut gepostet — nichts wurde angelegt oder gelöscht.${noteBit}${truncBit}${changedBit}`);
         return;
       } catch (e) {
         await logError(ctx.client, ctx.config, e, {
@@ -243,7 +323,6 @@ const cmd = {
         await msg.reply(`Embed-Repost fehlgeschlagen: ${e.message}`);
         return;
       }
-      return;
     }
 
     if (!channelId) {
@@ -284,7 +363,7 @@ const cmd = {
           runningYear: running?.year,
           maxPicks: ctx.config.maxPicksPerPlayer,
         });
-        await channel.send({ embeds: [embed], allowedMentions: { parse: [] } });
+        await channel.send({ embeds: [embed], ...mentionOpts() });
         embedSent = true;
         embedTruncated = Boolean(embed.data.description?.includes(TRUNCATION_HINT));
       } catch (e) {
@@ -298,7 +377,7 @@ const cmd = {
       userId: ctx.config.adminId,
       detail: `season_id=${season.id} backup=${pkg?.name || "-"} embed_sent=${embedSent}`,
     });
-    await msg.reply(
+    await say(
       [
         `🆕 **Saison ${season.year} angekündigt** (id ${season.id})`,
         `• Start: **${season.start_date}** · live: **nein**`,

@@ -108,3 +108,78 @@ test("historical qid already posted -> nothing posted, stamps", () => {
 test("normName strips [xx] suffix", () => {
   assert.strictEqual(normName("Claudette Soares [pt]"), "claudettesoares");
 });
+
+test("QID announced more than 14 days ago stays in recentAnnouncedQids and stamps qid-history", () => {
+  const fs = require("fs");
+  const os = require("os");
+  const path = require("path");
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "deathbot-test-qid-"));
+  process.env.TOKEN = "x";
+  process.env.ADMIN_ID = "1";
+  process.env.DISCORD_GUILD_ID = "guild-test";
+  process.env.DATA_DIR = tmp;
+  const { loadConfig } = require("../src/config");
+  const db = require("../src/db");
+  const config = loadConfig();
+  db.openDb(config);
+  try {
+    db.getDb()
+      .prepare(
+        `INSERT INTO announced_deaths (entry_id, name, url, lang, qid, announced_at)
+         VALUES (?, ?, ?, ?, ?, ?)`
+      )
+      .run(
+        "en:/wiki/Old_Qid_Person",
+        "Old Qid Person, actor.",
+        "https://en.wikipedia.org/wiki/Old_Qid_Person",
+        "en",
+        "Q-OLD-14",
+        "2020-01-01 00:00:00"
+      );
+    const since = new Date(Date.now() - 14 * 24 * 60 * 60 * 1000)
+      .toISOString()
+      .slice(0, 19)
+      .replace("T", " ");
+    const windowed = db.recentAnnouncedIdentities(since);
+    assert.strictEqual(
+      windowed.qids.has("Q-OLD-14"),
+      false,
+      "14-day window used by the daily report must drop this QID"
+    );
+
+    // recentAnnouncedQids (M3) has no time cut. Until that export exists, the
+    // same unwindowed read is what the poll uses.
+    const qids =
+      typeof db.recentAnnouncedQids === "function"
+        ? db.recentAnnouncedQids()
+        : new Set(
+            db
+              .getDb()
+              .prepare(
+                "SELECT qid FROM announced_deaths WHERE qid IS NOT NULL AND TRIM(qid) != ''"
+              )
+              .all()
+              .map((r) => r.qid)
+          );
+    assert.ok(qids.has("Q-OLD-14"), "QID older than 14 days stays in the history set");
+
+    const second = entry("en:/wiki/Old_Qid_Person_again", {
+      lang: "en",
+      text: "Old Qid Person, actor.",
+      qid: "Q-OLD-14",
+      isHuman: true,
+    });
+    const { post, bind } = planAnnouncements([second], { qids, humanNames: new Set() });
+    assert.strictEqual(post.length, 0, "second sighting must not be posted");
+    assert.ok(
+      bind.some((b) => b.loserId === second.id && b.winnerId === second.id && b.reason === "qid-history")
+    );
+  } finally {
+    try {
+      db.closeDb();
+    } catch {
+      /* already closed */
+    }
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+});

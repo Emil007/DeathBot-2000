@@ -1,18 +1,6 @@
 const db = require("../../db");
 const { usageReply } = require("../usage");
-
-function resolvePlayer(msg, token) {
-  const mention = msg.mentions.users.first();
-  if (mention) return db.getDb().prepare("SELECT * FROM players WHERE discord_user_id = ?").get(mention.id);
-  if (!token) return null;
-  return (
-    db.getDb().prepare("SELECT * FROM players WHERE discord_user_id = ?").get(token) ||
-    db
-      .getDb()
-      .prepare("SELECT * FROM players WHERE display_name LIKE ? COLLATE NOCASE")
-      .get(token)
-  );
-}
+const { replyText, sanitizeDisplayName, resolveSnowflakePoints, NEED_MENTION } = require("./liste");
 
 const cmd = {
   name: "add-points",
@@ -53,26 +41,23 @@ const cmd = {
     return points != null ? [String(points)] : [];
   },
   async run(ctx, args, msg) {
-    const points = parseInt(args[args.length - 1], 10);
-    if (Number.isNaN(points)) {
-      await msg.reply(usageReply(cmd, ctx.config));
+    const resolved = resolveSnowflakePoints(msg, args);
+    if (resolved.error === "usage") {
+      await replyText(msg, usageReply(cmd, ctx.config));
       return;
     }
-    let mention = msg.mentions.users.first();
-    if (!mention && args[0] && /^\d{16,20}$/.test(args[0])) {
-      mention = await ctx.client.users.fetch(args[0]).catch(() => null);
+    if (resolved.error) {
+      await replyText(msg, NEED_MENTION);
+      return;
     }
-    const player = mention
-      ? db.getDb().prepare("SELECT * FROM players WHERE discord_user_id = ?").get(mention.id)
-      : resolvePlayer(msg, args[0]);
+    const player = db.findPlayerByQuery(resolved.snowflake);
     if (!player) {
-      await msg.reply("Spieler nicht gefunden.");
+      await replyText(msg, "Spieler nicht gefunden.");
       return;
     }
-    db.addPoints(player.id, points);
-    await msg.reply(
-      `Punkte für **${player.display_name}**: jetzt **${db.playerTotal(player.id)}**`
-    );
+    db.addPoints(player.id, resolved.points);
+    const name = sanitizeDisplayName(player.display_name);
+    await replyText(msg, `Punkte für **${name}**: jetzt **${db.playerTotal(player.id)}**`);
   },
 };
 

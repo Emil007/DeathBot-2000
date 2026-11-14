@@ -19,6 +19,73 @@ const QUEUE_INTERVAL_MS = 1000;
 let queue = [];
 let consumerRunning = false;
 const warnedOnce = new Set();
+let safeTextCache = null;
+
+function isMissingModule(err, request) {
+  if (!err || err.code !== "MODULE_NOT_FOUND") return false;
+  const first = String(err.message || "").split("\n")[0];
+  return first.includes(request);
+}
+
+// Vertrag von M1 (src/discord/safe-text.js). Nur wenn das Modul in diesem
+// Workspace noch fehlt — nach dem Merge gewinnt der echte Export.
+function fallbackSanitizeDisplayName(raw) {
+  let s = String(raw ?? "");
+  s = s.replace(/[\u0000-\u001F\u007F\u2028\u2029]/g, " ");
+  s = s.replace(/[*_~|`<>@\[\]()]/g, "");
+  s = s.replace(/\s+/g, " ").trim();
+  if (s.length > 80) s = s.slice(0, 80).trim();
+  return s || "Unbenannt";
+}
+
+function safeText() {
+  if (safeTextCache) return safeTextCache;
+  let mod = null;
+  try {
+    mod = require("./safe-text");
+  } catch (e) {
+    if (!isMissingModule(e, "./safe-text")) throw e;
+  }
+  if (mod) {
+    if (typeof mod.sanitizeDisplayName !== "function" || typeof mod.mentionOpts !== "function") {
+      throw new Error("src/discord/safe-text.js must export sanitizeDisplayName and mentionOpts");
+    }
+    safeTextCache = mod;
+    return safeTextCache;
+  }
+  safeTextCache = {
+    sanitizeDisplayName: fallbackSanitizeDisplayName,
+    mentionOpts() {
+      return { allowedMentions: { parse: [] } };
+    },
+  };
+  return safeTextCache;
+}
+
+/**
+ * Log-Summaries dürfen Roh-Namen enthalten (`raw_name`, Display-Name, `<@id>`).
+ * Jeder solche Abschnitt geht durch sanitizeDisplayName (eine Zeile, keine
+ * Mention-/Markdown-Zeichen). Der umgebende Satz bleibt stehen.
+ */
+function sanitizeLogSummary(summary) {
+  const { sanitizeDisplayName } = safeText();
+  const flat = String(summary ?? "")
+    .replace(/[\u0000-\u001F\u007F\u2028\u2029]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+  if (!flat) return "";
+  if (!/[*_~|`<>@\[\]()]/.test(flat)) return flat;
+  const parts = flat.split(/(\s*→\s*|:\s*|\(|\))/);
+  const out = parts
+    .map((part) => {
+      if (!part) return "";
+      if (part === "(" || part === ")" || /^\s*→\s*$/.test(part) || /^:\s*$/.test(part)) return part;
+      if (/[*_~|`<>@\[\]()]/.test(part)) return sanitizeDisplayName(part);
+      return part;
+    })
+    .join("");
+  return out.replace(/\s+/g, " ").trim();
+}
 
 function scrubText(text, config) {
   let s = String(text ?? "");
@@ -49,7 +116,7 @@ async function drain() {
       await target.send({
         content: item.content || null,
         embeds: item.embeds && item.embeds.length ? item.embeds : undefined,
-        allowedMentions: { parse: [] },
+        ...safeText().mentionOpts(),
       });
     } catch (e) {
       console.warn("[log] send failed", e.message);
@@ -66,9 +133,10 @@ function enqueue(client, config, { kind, content, embeds }) {
   if (!consumerRunning) drain().catch((e) => console.warn("[log] drain failed", e.message));
 }
 
-function buildErrorEmbed(err, { where, userId }) {
-  const message = scrubText(String(err?.message || err || "Unbekannter Fehler"));
-  let stack = scrubText(err?.stack ? String(err.stack) : "");
+function buildErrorEmbed(err, { where, userId, config } = {}) {
+  const scrubbed = scrubText(err && err.stack ? err.stack : String(err), config);
+  const message = scrubText(String(err?.message || err || "Unbekannter Fehler"), config);
+  let stack = err && err.stack ? scrubbed : "";
   const status = err?.response?.status ?? err?.status;
   const code = err?.code ?? err?.rawError?.code;
   const lines = [
@@ -100,7 +168,7 @@ async function logEvent(client, config, { kind, summary, userId, detail }) {
   const parts = [
     `**${kind}**`,
     userId ? `(User ${userId})` : null,
-    scrubText(summary, config),
+    sanitizeLogSummary(scrubText(summary, config)),
     detail ? `\`\`\`\n${scrubText(detail, config).slice(0, 1400)}\n\`\`\`` : null,
   ].filter(Boolean);
   enqueue(client, config, { kind, content: parts.join(" ") });
@@ -113,7 +181,7 @@ async function logError(client, config, err, { where, userId } = {}) {
   const canonErr = err && typeof err === "object" ? err : new Error(String(err));
   enqueue(client, config, {
     kind: "error",
-    embeds: [buildErrorEmbed(canonErr, { where, userId })],
+    embeds: [buildErrorEmbed(canonErr, { where, userId, config })],
   });
 }
 
@@ -122,6 +190,7 @@ function _resetForTest() {
   queue = [];
   consumerRunning = false;
   warnedOnce.clear();
+  safeTextCache = null;
 }
 
 module.exports = { logEvent, logError, scrubText, _resetForTest };

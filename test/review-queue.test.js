@@ -199,3 +199,520 @@ test("F13: Confirm mit QID-Merge hält die announced-Saison für die nächste Ka
     .get(nextAnnounced.celeb.id);
   assert.strictEqual(q.season_id, announced.id, "second pending card keeps the announced season id");
 });
+
+// ---------------------------------------------------------------- M16 -------------
+
+const { MessageFlags } = require("discord.js");
+const SCOPE_REJECT = "`anmeldung` oder `pool`.";
+const REVIEW_INTRO =
+  "Erst **Bestätigen**, dann zählt der automatische Abgleich. **Kein Wiki** heißt: nie automatisch als tot werten.";
+const LOOKUP_FAIL =
+  "Lookup fehlgeschlagen. Die URL ist keine Wikipedia-Seite, oder Wikipedia antwortet nicht.";
+
+function pageLookupMod() {
+  return require("../src/wiki/page-lookup");
+}
+
+async function withLookupStubs(overrides, fn) {
+  const mod = pageLookupMod();
+  const prev = {
+    proposeWikiForName: mod.proposeWikiForName,
+    lookupUrl: mod.lookupUrl,
+  };
+  Object.assign(mod, overrides);
+  try {
+    await fn();
+  } finally {
+    mod.proposeWikiForName = prev.proposeWikiForName;
+    mod.lookupUrl = prev.lookupUrl;
+  }
+}
+
+function replyText(payload) {
+  return typeof payload === "string" ? payload : payload?.content;
+}
+
+test("M16: Review-Buttons heißen deutsch und bleiben unter 80 Zeichen", () => {
+  const labels = celebReview
+    .buildReviewButtons(1)
+    .toJSON()
+    .components.map((c) => c.label);
+  assert.deepStrictEqual(labels, [
+    "Bestätigen",
+    "Falscher Link",
+    "Alter setzen",
+    "Kein Wiki",
+    "Überspringen",
+  ]);
+  for (const label of labels) assert.ok(label.length <= 80, label);
+});
+
+test("M16: scope ist eine Slash-Choice anmeldung|pool", () => {
+  const opt = reviewCmd.options.find((o) => o.name === "scope");
+  assert.deepStrictEqual(
+    opt.choices.map((c) => c.value),
+    ["anmeldung", "pool"]
+  );
+  assert.deepStrictEqual(
+    reviewCmd.parseSlash({ options: { getString: () => "anmeldung" } }),
+    ["scope:anmeldung"]
+  );
+  assert.deepStrictEqual(reviewCmd.parseSlash({ options: { getString: () => null } }), []);
+});
+
+test("M16: scope:poool und andere Tippfehler öffnen die Queue nicht", async () => {
+  const origCount = db.countPendingReviews;
+  const origNext = db.nextPendingReview;
+  let opened = 0;
+  db.countPendingReviews = (...a) => {
+    opened += 1;
+    return origCount(...a);
+  };
+  db.nextPendingReview = (...a) => {
+    opened += 1;
+    return origNext(...a);
+  };
+  try {
+    for (const arg of ["scope:poool", "poool", "scope:next", "next", "scope:poolfoo"]) {
+      const replies = [];
+      let sent = 0;
+      const msg = {
+        reply: async (m) => replies.push(replyText(m)),
+        channel: { send: async () => { sent += 1; } },
+        author: { id: "1" },
+      };
+      await reviewCmd.run({ config: { channelAdmin: "", prefix: "!" } }, [arg], msg);
+      assert.deepStrictEqual(replies, [SCOPE_REJECT], arg);
+      assert.strictEqual(sent, 0, arg);
+    }
+    assert.strictEqual(opened, 0, "invalid scope must not read the queue");
+  } finally {
+    db.countPendingReviews = origCount;
+    db.nextPendingReview = origNext;
+  }
+});
+
+test("M16: ohne Argument bleibt Anmeldung, scope:pool bleibt der laufende Pool", async () => {
+  await withLookupStubs(
+    {
+      proposeWikiForName: async () => {
+        throw new Error("propose should not run for cards that already have a url");
+      },
+    },
+    async () => {
+      if (db.countPendingReviews({ seasonId: announcedSeason().id }) === 0) {
+        enqueueAnnounced("Default Scope Figure");
+      }
+      const announcedReplies = [];
+      const announcedMsg = {
+        reply: async (m) => announcedReplies.push(replyText(m)),
+        channel: { send: async () => {} },
+        author: { id: "1" },
+      };
+      await reviewCmd.run({ config: { channelAdmin: "", prefix: "!" } }, [], announcedMsg);
+      assert.notStrictEqual(announcedReplies[0], SCOPE_REJECT);
+      assert.match(announcedReplies[0], /Anmeldung/);
+
+      if (db.countPendingReviews() === 0) {
+        const c = db.findOrCreateCeleb({ name: "Pool Scope Figure", age: 70 });
+        db.enqueueReview(
+          c.celeb.id,
+          {
+            wikiUrl: "https://en.wikipedia.org/wiki/Pool_Scope_Figure",
+            wikiNorm: "en:pool_scope_figure",
+            proposedAge: 70,
+            lang: "en",
+          },
+          { seasonId: runningSeason().id }
+        );
+      }
+      const poolReplies = [];
+      const poolMsg = {
+        reply: async (m) => poolReplies.push(replyText(m)),
+        channel: { send: async () => {} },
+        author: { id: "1" },
+      };
+      await reviewCmd.run(
+        { config: { channelAdmin: "", prefix: "!" } },
+        ["scope:pool"],
+        poolMsg
+      );
+      assert.notStrictEqual(poolReplies[0], SCOPE_REJECT);
+      assert.match(poolReplies[0], /laufender Pool/);
+    }
+  );
+});
+
+test("M16: gesetztes aber nicht sendbares CHANNEL_ADMIN fällt auf preferDmUser zurück", async () => {
+  await withLookupStubs(
+    {
+      proposeWikiForName: async () => ({
+        wikiUrl: "https://en.wikipedia.org/wiki/Dm_Fallback",
+        proposedAge: 40,
+        lang: "en",
+        candidates: [],
+      }),
+    },
+    async () => {
+      if (db.countPendingReviews() === 0) {
+        const c = db.findOrCreateCeleb({ name: "Dm Fallback Figure", age: 40 });
+        db.enqueueReview(
+          c.celeb.id,
+          {
+            wikiUrl: "https://en.wikipedia.org/wiki/Dm_Fallback_Figure",
+            wikiNorm: "en:dm_fallback_figure",
+            proposedAge: 40,
+            lang: "en",
+          },
+          { seasonId: runningSeason().id }
+        );
+      }
+      const sent = [];
+      const dm = { id: "dm-1", send: async (payload) => sent.push(payload) };
+      let usedFallback = false;
+      const msg = {
+        reply: async () => {},
+        channel: {
+          id: "fallback-channel",
+          send: async () => {
+            usedFallback = true;
+          },
+        },
+        author: { id: "1", createDM: async () => dm },
+      };
+      const ctx = {
+        config: { channelAdmin: "admin-missing", prefix: "!" },
+        client: { channels: { fetch: async () => { throw new Error("not sendable"); } } },
+      };
+      await reviewCmd.run(ctx, ["pool"], msg);
+      assert.strictEqual(usedFallback, false, "must not post the card in the fallback channel");
+      assert.ok(sent.length >= 1, "card goes to the admin DM");
+      assert.deepStrictEqual(sent[0].allowedMentions, { parse: [] });
+    }
+  );
+});
+
+test("M16: vorhandene proposed_wiki_url ruft proposeWikiForName nicht auf", async () => {
+  db.getDb().prepare("DELETE FROM celeb_review_queue").run();
+  const name = "Second *Announced* <@123>";
+  const c = db.findOrCreateCeleb({ name, age: 41 });
+  const url = "https://en.wikipedia.org/wiki/Second_Announced";
+  const queued = db.enqueueReview(
+    c.celeb.id,
+    { wikiUrl: url, wikiNorm: "en:second_announced", proposedAge: 41, lang: "en" },
+    { seasonId: announcedSeason().id }
+  );
+  assert.strictEqual(queued.queued, true);
+  const stored = db
+    .getDb()
+    .prepare("SELECT proposed_wiki_url, proposed_candidates FROM celeb_review_queue WHERE celeb_id = ?")
+    .get(c.celeb.id);
+  assert.ok(stored.proposed_wiki_url);
+  assert.strictEqual(stored.proposed_candidates, null, "empty candidates used to force a re-search");
+
+  let calls = 0;
+  const sent = [];
+  await withLookupStubs(
+    {
+      proposeWikiForName: async () => {
+        calls += 1;
+        throw new Error("proposeWikiForName must not run");
+      },
+    },
+    async () => {
+      await celebReview.sendNextReview(
+        { config: { userAgent: "test", adminId: "1" } },
+        { send: async (payload) => sent.push(payload) },
+        { season: announcedSeason(), seasonId: announcedSeason().id }
+      );
+    }
+  );
+  assert.strictEqual(calls, 0);
+  assert.strictEqual(sent.length, 1);
+  const card = sent[0];
+  assert.strictEqual(card.embeds[0].data.title, "Wiki/Alter: Second Announced 123");
+  assert.ok(!card.embeds[0].data.title.includes("*"));
+  assert.ok(!card.embeds[0].data.title.includes("<@"));
+  assert.ok(card.embeds[0].data.description.includes(REVIEW_INTRO));
+  assert.ok(card.embeds[0].data.description.includes(url));
+  assert.deepStrictEqual(card.allowedMentions, { parse: [] });
+  const labels = card.components[card.components.length - 1].toJSON().components.map((b) => b.label);
+  assert.deepStrictEqual(labels, [
+    "Bestätigen",
+    "Falscher Link",
+    "Alter setzen",
+    "Kein Wiki",
+    "Überspringen",
+  ]);
+});
+
+test("M16: neue Suche ohne Queue-URL ruft proposeWikiForName auf", async () => {
+  db.getDb().prepare("DELETE FROM celeb_review_queue").run();
+  const c = db.findOrCreateCeleb({ name: "Needs A Search", age: 50 });
+  db.enqueueReview(
+    c.celeb.id,
+    { proposedAge: 50 },
+    { seasonId: announcedSeason().id }
+  );
+  let calls = 0;
+  await withLookupStubs(
+    {
+      proposeWikiForName: async () => {
+        calls += 1;
+        return {
+          wikiUrl: "https://en.wikipedia.org/wiki/Needs_A_Search",
+          wikiNorm: "en:needs_a_search",
+          proposedAge: 50,
+          lang: "en",
+          qid: "Q50",
+          candidates: [],
+        };
+      },
+    },
+    async () => {
+      await celebReview.sendNextReview(
+        { config: { userAgent: "test", adminId: "1" } },
+        { send: async () => {} },
+        { season: announcedSeason(), seasonId: announcedSeason().id }
+      );
+    }
+  );
+  assert.strictEqual(calls, 1);
+});
+
+test("M16: crev:url deferReply vor einem 5s-Lookup, danach editReply", async () => {
+  const c = db.findOrCreateCeleb({ name: "Wiki *Star* <@5>", age: 44 });
+  db.enqueueReview(
+    c.celeb.id,
+    { proposedAge: 44 },
+    { seasonId: announcedSeason().id }
+  );
+  const order = [];
+  let deferOpts = null;
+  let release;
+  let released = false;
+  const proposal = {
+    wikiUrl: "https://en.wikipedia.org/wiki/Wiki_Star",
+    wikiNorm: "en:wiki_star",
+    proposedAge: 44,
+    qid: "Q555",
+    lang: "en",
+    candidates: [
+      {
+        title: "Wiki Star",
+        url: "https://en.wikipedia.org/wiki/Wiki_Star",
+        norm: "en:wiki_star",
+        lang: "en",
+        proposedAge: 44,
+        qid: "Q555",
+      },
+    ],
+  };
+  // Worst case: der Lookup hängt 5s. deferReply muss der erste Call sein,
+  // sonst ist das 3s-Ack weg. Der Test löst den Stub auf Zuruf auf.
+  const LOOKUP_WORST_CASE_MS = 5000;
+  const started = Date.now();
+  let editPayload = null;
+  const interaction = {
+    customId: celebReview.reviewCustomId("url", c.celeb.id),
+    user: { id: "1" },
+    channel: { send: async () => order.push("send") },
+    isButton: () => false,
+    isModalSubmit: () => true,
+    isStringSelectMenu: () => false,
+    isRepliable: () => true,
+    deferred: false,
+    replied: false,
+    fields: {
+      getTextInputValue: () => "https://en.wikipedia.org/wiki/Wiki_Star",
+    },
+    deferReply: async (opts) => {
+      order.push("deferReply");
+      deferOpts = opts;
+      interaction.deferred = true;
+    },
+    editReply: async (payload) => {
+      order.push("editReply");
+      editPayload = payload;
+    },
+    reply: async () => {
+      order.push("reply");
+    },
+  };
+
+  await withLookupStubs(
+    {
+      lookupUrl: () => {
+        order.push("lookupUrl");
+        return new Promise((resolve) => {
+          const timer = setTimeout(() => resolve(proposal), LOOKUP_WORST_CASE_MS);
+          release = () => {
+            if (released) return;
+            released = true;
+            clearTimeout(timer);
+            resolve(proposal);
+          };
+        });
+      },
+      proposeWikiForName: async () => proposal,
+    },
+    async () => {
+      const pending = celebReview.handleReviewInteraction(
+        { config: { adminId: "1", userAgent: "test" } },
+        interaction
+      );
+      const deadline = Date.now() + 1000;
+      while (!order.includes("lookupUrl") && Date.now() < deadline) {
+        await new Promise((r) => setImmediate(r));
+      }
+      assert.deepStrictEqual(order, ["deferReply", "lookupUrl"]);
+      assert.notStrictEqual(order[0], "lookupUrl");
+      assert.ok(Date.now() - started < LOOKUP_WORST_CASE_MS, "ack must not wait out the lookup");
+      assert.strictEqual(deferOpts.flags, MessageFlags.Ephemeral);
+      release();
+      await pending;
+    }
+  );
+  assert.ok(order.indexOf("deferReply") < order.indexOf("lookupUrl"));
+  assert.ok(order.includes("editReply"));
+  assert.ok(!order.includes("reply"), "success path must edit the deferred reply");
+  assert.match(editPayload.content, /Wiki Star 5/);
+  assert.ok(!editPayload.content.includes("<@"));
+  assert.ok(!editPayload.content.includes("*Star*"));
+  assert.ok(editPayload.content.includes("https://en.wikipedia.org/wiki/Wiki_Star"));
+  assert.deepStrictEqual(editPayload.allowedMentions, { parse: [] });
+});
+
+test("M16: Lookup-Fehler nach deferReply ruft reply nicht noch einmal auf", async () => {
+  const c = db.findOrCreateCeleb({ name: "Broken Lookup", age: 33 });
+  const order = [];
+  let editPayload = null;
+  const interaction = {
+    customId: celebReview.reviewCustomId("url", c.celeb.id),
+    user: { id: "1" },
+    channel: { send: async () => order.push("send") },
+    isButton: () => false,
+    isModalSubmit: () => true,
+    isStringSelectMenu: () => false,
+    isRepliable: () => true,
+    deferred: false,
+    replied: false,
+    fields: { getTextInputValue: () => "https://en.wikipedia.org/wiki/Not_A_Page" },
+    deferReply: async () => {
+      order.push("deferReply");
+      interaction.deferred = true;
+    },
+    editReply: async (payload) => {
+      order.push("editReply");
+      editPayload = payload;
+    },
+    reply: async () => {
+      order.push("reply");
+    },
+  };
+  await withLookupStubs(
+    {
+      lookupUrl: async () => {
+        order.push("lookupUrl");
+        throw new Error("ENOTFOUND secret internals");
+      },
+    },
+    async () => {
+      await celebReview.handleReviewInteraction(
+        { config: { adminId: "1", userAgent: "test" } },
+        interaction
+      );
+    }
+  );
+  assert.deepStrictEqual(order.slice(0, 2), ["deferReply", "lookupUrl"]);
+  assert.ok(!order.includes("reply"));
+  assert.ok(order.includes("editReply"));
+  assert.strictEqual(editPayload.content, LOOKUP_FAIL);
+  assert.ok(!editPayload.content.includes("ENOTFOUND"));
+  assert.ok(!editPayload.content.includes("secret"));
+  assert.ok(!editPayload.content.includes(":"));
+});
+
+test("M16: Alter-Modal und Kandidatenwahl nennen Bestätigen", async () => {
+  const announced = announcedSeason();
+  const aged = db.findOrCreateCeleb({ name: "Age *Button*", age: 60 });
+  db.enqueueReview(
+    aged.celeb.id,
+    {
+      wikiUrl: "https://en.wikipedia.org/wiki/Age_Button",
+      wikiNorm: "en:age_button",
+      proposedAge: 60,
+      lang: "en",
+    },
+    { seasonId: announced.id }
+  );
+  const ageReplies = [];
+  await celebReview.handleReviewInteraction(
+    { config: { adminId: "1", userAgent: "test" } },
+    {
+      customId: celebReview.reviewCustomId("age", aged.celeb.id),
+      user: { id: "1" },
+      isButton: () => false,
+      isModalSubmit: () => true,
+      isStringSelectMenu: () => false,
+      isRepliable: () => true,
+      fields: { getTextInputValue: () => "70" },
+      reply: async (payload) => ageReplies.push(payload),
+    }
+  );
+  assert.match(ageReplies[0].content, /Danach \*\*Bestätigen\*\*\./);
+  assert.strictEqual(ageReplies[0].flags, MessageFlags.Ephemeral);
+  assert.deepStrictEqual(ageReplies[0].allowedMentions, { parse: [] });
+
+  const picked = db.findOrCreateCeleb({ name: "Pick Target", age: 61 });
+  const urlA = "https://en.wikipedia.org/wiki/Ada_One";
+  const urlB = "https://en.wikipedia.org/wiki/Ada_Two";
+  db.enqueueReview(
+    picked.celeb.id,
+    {
+      wikiUrl: urlA,
+      wikiNorm: "en:ada_one",
+      proposedAge: 61,
+      lang: "en",
+      candidates: [
+        { title: "Ada *One*", url: urlA, norm: "en:ada_one", lang: "en", proposedAge: 61, qid: "Q1" },
+        { title: "Ada Two", url: urlB, norm: "en:ada_two", lang: "en", proposedAge: 62, qid: "Q2" },
+      ],
+    },
+    { seasonId: announced.id }
+  );
+  const updates = [];
+  await withLookupStubs(
+    {
+      proposeWikiForName: async () => ({
+        wikiUrl: urlA,
+        proposedAge: 61,
+        lang: "en",
+        candidates: [],
+      }),
+    },
+    async () => {
+      await celebReview.handleReviewInteraction(
+        { config: { adminId: "1", userAgent: "test" } },
+        {
+          customId: celebReview.reviewCustomId("pick", picked.celeb.id),
+          user: { id: "1" },
+          channel: { send: async () => {} },
+          isButton: () => false,
+          isModalSubmit: () => false,
+          isStringSelectMenu: () => true,
+          isRepliable: () => true,
+          values: ["0"],
+          update: async (payload) => updates.push(payload),
+          reply: async () => {
+            throw new Error("pick should update, not reply");
+          },
+        }
+      );
+    }
+  );
+  assert.match(updates[0].content, /Jetzt \*\*Bestätigen\*\*\./);
+  assert.match(updates[0].content, /Ada One/);
+  assert.ok(!updates[0].content.includes("*One*"));
+  assert.deepStrictEqual(updates[0].allowedMentions, { parse: [] });
+});

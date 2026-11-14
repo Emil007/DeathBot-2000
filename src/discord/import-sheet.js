@@ -1,4 +1,36 @@
-function parseDeathDate(raw) {
+function loadParseCalendarDate() {
+  try {
+    return require("../db/time").parseCalendarDate;
+  } catch (err) {
+    // ANNAHME: M1 legt src/db/time.js an. Bis das Modul im Workspace liegt,
+    // gilt hier derselbe Kalendervertrag (Roundtrip über Date.UTC).
+    if (err.code !== "MODULE_NOT_FOUND") throw err;
+    return fallbackParseCalendarDate;
+  }
+}
+
+const parseCalendarDate = loadParseCalendarDate();
+
+function fallbackParseCalendarDate(s) {
+  if (typeof s !== "string") return null;
+  const match = /^(\d{4})-(\d{2})-(\d{2})$/.exec(s);
+  if (!match) return null;
+  const year = Number(match[1]);
+  const month = Number(match[2]);
+  const day = Number(match[3]);
+  const utc = new Date(Date.UTC(year, month - 1, day));
+  if (
+    utc.getUTCFullYear() !== year ||
+    utc.getUTCMonth() !== month - 1 ||
+    utc.getUTCDate() !== day
+  ) {
+    return null;
+  }
+  return s;
+}
+
+/** ISO-Kandidat aus den bekannten Sheet-Formen, sonst null (kein Datum). */
+function calendarCandidate(raw) {
   if (!raw) return null;
   const s = String(raw).trim();
   if (!s) return null;
@@ -15,10 +47,22 @@ function parseDeathDate(raw) {
     const d = us[2].padStart(2, "0");
     return `${us[3]}-${m}-${d}`;
   }
-  // Unknown format → invalid. Returning the raw text made import.js treat ANY
+  // Unknown format → not a date. Returning the raw text made import.js treat ANY
   // non-empty string as a real death date, so a malformed cell (e.g. "???") was
   // enough to apply a death. strict parseDeathDate keeps import honest.
   return null;
+}
+
+function interpretDeathDate(raw) {
+  const candidate = calendarCandidate(raw);
+  if (!candidate) return { diedAt: null, diedInvalid: false };
+  const diedAt = parseCalendarDate(candidate);
+  if (!diedAt) return { diedAt: null, diedInvalid: true };
+  return { diedAt, diedInvalid: false };
+}
+
+function parseDeathDate(raw) {
+  return interpretDeathDate(raw).diedAt;
 }
 
 function parseSheetTable(text) {
@@ -86,11 +130,13 @@ function parseSheetTable(text) {
         : null;
     const description = idxDesc >= 0 ? cells[idxDesc] || "" : "";
     const died = idxDied >= 0 ? cells[idxDied] || "" : "";
+    const { diedAt, diedInvalid } = interpretDeathDate(died);
     rows.push({
       name: name.trim(),
       age: Number.isFinite(age) ? age : null,
       description: description.trim(),
-      diedAt: parseDeathDate(died),
+      diedAt,
+      diedInvalid,
     });
   }
 

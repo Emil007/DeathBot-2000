@@ -1,13 +1,21 @@
-const db = require("../../db");
-const { canParticipate } = require("../membership");
+const { canParticipate, participationSentence } = require("../membership");
 const { respondPick } = require("../pick-assistant");
 const { logError } = require("../log");
+
+function mentionOpts() {
+  try {
+    return require("../safe-text").mentionOpts();
+  } catch (e) {
+    if (e && e.code === "MODULE_NOT_FOUND") return { allowedMentions: { parse: [] } };
+    throw e;
+  }
+}
 
 const cmd = {
   name: "picks",
   admin: false,
   group: "everyone",
-  description: "Zeigt deine Tipp-Liste für die nächste (angekündigte) Runde",
+  description: "Deine Namen für die nächste Runde",
   usage: "/picks\n{prefix}picks",
   examples: ["/picks", "{prefix}picks"],
   details:
@@ -18,15 +26,10 @@ const cmd = {
   async run(ctx, args, msg) {
     const part = await canParticipate(ctx.client, ctx.config, msg.author.id);
     if (!part.ok) {
-      await msg.reply(
-        part.reason === "not-member"
-          ? "Die Anmeldung ist an den angekündigten Kanal gebunden. Wer den Kanal nicht sehen kann, gibt keine Tipps ab."
-          : "Für die kommende Runde ist die Anmeldung noch nicht geöffnet."
-      );
+      await msg.reply({ content: participationSentence(part), ...mentionOpts() });
       return;
     }
     const season = part.season;
-    // DM öffnen und Liste dorthin — wenn wir schon im DM sind, antworten
     let target = msg.channel;
     if (msg.guildId) {
       try {
@@ -34,13 +37,20 @@ const cmd = {
         if (dm) target = dm;
       } catch (e) {
         await logError(ctx.client, ctx.config, e, { where: "/picks createDM", userId: msg.author.id });
-        await msg.reply("Ich kann dir keine DM schreiben (DM-geschlossen?). Öffne die DM zu Gregg.");
+        await msg.reply({
+          content:
+            "Ich kann dir keine DM schreiben (DMs zu). Öffne die Direktnachricht an Gregg und ruf `/picks` noch einmal auf.",
+          ...mentionOpts(),
+        });
         return;
       }
     }
     await respondPick(ctx, target, msg.author.id, season, [], msg.author.username);
     if (msg.guildId && target !== msg.channel) {
-      await msg.reply("Ich habe dir deine Tipp-Liste per DM geschickt — Namen einfach dort hin schreiben.");
+      await msg.reply({
+        content: "Tipp-Liste ist in deiner DM. Namen dorthin, nicht in diesen Kanal.",
+        ...mentionOpts(),
+      });
     }
   },
 };

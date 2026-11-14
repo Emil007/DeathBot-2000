@@ -1,5 +1,6 @@
 const db = require("../../db");
 const { usageReply } = require("../usage");
+const { replyText, sanitizeDisplayName, resolveSnowflakePoints, NEED_MENTION } = require("./liste");
 
 const cmd = {
   name: "set-points",
@@ -40,26 +41,23 @@ const cmd = {
     return points != null ? [String(points)] : [];
   },
   async run(ctx, args, msg) {
-    const points = parseInt(args[args.length - 1], 10);
-    if (Number.isNaN(points)) {
-      await msg.reply(usageReply(cmd, ctx.config));
+    const resolved = resolveSnowflakePoints(msg, args);
+    if (resolved.error === "usage") {
+      await replyText(msg, usageReply(cmd, ctx.config));
       return;
     }
-    let mention = msg.mentions.users.first();
-    if (!mention && args[0] && /^\d{16,20}$/.test(args[0])) {
-      mention = await ctx.client.users.fetch(args[0]).catch(() => null);
+    if (resolved.error) {
+      await replyText(msg, NEED_MENTION);
+      return;
     }
-    const player = mention
-      ? db.getDb().prepare("SELECT * FROM players WHERE discord_user_id = ?").get(mention.id)
-      : null;
+    const player = db.findPlayerByQuery(resolved.snowflake);
     if (!player) {
-      await msg.reply("Spieler nicht gefunden (@User bzw. user_id nötig).");
+      await replyText(msg, "Spieler nicht gefunden.");
       return;
     }
-    db.setPoints(player.id, points);
-    await msg.reply(
-      `Punkte für **${player.display_name}** auf **${db.playerTotal(player.id)}** gesetzt.`
-    );
+    db.setPoints(player.id, resolved.points);
+    const name = sanitizeDisplayName(player.display_name);
+    await replyText(msg, `Punkte für **${name}** auf **${db.playerTotal(player.id)}** gesetzt.`);
   },
 };
 

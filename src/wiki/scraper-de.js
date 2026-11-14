@@ -1,6 +1,6 @@
 const axios = require("axios");
 const cheerio = require("cheerio");
-const { wikiPathFromHref } = require("./scraper-en");
+const { wikiPathFromHref, scrapeCalendar } = require("./scraper-en");
 
 const MONTHS = [
   "Januar", "Februar", "März", "April", "Mai", "Juni",
@@ -250,13 +250,13 @@ function monthUrls(year, monthIndex) {
 
 /**
  * @param {string} userAgent
- * @param {{ scope?: 'recent'|'full' }} [opts]
+ * @param {{ scope?: 'recent'|'full', tz?: string, now?: Date|string|number }} [opts]
+ * `tz` defaults to Europe/Vienna. `now` is the frozen instant (default: current time).
  */
 async function scrapeDe(userAgent, opts = {}) {
   const scope = opts.scope || "full";
   const client = createClient(userAgent);
-  const year = new Date().getFullYear();
-  const monthIndex = new Date().getMonth();
+  const { year, monthIndex } = scrapeCalendar(opts);
   const urls = [];
 
   urls.push(`https://de.wikipedia.org/wiki/Nekrolog_${year}`);

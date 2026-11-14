@@ -3,15 +3,76 @@ const Database = require("better-sqlite3");
 const { SCHEMA, migrate } = require("./schema");
 
 let db = null;
+// Zeitzone aus openDb(config). Leer-DB-Jahr und diedAt-Fallback rechnen damit,
+// nicht mit dem Prozess-Offset und nicht mit toISOString().slice(0, 10).
+let dbTz = "Europe/Vienna";
+
+// M1 legt src/db/time.js an. Fehlt das Modul in diesem Workspace noch, gelten
+// dieselben Verträge lokal, damit der DB-Kern vor dem Merge lauffähig bleibt.
+function calendarDateFallback(instant, timeZone) {
+  return new Intl.DateTimeFormat("en-CA", {
+    timeZone: timeZone || "UTC",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+  }).format(instant);
+}
+
+function parseCalendarDateFallback(s) {
+  if (typeof s !== "string" || !/^\d{4}-\d{2}-\d{2}$/.test(s)) return null;
+  const y = Number(s.slice(0, 4));
+  const m = Number(s.slice(5, 7));
+  const d = Number(s.slice(8, 10));
+  const utc = new Date(Date.UTC(y, m - 1, d));
+  if (utc.getUTCFullYear() !== y || utc.getUTCMonth() !== m - 1 || utc.getUTCDate() !== d) {
+    return null;
+  }
+  return s;
+}
+
+function addCalendarDaysFallback(yyyyMmDd, n) {
+  const parsed = parseCalendarDateFallback(yyyyMmDd);
+  if (!parsed) throw new Error(`Ungültiges Kalenderdatum: ${yyyyMmDd}`);
+  const y = Number(parsed.slice(0, 4));
+  const m = Number(parsed.slice(5, 7));
+  const d = Number(parsed.slice(8, 10));
+  const utc = new Date(Date.UTC(y, m - 1, d));
+  utc.setUTCDate(utc.getUTCDate() + Number(n));
+  const yy = utc.getUTCFullYear();
+  const mm = String(utc.getUTCMonth() + 1).padStart(2, "0");
+  const dd = String(utc.getUTCDate()).padStart(2, "0");
+  return `${yy}-${mm}-${dd}`;
+}
+
+let calendarDate = calendarDateFallback;
+let parseCalendarDate = parseCalendarDateFallback;
+let addCalendarDays = addCalendarDaysFallback;
+try {
+  const time = require("./time");
+  if (
+    typeof time.calendarDate === "function" &&
+    typeof time.parseCalendarDate === "function" &&
+    typeof time.addCalendarDays === "function"
+  ) {
+    calendarDate = time.calendarDate;
+    parseCalendarDate = time.parseCalendarDate;
+    addCalendarDays = time.addCalendarDays;
+  }
+} catch (e) {
+  if (e.code !== "MODULE_NOT_FOUND") throw e;
+}
 
 function openDb(config) {
+  dbTz = (config && config.tz) || "Europe/Vienna";
   fs.mkdirSync(config.dataDir, { recursive: true });
   fs.mkdirSync(config.backupsDir, { recursive: true });
   fs.mkdirSync(config.restoreDir, { recursive: true });
 
   db = new Database(config.dbPath);
+  db.pragma("busy_timeout = 10000");
   db.exec(SCHEMA);
   migrate(db);
+  ensureM3Schema();
   // F05-Reparatur (einmalig, idempotent): vor dem Fix ließ `/go` aktive Zeilen
   // mit live=1 + phase='setup' zurück, weil setSeasonLive `phase` nie setzte.
   // Diese Bestandszeilen auf 'running' heben — danach matcht kein weiterer Lauf.
@@ -29,6 +90,31 @@ function openDb(config) {
   // Cleanup is now an explicit opt-in script with a dry-run default:
   //   node scripts/prune-junk-announcements.js [--apply] [--force]
   return db;
+}
+
+// Spalten/Tabellen, die dieser DB-Kern schreibt. Idempotent, damit ein späteres
+// Schema-Migrate dieselben Namen nicht doppelt anlegen muss.
+function ensureM3Schema() {
+  const cols = (table) =>
+    new Set(db.prepare(`PRAGMA table_info(${table})`).all().map((c) => c.name));
+  const celebCols = cols("celebs");
+  if (!celebCols.has("death_announced_at")) {
+    db.exec("ALTER TABLE celebs ADD COLUMN death_announced_at TEXT");
+  }
+  if (!celebCols.has("retract_pending")) {
+    db.exec("ALTER TABLE celebs ADD COLUMN retract_pending INTEGER NOT NULL DEFAULT 0");
+  }
+  const draftCols = cols("pick_drafts");
+  if (draftCols.size && !draftCols.has("unlinked_ack")) {
+    db.exec("ALTER TABLE pick_drafts ADD COLUMN unlinked_ack INTEGER NOT NULL DEFAULT 0");
+  }
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS pending_pastes (
+      user_id TEXT PRIMARY KEY,
+      body TEXT NOT NULL,
+      updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+  `);
 }
 
 function getDb() {
@@ -58,7 +144,8 @@ function reopenDb(config) {
 function ensureActiveSeason() {
   const active = db.prepare("SELECT id FROM seasons WHERE active = 1 LIMIT 1").get();
   if (active) return active.id;
-  const year = new Date().getFullYear();
+  // Nur der leere-DB-Fall legt eine Zeile an. Jahr aus der gemerkten Zeitzone.
+  const year = Number(calendarDate(new Date(), dbTz).slice(0, 4));
   const start = `${year}-01-01`;
   const info = db
     .prepare(
@@ -172,6 +259,10 @@ function setSeasonDeathpoolChannel(seasonId, channelId) {
 // CHANNEL_DEATHPOOL ist optional und config.channelDeathpool zählt als leer.
 // Gibt die ID zurück (String) oder null, wenn keine gespeichert ist.
 function resolveDeathpoolChannel(config) {
+  // config.channelDeathpool wird hier nicht gelesen. Der Env-Wert landet
+  // einmalig über M6 in der Spalte, nicht als Fallback an dieser Stelle.
+  void config;
+  if (!db) return null;
   let running = null;
   try {
     running = getActiveSeason();
@@ -179,7 +270,16 @@ function resolveDeathpoolChannel(config) {
     running = null;
   }
   const stored = running?.deathpool_channel_id;
-  if (stored) return stored;
+  if (stored) return String(stored);
+  const archived = db
+    .prepare(
+      `SELECT deathpool_channel_id FROM seasons
+       WHERE phase = 'archived'
+       ORDER BY id DESC
+       LIMIT 1`
+    )
+    .get();
+  if (archived?.deathpool_channel_id) return String(archived.deathpool_channel_id);
   return null;
 }
 
@@ -219,6 +319,9 @@ function activateAnnouncedSeason() {
     }
 
     archiveRunningSeason(running.id);
+    // Bilanz-Nachzug hängt an der archivierten Id. year_rollover_annual_review
+    // bleibt unangetastet; Jahr und start_date der announced-Zeile auch.
+    setMeta("pending_season_review", String(running.id));
 
     const info = db
       .prepare(
@@ -309,6 +412,8 @@ function findOrCreateCeleb({ name, age, description }) {
     .get(key);
 
   if (celeb) {
+    // Bestehende Zeile nicht anfassen: kein Name, kein Alter, keine Beschreibung,
+    // kein Aka aus dem fremden Rohstring. ageConflict nur berechnen.
     let ageConflict = null;
     if (
       age != null &&
@@ -317,21 +422,6 @@ function findOrCreateCeleb({ name, age, description }) {
     ) {
       ageConflict = { existing: celeb.age_at_pick, incoming: Number(age) };
     }
-    db.prepare(
-      `UPDATE celebs SET
-        name = COALESCE(?, name),
-        sheet_age_hint = COALESCE(?, sheet_age_hint),
-        age_at_pick = COALESCE(age_at_pick, ?),
-        description = COALESCE(?, description)
-       WHERE id = ?`
-    ).run(name, age ?? null, age ?? null, description || null, celeb.id);
-    if (nameKey(name) !== celeb.name_key) {
-      db.prepare("INSERT OR IGNORE INTO celeb_aka (celeb_id, alias) VALUES (?, ?)").run(
-        celeb.id,
-        name
-      );
-    }
-    celeb = db.prepare("SELECT * FROM celebs WHERE id = ?").get(celeb.id);
     return { celeb, ageConflict, created: false, possibleHomonym: false };
   }
 
@@ -787,31 +877,35 @@ function setExcludeFromAuto(celebId, exclude) {
  * - Optionally removes all season picks for this celeb (cheat / invalid pick)
  */
 function invalidateCeleb(celebId, { removePicks = false } = {}) {
-  const celeb = db.prepare("SELECT * FROM celebs WHERE id = ?").get(celebId);
-  if (!celeb) return null;
+  return db.transaction(() => {
+    const celeb = db.prepare("SELECT * FROM celebs WHERE id = ?").get(celebId);
+    if (!celeb) return null;
 
-  let retract = null;
-  if (!celeb.is_alive) {
-    retract = retractDeath(celebId);
-  }
+    let retract = null;
+    if (!celeb.is_alive) {
+      // Nested db.transaction → Savepoint. Exclude und Pick-Löschen committen
+      // zusammen mit dem Retract, oder gar nicht.
+      retract = retractDeath(celebId);
+    }
 
-  setExcludeFromAuto(celebId, true);
+    setExcludeFromAuto(celebId, true);
 
-  let picksRemoved = 0;
-  if (removePicks) {
-    const season = getActiveSeason();
-    const info = db
-      .prepare("DELETE FROM picks WHERE celeb_id = ? AND season_id = ?")
-      .run(celebId, season.id);
-    picksRemoved = info.changes || 0;
-  }
+    let picksRemoved = 0;
+    if (removePicks) {
+      const season = getActiveSeason();
+      const info = db
+        .prepare("DELETE FROM picks WHERE celeb_id = ? AND season_id = ?")
+        .run(celebId, season.id);
+      picksRemoved = info.changes || 0;
+    }
 
-  return {
-    celeb: db.prepare("SELECT * FROM celebs WHERE id = ?").get(celebId),
-    retracted: Boolean(retract),
-    awardsUndone: retract?.awards?.length || 0,
-    picksRemoved,
-  };
+    return {
+      celeb: db.prepare("SELECT * FROM celebs WHERE id = ?").get(celebId),
+      retracted: Boolean(retract),
+      awardsUndone: retract?.awards?.length || 0,
+      picksRemoved,
+    };
+  })();
 }
 
 function listBonuses() {
@@ -963,7 +1057,13 @@ function addDraftNames(draftId, names, opts = {}) {
     stmt.run(draftId, pos, name);
     added += 1;
   }
-  db.prepare("UPDATE pick_drafts SET updated_at = datetime('now') WHERE id = ?").run(draftId);
+  if (added > 0) {
+    db.prepare(
+      "UPDATE pick_drafts SET updated_at = datetime('now'), unlinked_ack = 0 WHERE id = ?"
+    ).run(draftId);
+  } else {
+    db.prepare("UPDATE pick_drafts SET updated_at = datetime('now') WHERE id = ?").run(draftId);
+  }
   // truncated: es blieben Namen wegen des GLOBALEN Limits draußen (nur
   // `entfernen` schafft Platz — ganze Liste, keine „mehrere Meldungen").
   // Duplikate zählen hier NICHT als truncated — sie werden separat gemeldet.
@@ -982,12 +1082,20 @@ function draftCharBudget(draftId) {
   return row ? row.total : 0;
 }
 
+function resetUnlinkedAck(draftId) {
+  if (draftId == null) return;
+  db.prepare("UPDATE pick_drafts SET unlinked_ack = 0 WHERE id = ?").run(draftId);
+}
+
 function removeDraftEntry(entryId) {
+  const row = db.prepare("SELECT draft_id FROM pick_draft_entries WHERE id = ?").get(entryId);
   const info = db.prepare("DELETE FROM pick_draft_entries WHERE id = ?").run(entryId);
+  if (info.changes > 0) resetUnlinkedAck(row?.draft_id);
   return info.changes > 0;
 }
 
 function replaceDraftEntryName(entryId, rawName) {
+  const row = db.prepare("SELECT draft_id FROM pick_draft_entries WHERE id = ?").get(entryId);
   const info = db
     .prepare(
       `UPDATE pick_draft_entries SET raw_name = ?, link_status = 'pending', wiki_url = NULL,
@@ -995,32 +1103,35 @@ function replaceDraftEntryName(entryId, rawName) {
        WHERE id = ?`
     )
     .run(rawName, entryId);
+  if (info.changes > 0) resetUnlinkedAck(row?.draft_id);
   return info.changes > 0;
 }
 
-function setDraftEntryLinked(
-  entryId,
-  { wikiUrl, wikiNorm, qid, proposedAge, linkStatus, candidatesJson } = {}
-) {
+function setDraftEntryLinked(entryId, opts = {}, clearIdentity = false) {
+  const { wikiUrl, wikiNorm, qid, proposedAge, linkStatus, candidatesJson } = opts;
   // candidates_json NICHT via COALESCE: ein neuer eindeutiger Kandidat muss einen
   // alten mehrdeutigen Satz ersetzen, sonst waehlt der User aus veralteten Daten (F7).
   // qid NICHT coalescen (R2-2): wenn der Aufrufer explizit ein qid mitgibt
   // (auch null = "keins"), ersetzt es die alte Zuordnung. Eine neue URL-Linkung
   // ohne Wikidata-QID darf die vorige Person NICHT stehen lassen — sonst findet
   // finalizeDraft über das alte qid die falsche Person.
+  // clearIdentity erzwingt NULL auf qid und wiki_norm, nicht COALESCE.
+  const wipe = clearIdentity === true || opts.clearIdentity === true;
   const hasQid = qid !== undefined; // undefined = nicht Teil des Updates
-  db.prepare(
+  const info = db.prepare(
     `UPDATE pick_draft_entries SET
        wiki_url = COALESCE(?, wiki_url),
-       wiki_norm = COALESCE(?, wiki_norm),
-       qid = CASE WHEN ? = 1 THEN ? ELSE qid END,
+       wiki_norm = CASE WHEN ? = 1 THEN NULL ELSE COALESCE(?, wiki_norm) END,
+       qid = CASE WHEN ? = 1 THEN NULL WHEN ? = 1 THEN ? ELSE qid END,
        proposed_age = COALESCE(?, proposed_age),
        candidates_json = ?,
        link_status = COALESCE(?, link_status)
      WHERE id = ?`
   ).run(
     wikiUrl ?? null,
+    wipe ? 1 : 0,
     wikiNorm ?? null,
+    wipe ? 1 : 0,
     hasQid ? 1 : 0,
     qid ?? null,
     proposedAge ?? null,
@@ -1028,6 +1139,10 @@ function setDraftEntryLinked(
     linkStatus ?? null,
     entryId
   );
+  if (info.changes > 0) {
+    const row = db.prepare("SELECT draft_id FROM pick_draft_entries WHERE id = ?").get(entryId);
+    resetUnlinkedAck(row?.draft_id);
+  }
 }
 
 function listDraftEntries(draftId) {
@@ -1080,15 +1195,25 @@ function finalizeDraft(playerId, seasonId) {
     }
     if (!entries.length) return { blocked: true, entryId: null, reason: "empty" };
 
+    const unlinked = entries.filter((e) => e.link_status === "unlinked");
+    if (unlinked.length && Number(draft.unlinked_ack) !== 1) {
+      db.prepare(
+        "UPDATE pick_drafts SET unlinked_ack = 1, updated_at = datetime('now') WHERE id = ?"
+      ).run(draft.id);
+      return { blocked: "unlinked", names: unlinked.map((e) => e.raw_name) };
+    }
+
     clearPicksForPlayer(playerId, seasonId);
     const reviewIds = [];
     let added = 0;
     for (const e of entries) {
-      const { celeb, reuse } = linkCelebForAnnouncedSeason({
+      // unlinked verknüpft nur den Roh-Namen. qid und wiki_norm bleiben draußen.
+      const ignoreIdentity = e.link_status === "unlinked";
+      const { celeb } = linkCelebForAnnouncedSeason({
         name: e.raw_name,
         age: e.proposed_age ?? null,
-        qid: e.qid || null,
-        wikiNorm: e.wiki_norm || null,
+        qid: ignoreIdentity ? null : e.qid || null,
+        wikiNorm: ignoreIdentity ? null : e.wiki_norm || null,
       });
       setPick(playerId, celeb.id, seasonId);
       if (e.proposed_age != null) {
@@ -1104,8 +1229,9 @@ function finalizeDraft(playerId, seasonId) {
         reviewIds.push(celeb.id);
       }
     }
-    db.prepare("UPDATE pick_drafts SET status = 'finalized', updated_at = datetime('now') WHERE id = ?")
-      .run(draft.id);
+    db.prepare(
+      "UPDATE pick_drafts SET status = 'finalized', unlinked_ack = 0, updated_at = datetime('now') WHERE id = ?"
+    ).run(draft.id);
     return { reviewIds: [...new Set(reviewIds)], added };
   })();
 }
@@ -1243,12 +1369,26 @@ function getWinnersForCeleb(celebId, seasonId) {
 function applyDeath(celebId, opts = {}) {
   return db.transaction((cid, o) => {
     const celeb = db.prepare("SELECT * FROM celebs WHERE id = ?").get(cid);
-    if (!celeb || !celeb.is_alive) return { celeb, awards: [], score: 0 };
+    if (!celeb) return { celeb: null, awards: [], score: 0, skipped: true, reason: "missing" };
+
+    // Harte Sperre, auch für /kill. Unbestätigt oder exclude_from_auto:
+    // kein is_alive, kein Award, keine Punkte. Wer werten will, bestätigt vorher.
+    if (celeb.wiki_confirmed !== 1 || celeb.exclude_from_auto === 1) {
+      return {
+        skipped: true,
+        reason: celeb.wiki_confirmed !== 1 ? "unconfirmed" : "exclude_from_auto",
+        celeb,
+        awards: [],
+        score: 0,
+      };
+    }
+    if (!celeb.is_alive) return { celeb, awards: [], score: 0 };
 
     const season = getActiveSeason();
     const winners = getWinnersForCeleb(cid, season.id);
     const now = new Date().toISOString();
-    const diedAt = o.diedAt || now.slice(0, 10);
+    // Ohne diedAt: Kalendertag in der gemerkten Zeitzone, nicht UTC-slice.
+    const diedAt = o.diedAt ? String(o.diedAt) : calendarDate(new Date(), dbTz);
 
     // F14: seit der Fix vergeht diedAt das echte Wiki-Todesdatum (entry.day/
     // month/year), nicht den Erkennungstag. Ein Tod VOR dem Saisonstart darf
@@ -1256,14 +1396,11 @@ function applyDeath(celebId, opts = {}) {
     // NACH dem Start entdeckt wird (z.B. 20.12. in der Jan-Liste). Der Tod wird
     // trotzdem vermerkt (is_alive=0), damit getAnnouncedPreStartDeathsUnwarned
     // bzw. die Pre-Start-Warnung den Einreicher erreichen kann.
-    const seasonStart = season?.start_date;
-    const isoRe = /^\d{4}-\d{2}-\d{2}$/;
-    const preStart =
-      Boolean(o.diedAt) &&
-      Boolean(seasonStart) &&
-      isoRe.test(String(o.diedAt)) &&
-      isoRe.test(String(seasonStart)) &&
-      String(o.diedAt) < String(seasonStart);
+    // Vergleich nur über parseCalendarDate beider Seiten.
+    // death_announced_at wird hier nicht gesetzt — der Post macht das später.
+    const diedParsed = parseCalendarDate(diedAt);
+    const startParsed = parseCalendarDate(season?.start_date == null ? "" : String(season.start_date));
+    const preStart = Boolean(diedParsed && startParsed && diedParsed < startParsed);
 
     // Never overwrite a confirmed biography URL with a death-list link
     if (celeb.wiki_confirmed) {
@@ -1354,55 +1491,61 @@ function applyDeath(celebId, opts = {}) {
 }
 
 function retractDeath(celebId) {
-  const celeb = db.prepare("SELECT * FROM celebs WHERE id = ?").get(celebId);
-  if (!celeb || celeb.is_alive) return null;
+  return db.transaction(() => {
+    const celeb = db.prepare("SELECT * FROM celebs WHERE id = ?").get(celebId);
+    if (!celeb || celeb.is_alive) return null;
 
-  // Nur die AKTIVE Saison anfassen: Die 2026er-Punkte liegen nach dem Wechsel im
-  // Snapshot, ein aktiver Fehltreffer darf nur die Laufzeit-Gutschrift zurückholen.
-  const season = getActiveSeason();
-  const awards = db
-    .prepare("SELECT * FROM death_awards WHERE celeb_id = ? AND season_id = ?")
-    .all(celebId, season.id);
+    // Nur die AKTIVE Saison anfassen: Die 2026er-Punkte liegen nach dem Wechsel im
+    // Snapshot, ein aktiver Fehltreffer darf nur die Laufzeit-Gutschrift zurückholen.
+    // Punkte, Award-Delete und is_alive committen zusammen. Ein Abbruch (auch als
+    // Savepoint unter invalidateCeleb) lässt die Gutschrift stehen.
+    const season = getActiveSeason();
+    const awards = db
+      .prepare("SELECT * FROM death_awards WHERE celeb_id = ? AND season_id = ?")
+      .all(celebId, season.id);
 
-  for (const a of awards) {
-    db.prepare("UPDATE players SET base_points = base_points - ? WHERE id = ?").run(
-      a.points,
-      a.player_id
+    for (const a of awards) {
+      db.prepare("UPDATE players SET base_points = base_points - ? WHERE id = ?").run(
+        a.points,
+        a.player_id
+      );
+    }
+    db.prepare("DELETE FROM death_awards WHERE celeb_id = ? AND season_id = ?").run(
+      celebId,
+      season.id
     );
-  }
-  db.prepare("DELETE FROM death_awards WHERE celeb_id = ? AND season_id = ?").run(
-    celebId,
-    season.id
-  );
-  if (celeb.wiki_confirmed) {
-    db.prepare(
-      `UPDATE celebs SET
-        is_alive = 1,
-        died_at = NULL,
-        death_list_url = NULL,
-        death_confirmed = 0,
-        death_detected_at = NULL,
-        death_source = NULL
-       WHERE id = ?`
-    ).run(celebId);
-  } else {
-    db.prepare(
-      `UPDATE celebs SET
-        is_alive = 1,
-        died_at = NULL,
-        wiki_url = NULL,
-        death_list_url = NULL,
-        death_confirmed = 0,
-        death_detected_at = NULL,
-        death_source = NULL
-       WHERE id = ?`
-    ).run(celebId);
-  }
+    if (celeb.wiki_confirmed) {
+      db.prepare(
+        `UPDATE celebs SET
+          is_alive = 1,
+          died_at = NULL,
+          death_list_url = NULL,
+          death_confirmed = 0,
+          death_detected_at = NULL,
+          death_source = NULL,
+          retract_pending = 1
+         WHERE id = ?`
+      ).run(celebId);
+    } else {
+      db.prepare(
+        `UPDATE celebs SET
+          is_alive = 1,
+          died_at = NULL,
+          wiki_url = NULL,
+          death_list_url = NULL,
+          death_confirmed = 0,
+          death_detected_at = NULL,
+          death_source = NULL,
+          retract_pending = 1
+         WHERE id = ?`
+      ).run(celebId);
+    }
 
-  return {
-    celeb: db.prepare("SELECT * FROM celebs WHERE id = ?").get(celebId),
-    awards,
-  };
+    return {
+      celeb: db.prepare("SELECT * FROM celebs WHERE id = ?").get(celebId),
+      awards,
+    };
+  })();
 }
 
 function confirmDeath(celebId) {
@@ -1450,27 +1593,68 @@ function playerTotal(playerId) {
   return player.base_points + bonusSum;
 }
 
-function listScores() {
-  const players = db.prepare("SELECT * FROM players").all();
-  return players
-    .map((p) => ({
-      ...p,
-      total: playerTotal(p.id),
-      pickCount: db
-        .prepare(
-          `SELECT COUNT(*) AS c FROM picks pk
+function listScoreboard() {
+  // Ein SELECT: base_points plus Boni und Pick-Anzahl der aktiven Saison.
+  // Kein playerTotal pro Zeile.
+  return db
+    .prepare(
+      `SELECT
+         p.*,
+         p.base_points + COALESCE((
+           SELECT SUM(b.points * pb.times)
+           FROM player_bonuses pb
+           INNER JOIN bonuses b ON b.id = pb.bonus_id
+           WHERE pb.player_id = p.id
+         ), 0) AS total,
+         (
+           SELECT COUNT(*)
+           FROM picks pk
            INNER JOIN seasons s ON s.id = pk.season_id AND s.active = 1
-           WHERE pk.player_id = ?`
-        )
-        .get(p.id).c,
-    }))
-    .filter((p) => p.pickCount > 0)
-    .sort((a, b) => b.total - a.total);
+           WHERE pk.player_id = p.id
+         ) AS pickCount
+       FROM players p
+       ORDER BY total DESC, p.id ASC`
+    )
+    .all();
+}
+
+function listScores() {
+  return listScoreboard().filter((p) => p.pickCount > 0);
+}
+
+/**
+ * Todesfälle einer Saison: verschiedene Celebs mit Pick, is_alive = 0,
+ * died_at >= start_date und died_at < 1. Januar des Folgejahres.
+ * Jahreszahl aus dem gültigen Datum, Grenze über addCalendarDays — nicht getFullYear().
+ */
+function seasonDeathWindow(startDate) {
+  const start = parseCalendarDate(startDate == null ? "" : String(startDate));
+  if (!start) return null;
+  const year = Number(start.slice(0, 4));
+  const dec31 = parseCalendarDate(`${year}-12-31`);
+  if (!dec31) return null;
+  return { start, end: addCalendarDays(dec31, 1) };
+}
+
+function countSeasonDeaths(season) {
+  if (!season) return 0;
+  const window = seasonDeathWindow(season.start_date);
+  if (!window) return 0;
+  return db
+    .prepare(
+      `SELECT COUNT(DISTINCT c.id) AS c
+       FROM celebs c
+       INNER JOIN picks pk ON pk.celeb_id = c.id AND pk.season_id = ?
+       WHERE c.is_alive = 0
+         AND c.died_at >= ?
+         AND c.died_at < ?`
+    )
+    .get(season.id, window.start, window.end).c;
 }
 
 /**
  * Jahresauswertung einer archivierten Saison: Punktestände aus dem Snapshot,
- * Todesfälle (via death_awards) und Treffer pro Spieler. Für den automatischen
+ * Todesfälle und Treffer pro Spieler. Für den automatischen
  * Jahreswechsel (1.1., Mitternacht).
  */
 function seasonReview(seasonId) {
@@ -1500,14 +1684,13 @@ function seasonReview(seasonId) {
   }
   for (const a of awardRows) {
     if (!byPlayer[a.player_id]) byPlayer[a.player_id] = { name: a.display_name, total: 0, points: 0, hits: 0 };
-    byPlayer[a.player_id].hits++;
+    if (Number(a.points) > 0) byPlayer[a.player_id].hits++;
   }
   const rows = Object.values(byPlayer)
     .map((r) => ({ ...r, total: r.total || 0 }))
     .sort((a, b) => b.total - a.total || b.hits - a.hits);
-  // F20(c): deaths = ANZAHL VERSCHIEDENER Toter, nicht Award-Zeilen. Zehn
-  // Spieler auf demselben Toten sind EIN Todesfall, nicht zehn.
-  const deaths = new Set(awardRows.map((a) => a.celeb_id)).size;
+  // Tote Picks im Saisonfenster, auch mit 0 Punkten und ohne Award-Zeile.
+  const deaths = countSeasonDeaths(season);
   return { season, rows, deaths };
 }
 
@@ -1527,7 +1710,7 @@ function seasonLiveReview(seasonId) {
   const players = db.prepare("SELECT * FROM players").all();
   const awardRows = db
     .prepare(
-      `SELECT da.celeb_id, p.id AS player_id, p.display_name FROM death_awards da
+      `SELECT da.celeb_id, da.points, p.id AS player_id, p.display_name FROM death_awards da
        INNER JOIN players p ON p.id = da.player_id
        WHERE da.season_id = ?`
     )
@@ -1548,12 +1731,12 @@ function seasonLiveReview(seasonId) {
     if (!byPlayer[a.player_id]) {
       byPlayer[a.player_id] = { name: a.display_name, total: 0, points: 0, hits: 0 };
     }
-    byPlayer[a.player_id].hits++;
+    if (Number(a.points) > 0) byPlayer[a.player_id].hits++;
   }
   const rows = Object.values(byPlayer)
     .map((r) => ({ ...r, total: r.total || 0 }))
     .sort((a, b) => b.total - a.total || b.hits - a.hits);
-  const deaths = new Set(awardRows.map((a) => a.celeb_id)).size;
+  const deaths = countSeasonDeaths(season);
   return { season, rows, deaths };
 }
 
@@ -1575,22 +1758,13 @@ function getPlayerPicks(discordUserId) {
 function findPlayerByQuery(query) {
   if (!query) return null;
   const q = String(query).trim();
-  if (/^\d{16,20}$/.test(q)) {
-    return db.prepare("SELECT * FROM players WHERE discord_user_id = ?").get(q) || null;
-  }
-  return (
-    db
-      .prepare(
-        `SELECT * FROM players WHERE display_name = ? COLLATE NOCASE LIMIT 1`
-      )
-      .get(q) ||
-    db
-      .prepare(
-        `SELECT * FROM players WHERE display_name LIKE ? COLLATE NOCASE LIMIT 1`
-      )
-      .get(`%${q}%`) ||
-    null
-  );
+  let discordUserId = null;
+  const mention = q.match(/^<@!?(\d+)>$/);
+  if (mention) discordUserId = mention[1];
+  else if (/^\d{16,20}$/.test(q)) discordUserId = q;
+  else return null;
+  // discord_user_id ist UNIQUE: höchstens eine Zeile. Kein LIKE, kein Anzeigename.
+  return db.prepare("SELECT * FROM players WHERE discord_user_id = ?").get(discordUserId) || null;
 }
 
 /** All celebs in DB with how many active-season picks. */
@@ -1639,18 +1813,29 @@ function markWikiAnnounced(entryId, at = null, qid = null) {
   // Stamp only the FIRST successful announce. Re-scrapes (restart seed, re-poll)
   // must never refresh announced_at, otherwise the daily summary counts every
   // known entry as "new since yesterday" after every container restart.
-  const existing = db
-    .prepare("SELECT announced_at, qid FROM wiki_seen WHERE entry_id = ?")
-    .get(entryId);
-  if (existing?.announced_at) return;
-  const ts = at || db.prepare("SELECT datetime('now') AS t").get().t;
-  db.prepare(
-    `UPDATE wiki_seen SET announced_at = ?, qid = COALESCE(?, qid) WHERE entry_id = ?`
-  ).run(ts, qid, entryId);
-  db.prepare(
-    `INSERT OR IGNORE INTO announced_deaths (entry_id, name, url, lang, qid, announced_at)
-     SELECT entry_id, text, url, lang, COALESCE(?, qid), ? FROM wiki_seen WHERE entry_id = ?`
-  ).run(qid, ts, entryId);
+  // Steht announced_at schon, fehlt aber die announced_deaths-Zeile, wird sie
+  // nachgezogen (INSERT OR IGNORE) — der Zeitstempel bleibt.
+  return db.transaction(() => {
+    const existing = db
+      .prepare("SELECT announced_at, qid FROM wiki_seen WHERE entry_id = ?")
+      .get(entryId);
+    if (existing?.announced_at) {
+      db.prepare(
+        `INSERT OR IGNORE INTO announced_deaths (entry_id, name, url, lang, qid, announced_at)
+         SELECT entry_id, text, url, lang, COALESCE(?, qid), announced_at
+         FROM wiki_seen WHERE entry_id = ?`
+      ).run(qid, entryId);
+      return;
+    }
+    const ts = at || db.prepare("SELECT datetime('now') AS t").get().t;
+    db.prepare(
+      `UPDATE wiki_seen SET announced_at = ?, qid = COALESCE(?, qid) WHERE entry_id = ?`
+    ).run(ts, qid, entryId);
+    db.prepare(
+      `INSERT OR IGNORE INTO announced_deaths (entry_id, name, url, lang, qid, announced_at)
+       SELECT entry_id, text, url, lang, COALESCE(?, qid), ? FROM wiki_seen WHERE entry_id = ?`
+    ).run(qid, ts, entryId);
+  })();
 }
 
 /**
@@ -1669,6 +1854,12 @@ function recentAnnouncedIdentities(sinceIso) {
     if (r.name) humanNames.add(String(r.name).toLowerCase());
   }
   return { qids, humanNames };
+}
+
+/** Alle announced_deaths.qid, ohne Zeitfilter. Für den Tagesbericht bleibt recentAnnouncedIdentities. */
+function recentAnnouncedQids() {
+  const rows = db.prepare("SELECT qid FROM announced_deaths WHERE qid IS NOT NULL AND qid != ''").all();
+  return new Set(rows.map((r) => r.qid));
 }
 
 function seedAllWikiSeen(entries) {
@@ -1805,21 +1996,50 @@ function recentPhraseHashes(limit = 80) {
   );
 }
 
+// Notfall-Wipe: archiviert die aktive Saison, legt eine neue Setup-Saison an
+// und löscht den Pool in einer Transaktion. Kein stiller Boot-Pfad — openDb
+// ruft das nicht auf.
 function clearSeasonForNewYear(year, startDate) {
-  const old = getActiveSeason();
-  db.prepare("UPDATE seasons SET active = 0, live = 0, phase = 'archived' WHERE id = ?").run(
-    old.id
-  );
-  const y = year || new Date().getFullYear();
-  const start = startDate || `${y}-01-01`;
-  const info = db
-    .prepare(
-      `INSERT INTO seasons (year, active, start_date, live, phase) VALUES (?, 1, ?, 0, 'setup')`
-    )
-    .run(y, start);
-  db.prepare("UPDATE players SET base_points = 0").run();
-  db.prepare("DELETE FROM player_bonuses").run();
-  return { oldSeason: old, newSeasonId: info.lastInsertRowid, startDate: start };
+  return db.transaction(() => {
+    const old = getActiveSeason();
+    const y =
+      year == null || year === ""
+        ? Number(calendarDate(new Date(), dbTz).slice(0, 4))
+        : year;
+    let start;
+    if (startDate == null || startDate === "") {
+      start = `${y}-01-01`;
+      if (!parseCalendarDate(String(start))) {
+        throw new Error(`Ungültiges startDate: ${start}`);
+      }
+    } else {
+      const parsed = parseCalendarDate(String(startDate));
+      if (!parsed) throw new Error(`Ungültiges startDate: ${startDate}`);
+      start = parsed;
+    }
+    db.prepare("UPDATE seasons SET active = 0, live = 0, phase = 'archived' WHERE id = ?").run(
+      old.id
+    );
+    const info = db
+      .prepare(
+        `INSERT INTO seasons (year, active, start_date, live, phase) VALUES (?, 1, ?, 0, 'setup')`
+      )
+      .run(y, start);
+    db.prepare("UPDATE players SET base_points = 0").run();
+    db.prepare("DELETE FROM death_awards").run();
+    db.prepare("DELETE FROM picks").run();
+    db.prepare("DELETE FROM celeb_aka").run();
+    db.prepare("DELETE FROM celeb_blacklist").run();
+    db.prepare("DELETE FROM celeb_review_queue").run();
+    db.prepare("DELETE FROM celeb_url_wait").run();
+    db.prepare("DELETE FROM pick_death_warnings").run();
+    db.prepare("DELETE FROM pick_draft_entries").run();
+    db.prepare("DELETE FROM pick_drafts").run();
+    db.prepare("DELETE FROM pending_pastes").run();
+    db.prepare("DELETE FROM celebs").run();
+    db.prepare("DELETE FROM player_bonuses").run();
+    return { oldSeason: old, newSeasonId: info.lastInsertRowid, startDate: start };
+  })();
 }
 
 function statsSnapshot() {
@@ -1918,6 +2138,58 @@ function statusSnapshot() {
   };
 }
 
+function listUnannouncedDeaths() {
+  return db
+    .prepare(
+      `SELECT * FROM celebs
+       WHERE is_alive = 0
+         AND death_announced_at IS NULL
+         AND wiki_confirmed = 1
+         AND exclude_from_auto = 0
+       ORDER BY id ASC`
+    )
+    .all();
+}
+
+function markDeathAnnounced(celebId) {
+  const info = db
+    .prepare(
+      `UPDATE celebs SET death_announced_at = ?
+       WHERE id = ? AND death_announced_at IS NULL`
+    )
+    .run(new Date().toISOString(), celebId);
+  return info.changes > 0;
+}
+
+function listPendingRetractions() {
+  return db
+    .prepare(`SELECT * FROM celebs WHERE retract_pending = 1 ORDER BY id ASC`)
+    .all();
+}
+
+function markRetractionAnnounced(celebId) {
+  const info = db
+    .prepare(`UPDATE celebs SET retract_pending = 0 WHERE id = ?`)
+    .run(celebId);
+  return info.changes > 0;
+}
+
+function savePendingPaste(userId, body) {
+  db.prepare(
+    `INSERT INTO pending_pastes (user_id, body, updated_at) VALUES (?, ?, datetime('now'))
+     ON CONFLICT(user_id) DO UPDATE SET body = excluded.body, updated_at = datetime('now')`
+  ).run(String(userId), body == null ? "" : String(body));
+}
+
+function takePendingPaste(userId) {
+  return db.transaction(() => {
+    const row = db.prepare(`SELECT body FROM pending_pastes WHERE user_id = ?`).get(String(userId));
+    if (!row) return null;
+    db.prepare(`DELETE FROM pending_pastes WHERE user_id = ?`).run(String(userId));
+    return row.body;
+  })();
+}
+
 module.exports = {
   openDb,
   getDb,
@@ -1986,12 +2258,19 @@ module.exports = {
   getWinnersForCeleb,
   applyDeath,
   retractDeath,
+  listUnannouncedDeaths,
+  markDeathAnnounced,
+  listPendingRetractions,
+  markRetractionAnnounced,
+  savePendingPaste,
+  takePendingPaste,
   confirmDeath,
   getUnconfirmedDeaths,
   markCelebDead,
   addPoints,
   setPoints,
   playerTotal,
+  listScoreboard,
   listScores,
   getPlayerPicks,
   findPlayerByQuery,
@@ -2007,6 +2286,7 @@ module.exports = {
   markWikiSeen,
   markWikiAnnounced,
   recentAnnouncedIdentities,
+  recentAnnouncedQids,
   seedAllWikiSeen,
   repairAnnouncedBursts,
   countJunkAnnouncements,

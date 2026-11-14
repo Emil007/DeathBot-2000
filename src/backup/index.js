@@ -4,8 +4,50 @@ const cron = require("node-cron");
 const AdmZip = require("adm-zip");
 const db = require("../db");
 
+// 04:00 gibt es am EU-Frühjahrs- und Herbstumstellungstag genau einmal.
+const BACKUP_CRON = "0 4 * * *";
+
+let snapshotSeq = 0;
+
 function timestamp() {
   return new Date().toISOString().replace(/[:.]/g, "-");
+}
+
+function unlinkQuiet(filePath) {
+  try {
+    fs.unlinkSync(filePath);
+  } catch (e) {
+    if (e && e.code !== "ENOENT") {
+      console.error("[backup] cleanup failed:", filePath, e.message);
+    }
+  }
+}
+
+/**
+ * Drop SQLite sidecars for a database path. Missing files are fine.
+ * Unlink first; if the file is busy, rename it aside so it is no longer
+ * named `-wal` / `-shm` (SQLite would otherwise replay it).
+ */
+function removeSidecars(dbPath) {
+  if (!dbPath || typeof dbPath !== "string") {
+    throw new Error("removeSidecars: database path required");
+  }
+  for (const side of ["-wal", "-shm"]) {
+    const sidecar = dbPath + side;
+    try {
+      fs.unlinkSync(sidecar);
+    } catch (unlinkErr) {
+      if (unlinkErr && unlinkErr.code === "ENOENT") continue;
+      const aside = `${sidecar}.aside-${process.pid}-${Date.now()}`;
+      try {
+        fs.renameSync(sidecar, aside);
+      } catch (renameErr) {
+        if (renameErr && renameErr.code === "ENOENT") continue;
+        console.error("[backup] sidecar remove failed:", sidecar, renameErr.message);
+        throw new Error(`Restore sidecar remove failed: ${renameErr.message}`);
+      }
+    }
+  }
 }
 
 function createPackage(config, { reason = "backup", retain = false } = {}) {
@@ -19,30 +61,55 @@ function createPackage(config, { reason = "backup", retain = false } = {}) {
   const stats = db.statsSnapshot();
   const name = `season-${season.year}-${timestamp()}-${reason}.zip`;
   const outPath = path.join(dir, name);
-
-  // Ensure WAL checkpointed into main file
-  db.getDb().pragma("wal_checkpoint(TRUNCATE)");
-
-  const zip = new AdmZip();
-  zip.addLocalFile(config.dbPath, "", "deathbot.sqlite");
-  zip.addFile(
-    "manifest.json",
-    Buffer.from(
-      JSON.stringify(
-        {
-          created_at: new Date().toISOString(),
-          reason,
-          season,
-          stats,
-          version: 1,
-        },
-        null,
-        2
-      ),
-      "utf8"
-    )
+  // `<name>.tmp` — does not end in `.zip`, so listRestoreCandidates ignores it.
+  const tmpZip = `${outPath}.tmp`;
+  const snapPath = path.join(
+    dir,
+    `.snapshot-${process.pid}-${Date.now()}-${snapshotSeq++}.sqlite`
   );
-  zip.writeZip(outPath);
+
+  let published = false;
+  try {
+    // Checkpoint, then a consistent copy. The live file is not what goes
+    // into the zip: an open WAL must not be packed next to a new main file.
+    // VACUUM INTO stays synchronous — db.backup() is async and createPackage
+    // is called without await.
+    db.getDb().pragma("wal_checkpoint(TRUNCATE)");
+    db.getDb().prepare("VACUUM INTO ?").run(snapPath);
+
+    const zip = new AdmZip();
+    zip.addLocalFile(snapPath, "", "deathbot.sqlite");
+    zip.addFile(
+      "manifest.json",
+      Buffer.from(
+        JSON.stringify(
+          {
+            created_at: new Date().toISOString(),
+            reason,
+            season,
+            stats,
+            version: 1,
+          },
+          null,
+          2
+        ),
+        "utf8"
+      )
+    );
+    if (fs.existsSync(tmpZip)) fs.unlinkSync(tmpZip);
+    zip.writeZip(tmpZip);
+    if (!fs.existsSync(tmpZip) || fs.statSync(tmpZip).size === 0) {
+      throw new Error("Backup zip was not written");
+    }
+    fs.renameSync(tmpZip, outPath);
+    published = true;
+  } finally {
+    unlinkQuiet(snapPath);
+    unlinkQuiet(snapPath + "-wal");
+    unlinkQuiet(snapPath + "-shm");
+    if (!published) unlinkQuiet(tmpZip);
+  }
+
   return { path: outPath, name, stats, season };
 }
 
@@ -126,15 +193,26 @@ function restorePackage(config, fileName) {
     }
   }
 
+  // Close first so SQLite releases -wal/-shm. Sidecars must be gone BEFORE
+  // the new file occupies config.dbPath — otherwise the old WAL is replayed
+  // onto the restored database.
+  let swapped = false;
   db.closeDb();
   try {
+    // Via module.exports so tests can record the call order.
+    module.exports.removeSidecars(config.dbPath);
+    console.log("[backup] restore: removed -wal/-shm before replacing the database");
     fs.renameSync(written, config.dbPath);
-    // remove sidecars
-    for (const side of ["-wal", "-shm"]) {
-      const p = config.dbPath + side;
-      if (fs.existsSync(p)) fs.unlinkSync(p);
-    }
+    swapped = true;
+    console.log("[backup] restore: database file replaced");
   } finally {
+    if (!swapped) {
+      try {
+        if (fs.existsSync(written)) fs.unlinkSync(written);
+      } catch {
+        /* ignore */
+      }
+    }
     // reopen is best-effort (itself retries once internally); if it still fails,
     // the bot must not silently run on a stale/closed DB.
     try {
@@ -144,20 +222,14 @@ function restorePackage(config, fileName) {
       throw new Error(`Restore reopened DB failed: ${e.message}`);
     }
   }
-  // cleanup temp if it somehow still exists
-  try {
-    if (fs.existsSync(written)) fs.unlinkSync(written);
-  } catch {
-    /* ignore */
-  }
 
   return { manifest, safety: safety.name, restored: fileName };
 }
 
 function pruneBackups(config, { keep = 14 } = {}) {
   fs.mkdirSync(config.backupsDir, { recursive: true });
-  // Nur die Wurzel des backupsDir rotieren; der Unterordner season-start/ (die
-  // ewig aufbewahrten Saison-Start-Backups mit den Tipps) wird NIEMALS gelöscht.
+  // Nur die Wurzel rotieren. Der Unterordner season-start/ (die ewig
+  // aufbewahrten Saison-Start-Backups mit den Tipps) wird NIEMALS gelöscht.
   const files = fs
     .readdirSync(config.backupsDir, { withFileTypes: true })
     .filter((e) => e.isFile() && e.name.endsWith(".zip"))
@@ -186,40 +258,46 @@ function pruneBackups(config, { keep = 14 } = {}) {
 }
 
 function startAutoBackup(config, client) {
-  // Nightly backup (local TZ from process / compose TZ)
-  cron.schedule("0 2 * * *", () => {
-    try {
-      const pkg = createPackage(config, { reason: "nightly" });
-      const prune = pruneBackups(config, { keep: 14 });
-      console.log(
-        "[backup] nightly",
-        pkg.name,
-        `kept=${prune.kept.length} removed=${prune.removed.length}`
-      );
-      // Nacht-Backup ist KEIN Wiki-Scan -> darf in den Logkanal.
-      if (client) {
-        const { logEvent } = require("../discord/log");
-        logEvent(client, config, {
-          kind: "backup",
-          summary: `Nacht-Backup: ${pkg.name} (kept=${prune.kept.length} removed=${prune.removed.length})`,
-        }).catch(() => {});
+  // 04:00 gibt es am EU-Frühjahrs- und Herbstumstellungstag genau einmal.
+  cron.schedule(
+    BACKUP_CRON,
+    () => {
+      try {
+        const pkg = createPackage(config, { reason: "nightly" });
+        const prune = pruneBackups(config, { keep: 14 });
+        console.log(
+          "[backup] nightly",
+          pkg.name,
+          `kept=${prune.kept.length} removed=${prune.removed.length}`
+        );
+        // Nacht-Backup ist KEIN Wiki-Scan -> darf in den Logkanal.
+        if (client) {
+          const { logEvent } = require("../discord/log");
+          logEvent(client, config, {
+            kind: "backup",
+            summary: `Nacht-Backup: ${pkg.name} (kept=${prune.kept.length} removed=${prune.removed.length})`,
+          }).catch(() => {});
+        }
+      } catch (e) {
+        console.error("[backup] nightly failed", e.message);
+        if (client) {
+          const { logError } = require("../discord/log");
+          logError(client, config, e, { where: "nightly backup" }).catch(() => {});
+        }
       }
-    } catch (e) {
-      console.error("[backup] nightly failed", e.message);
-      if (client) {
-        const { logError } = require("../discord/log");
-        logError(client, config, e, { where: "nightly backup" }).catch(() => {});
-      }
-    }
-  });
-  console.log("[backup] nightly scheduled at 02:00 (keep last 14)");
+    },
+    { timezone: config.tz }
+  );
+  console.log(`[backup] nightly scheduled at 04:00 (tz=${config.tz}, keep last 14)`);
 }
 
 module.exports = {
+  BACKUP_CRON,
   createPackage,
   listRestoreCandidates,
   findPackage,
   restorePackage,
+  removeSidecars,
   pruneBackups,
   startAutoBackup,
 };

@@ -129,3 +129,143 @@ test("finalized draft is not reopened after season switch", () => {
   const either = db.finalizeDraft(p.id, announced.id);
   assert.ok(either.blocked || either.added !== undefined);
 });
+
+function replyText(payload) {
+  if (payload == null) return "";
+  if (typeof payload === "string") return payload;
+  return payload.content || "";
+}
+
+test("second announce-season without repost leaves channel and start byte-identical", async () => {
+  const announced = db.getAnnouncedSeason();
+  assert.ok(announced);
+  const channelBefore = announced.announce_channel_id;
+  const startBefore = announced.start_date;
+  const noteBefore = announced.announce_note;
+  const origOpen = db.openAnnouncedSeason;
+  let opens = 0;
+  db.openAnnouncedSeason = (...args) => {
+    opens += 1;
+    return origOpen(...args);
+  };
+  const cmd = require("../src/discord/commands/announce-season");
+  const replies = [];
+  try {
+    await cmd.run(
+      {
+        config,
+        client: {
+          channels: {
+            fetch: async () => {
+              throw new Error("second announce must not fetch a channel");
+            },
+          },
+        },
+      },
+      ["channel:other-channel", `start:${announced.year}-06-15`, `year:${announced.year}`, "note:hacked"],
+      {
+        mentions: { channels: { first: () => null } },
+        author: { id: "1" },
+        async reply(t) {
+          replies.push(replyText(t));
+        },
+      }
+    );
+  } finally {
+    db.openAnnouncedSeason = origOpen;
+  }
+  const after = db.getAnnouncedSeason();
+  assert.strictEqual(opens, 0);
+  assert.strictEqual(after.announce_channel_id, channelBefore);
+  assert.strictEqual(after.start_date, startBefore);
+  assert.strictEqual(after.announce_note, noteBefore);
+  const text = replies.join("\n");
+  assert.ok(text.includes(`${announced.year} ist schon offen (Kanal ${channelBefore}, Start ${startBefore}).`));
+  assert.ok(text.includes("repost:true"));
+});
+
+test("repost:true names the new channel and the new start date", async () => {
+  const cmd = require("../src/discord/commands/announce-season");
+  const replies = [];
+  await cmd.run(
+    {
+      config,
+      client: {
+        channels: {
+          fetch: async () => ({
+            send: async () => ({}),
+          }),
+        },
+      },
+    },
+    ["repost", "channel:ch-new", "start:2027-07-01"],
+    {
+      mentions: { channels: { first: () => null } },
+      author: { id: "1" },
+      async reply(t) {
+        replies.push(replyText(t));
+      },
+    }
+  );
+  const row = db.getAnnouncedSeason();
+  assert.strictEqual(row.announce_channel_id, "ch-new");
+  assert.strictEqual(row.start_date, "2027-07-01");
+  assert.ok(replies.join("\n").includes("Geändert: Kanal <#ch-new>, Start 2027-07-01."));
+});
+
+test("go sets live before a follow-up that throws, and live stays 1", async () => {
+  db.setSeasonLive(false);
+  const order = [];
+  const origLive = db.setSeasonLive;
+  db.setSeasonLive = (v) => {
+    order.push("setSeasonLive");
+    return origLive(v);
+  };
+  const wikiPollPath = require.resolve("../src/jobs/wiki-poll");
+  const prevPoll = require.cache[wikiPollPath];
+  require.cache[wikiPollPath] = {
+    id: wikiPollPath,
+    filename: wikiPollPath,
+    loaded: true,
+    exports: {
+      runWikiPoll: async (_client, _config, opts) => {
+        order.push(`poll:${opts && opts.mode}`);
+        return { hits: [] };
+      },
+    },
+  };
+  const goPath = require.resolve("../src/discord/commands/go");
+  delete require.cache[goPath];
+  const go = require(goPath);
+  try {
+    await go.run(
+      { config, client: { channels: { fetch: async () => null } } },
+      ["force"],
+      {
+        author: {
+          id: "1",
+          createDM: async () => ({ send: async () => {} }),
+        },
+        channel: { id: "c", send: async () => {} },
+        async reply(payload) {
+          const text = replyText(payload);
+          if (text.includes("All-Deaths")) {
+            order.push("follow-up");
+            throw new Error("follow-up boom");
+          }
+          order.push("reply");
+        },
+      }
+    );
+    const liveAt = order.indexOf("setSeasonLive");
+    const followAt = order.indexOf("follow-up");
+    assert.ok(liveAt >= 0, order.join(","));
+    assert.ok(followAt > liveAt, order.join(","));
+    assert.ok(order.indexOf("poll:reconcile") < liveAt, order.join(","));
+    assert.strictEqual(db.getActiveSeason().live, 1);
+  } finally {
+    db.setSeasonLive = origLive;
+    if (prevPoll) require.cache[wikiPollPath] = prevPoll;
+    else delete require.cache[wikiPollPath];
+  }
+});

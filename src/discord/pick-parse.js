@@ -77,4 +77,33 @@ function parsePickList(text, opts = {}) {
   return { names, duplicates, recognized, truncated: overhang > 0 || undefined };
 }
 
-module.exports = { parsePickList, nameKey };
+/**
+ * Kein klarer Name: Gruß, Höflichkeit, oder Smalltalk-Anfang.
+ * „öffnen“ ist kein Befehl mehr und auch kein Name (M12).
+ */
+const SMALLTALK = new Set([
+  "hallo",
+  "hi",
+  "hey",
+  "moin",
+  "servus",
+  "hilfe",
+  "help",
+  "danke",
+  "ok",
+  "okay",
+  "ja",
+  "nein",
+  "öffnen",
+  "oeffnen",
+]);
+
+function isSmallTalkLine(line) {
+  const t = String(line || "").trim().toLowerCase();
+  if (!t) return false;
+  if (SMALLTALK.has(t)) return true;
+  if (t.startsWith("wie geht") || t.startsWith("was geht") || t.startsWith("guten ")) return true;
+  return false;
+}
+
+module.exports = { parsePickList, nameKey, isSmallTalkLine };

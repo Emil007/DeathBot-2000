@@ -1,10 +1,48 @@
 const axios = require("axios");
+const { withWikiSlot } = require("./gate");
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+// One client per User-Agent. resolveEnglishArticle is called once per DE row;
+// building a new client each time is what this cache avoids.
+const clients = new Map();
 
 function createClient(userAgent) {
-  return axios.create({
-    timeout: 20000,
-    headers: { "User-Agent": userAgent },
-  });
+  if (!clients.has(userAgent)) {
+    clients.set(
+      userAgent,
+      axios.create({
+        timeout: 20000,
+        headers: { "User-Agent": userAgent },
+      })
+    );
+  }
+  return clients.get(userAgent);
+}
+
+/**
+ * 429 backoff matches death-brief.js getRetry: three tries, then the error.
+ * That helper is not exported; this package does not edit death-brief.js.
+ * Each attempt holds a wiki slot. The pause between attempts does not.
+ */
+async function getRetry(client, url, params, { tries = 3 } = {}) {
+  for (let i = 0; i < tries; i++) {
+    try {
+      const r = await withWikiSlot(() => client.get(url, { params }));
+      if (r.status === 429) {
+        throw Object.assign(new Error("HTTP 429 (rate-limited)"), { response: { status: 429 } });
+      }
+      return r;
+    } catch (e) {
+      const code = e?.response?.status;
+      if (code === 429 && i < tries - 1) {
+        await sleep(600 * (i + 1) + Math.random() * 400);
+        continue;
+      }
+      throw e;
+    }
+  }
+  throw new Error("unreachable");
 }
 
 function normalizeWikiUrl(url) {
@@ -51,15 +89,13 @@ function parseWikidataTime(time) {
 
 async function searchWikipedia(client, lang, query) {
   const api = `https://${lang}.wikipedia.org/w/api.php`;
-  const { data } = await client.get(api, {
-    params: {
-      action: "query",
-      list: "search",
-      srsearch: query,
-      srlimit: 8,
-      format: "json",
-      origin: "*",
-    },
+  const { data } = await getRetry(client, api, {
+    action: "query",
+    list: "search",
+    srsearch: query,
+    srlimit: 8,
+    format: "json",
+    origin: "*",
   });
   const hits = data?.query?.search || [];
   return hits.map((h) => ({
@@ -113,25 +149,19 @@ function entityIsHuman(entity) {
 }
 
 async function getPageCategories(client, lang, title) {
-  try {
-    const api = `https://${lang}.wikipedia.org/w/api.php`;
-    const { data } = await client.get(api, {
-      params: {
-        action: "query",
-        titles: title,
-        prop: "categories",
-        cllimit: 50,
-        clshow: "!hidden",
-        format: "json",
-        origin: "*",
-        redirects: 1,
-      },
-    });
-    const page = Object.values(data?.query?.pages || {})[0];
-    return (page?.categories || []).map((c) => c.title || "");
-  } catch {
-    return [];
-  }
+  const api = `https://${lang}.wikipedia.org/w/api.php`;
+  const { data } = await getRetry(client, api, {
+    action: "query",
+    titles: title,
+    prop: "categories",
+    cllimit: 50,
+    clshow: "!hidden",
+    format: "json",
+    origin: "*",
+    redirects: 1,
+  });
+  const page = Object.values(data?.query?.pages || {})[0];
+  return (page?.categories || []).map((c) => c.title || "");
 }
 
 function categoriesSuggestPerson(cats) {
@@ -151,35 +181,58 @@ function categoriesSuggestNonPerson(cats) {
 }
 
 /**
+ * Person decision plus whether the hit is unambiguous.
+ * Unambiguous means entityIsHuman, or person-categories without non-person
+ * categories. A birth date alone is still a person, but the search keeps going.
+ * @returns {Promise<{person: boolean, unambiguous: boolean}>}
+ */
+async function classifyPerson(client, lang, title, entity) {
+  if (titleLooksNonPerson(title)) return { person: false, unambiguous: false };
+
+  const human = entityIsHuman(entity);
+  if (human === true) return { person: true, unambiguous: true };
+  if (human === false) return { person: false, unambiguous: false };
+
+  // Birth date accepts the page (same as before) but is not by itself
+  // "eindeutig". Categories decide whether the search may stop.
+  if (entity?.claims?.P569?.[0]) {
+    let unambiguous = false;
+    try {
+      const cats = await getPageCategories(client, lang, title);
+      unambiguous = categoriesSuggestPerson(cats) && !categoriesSuggestNonPerson(cats);
+    } catch (e) {
+      console.warn("[page-lookup] categories", e.message);
+      unambiguous = false;
+    }
+    return { person: true, unambiguous };
+  }
+
+  const cats = await getPageCategories(client, lang, title);
+  if (categoriesSuggestNonPerson(cats)) return { person: false, unambiguous: false };
+  if (categoriesSuggestPerson(cats) && !categoriesSuggestNonPerson(cats)) {
+    return { person: true, unambiguous: true };
+  }
+  // Unknown: reject to avoid filmography/list false positives
+  return { person: false, unambiguous: false };
+}
+
+/**
  * Decide if a page is a person biography.
  * @returns {Promise<boolean>}
  */
 async function isPersonPage(client, lang, title, entity) {
-  if (titleLooksNonPerson(title)) return false;
-
-  const human = entityIsHuman(entity);
-  if (human === true) return true;
-  if (human === false) return false;
-
-  // No clear P31 — use categories + birth claim
-  if (entity?.claims?.P569?.[0]) return true;
-  const cats = await getPageCategories(client, lang, title);
-  if (categoriesSuggestNonPerson(cats)) return false;
-  if (categoriesSuggestPerson(cats)) return true;
-  // Unknown: reject to avoid filmography/list false positives
-  return false;
+  const classified = await classifyPerson(client, lang, title, entity);
+  return classified.person;
 }
 
 async function getWikidataEntity(client, qid) {
   if (!qid) return null;
-  const { data } = await client.get("https://www.wikidata.org/w/api.php", {
-    params: {
-      action: "wbgetentities",
-      ids: qid,
-      props: "claims|sitelinks",
-      format: "json",
-      origin: "*",
-    },
+  const { data } = await getRetry(client, "https://www.wikidata.org/w/api.php", {
+    action: "wbgetentities",
+    ids: qid,
+    props: "claims|sitelinks",
+    format: "json",
+    origin: "*",
   });
   return data?.entities?.[qid] || null;
 }
@@ -216,17 +269,15 @@ async function getPageMeta(client, lang, titleOrUrl) {
   if (titleLooksNonPerson(title)) return null;
 
   const api = `https://${lang}.wikipedia.org/w/api.php`;
-  const { data } = await client.get(api, {
-    params: {
-      action: "query",
-      titles: title,
-      prop: "pageprops|pageimages|info",
-      inprop: "url",
-      pithumbsize: 400,
-      format: "json",
-      origin: "*",
-      redirects: 1,
-    },
+  const { data } = await getRetry(client, api, {
+    action: "query",
+    titles: title,
+    prop: "pageprops|pageimages|info",
+    inprop: "url",
+    pithumbsize: 400,
+    format: "json",
+    origin: "*",
+    redirects: 1,
   });
   const page = Object.values(data?.query?.pages || {})[0];
   if (!page || page.missing != null) return null;
@@ -234,8 +285,8 @@ async function getPageMeta(client, lang, titleOrUrl) {
 
   const qid = page.pageprops?.wikibase_item || null;
   const entity = qid ? await getWikidataEntity(client, qid) : null;
-  const person = await isPersonPage(client, lang, page.title, entity);
-  if (!person) return null;
+  const classified = await classifyPerson(client, lang, page.title, entity);
+  if (!classified.person) return null;
 
   const birth = parseWikidataTime(
     entity?.claims?.P569?.[0]?.mainsnak?.datavalue?.value?.time
@@ -256,6 +307,7 @@ async function getPageMeta(client, lang, titleOrUrl) {
     enLink: links.en,
     deLink: links.de,
     isPerson: true,
+    unambiguous: classified.unambiguous,
   };
 }
 
@@ -306,18 +358,23 @@ function proposalFromMeta(meta, seasonStartDate, sheetAge, candidates = []) {
 
 /**
  * Propose EN (preferred) or DE wiki + age; include top **person** candidates only.
+ * Stops at the first unambiguous person instead of filling three slots.
+ * An HTTP failure with no person is `{ error: "lookup-failed" }`. A finished
+ * search that simply found nobody keeps `{ wikiUrl: null }` and no error.
  */
 async function proposeWikiForName(userAgent, name, seasonStartDate, sheetAge) {
   const client = createClient(userAgent);
   const candidates = [];
   let primaryMeta = null;
+  let httpFailed = false;
+  let stopped = false;
 
   async function collect(lang, hits) {
     for (const hit of hits) {
-      if (candidates.length >= 3) break;
+      if (stopped || candidates.length >= 3) break;
       if (titleLooksNonPerson(hit.title)) continue;
       try {
-        await new Promise((r) => setTimeout(r, 350));
+        await sleep(350);
         const meta = await getPageMeta(client, lang, hit.title);
         if (!meta) continue;
         const wikiAge = meta.birthDate ? ageAtDate(meta.birthDate, seasonStartDate) : null;
@@ -332,7 +389,12 @@ async function proposeWikiForName(userAgent, name, seasonStartDate, sheetAge) {
           snippet: hit.snippet || "",
         });
         if (!primaryMeta) primaryMeta = meta;
+        if (meta.unambiguous) {
+          stopped = true;
+          break;
+        }
       } catch (e) {
+        httpFailed = true;
         console.warn(`[page-lookup] ${lang} candidate`, e.message);
       }
     }
@@ -342,26 +404,34 @@ async function proposeWikiForName(userAgent, name, seasonStartDate, sheetAge) {
     const enHits = await searchWikipedia(client, "en", name);
     await collect("en", enHits);
   } catch (e) {
+    httpFailed = true;
     console.warn("[page-lookup] EN search", e.message);
   }
 
-  if (candidates.length < 3) {
+  if (!stopped && candidates.length < 3) {
     try {
-      await new Promise((r) => setTimeout(r, 350));
+      await sleep(350);
       const deHits = await searchWikipedia(client, "de", name);
       await collect("de", deHits);
     } catch (e) {
+      httpFailed = true;
       console.warn("[page-lookup] DE search", e.message);
     }
   }
 
-  return proposalFromMeta(primaryMeta, seasonStartDate, sheetAge, candidates);
+  const proposal = proposalFromMeta(primaryMeta, seasonStartDate, sheetAge, candidates);
+  // A hit wins over a failed sibling request. No hit plus any HTTP error is
+  // not a miss: callers leave the row pending instead of marking it unlinked.
+  if (!primaryMeta && httpFailed) {
+    return { ...proposal, error: "lookup-failed" };
+  }
+  return proposal;
 }
 
 async function lookupUrl(userAgent, url, seasonStartDate, sheetAge) {
-  const client = createClient(userAgent);
   const norm = normalizeWikiUrl(url);
-  if (!norm) throw new Error("Need an en.wikipedia.org or de.wikipedia.org /wiki/ URL");
+  if (!norm) throw new Error("Keine Wikipedia-URL.");
+  const client = createClient(userAgent);
   const meta = await getPageMeta(client, norm.lang, norm.url);
   if (!meta) {
     throw new Error(
@@ -389,20 +459,18 @@ async function lookupUrl(userAgent, url, seasonStartDate, sheetAge) {
  * ein vorübergehender Hänger ist NICHT "kein EN" (dann vertagt der Poller).
  */
 async function resolveEnglishArticle(userAgent, germanUrl) {
-  const client = createClient(userAgent);
   const norm = normalizeWikiUrl(germanUrl);
   if (!norm || norm.lang !== "de") throw new Error("resolveEnglish braucht de.wikipedia.org /wiki/ URL");
+  const client = createClient(userAgent);
   const api = "https://de.wikipedia.org/w/api.php";
-  const { data } = await client.get(api, {
-    params: {
-      action: "query",
-      prop: "langlinks",
-      lllang: "en",
-      redirects: 1,
-      titles: norm.title,
-      format: "json",
-      origin: "*",
-    },
+  const { data } = await getRetry(client, api, {
+    action: "query",
+    prop: "langlinks",
+    lllang: "en",
+    redirects: 1,
+    titles: norm.title,
+    format: "json",
+    origin: "*",
   });
   const page = Object.values(data?.query?.pages || {})[0];
   const enTitle = page?.langlinks?.[0]?.["*"];

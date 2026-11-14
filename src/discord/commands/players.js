@@ -1,30 +1,35 @@
-const db = require("../../db");
+const { sendChunks, chunkLines, sanitizeDisplayName } = require("./liste");
+const { readScoreboard } = require("./scores");
+
+const EMPTY = "Noch keine Spieler im Pool.";
 
 const cmd = {
   name: "players",
   admin: false,
   group: "everyone",
-  description: "Listet alle Spieler mit Punktestand",
+  description: "Alle Spieler und ihre Punkte",
   usage: "/players\n{prefix}players",
   examples: ["/players", "{prefix}players"],
-  details: "Für `/liste user:@…` oder `/liste name:…`.",
+  details: "Für `/liste` mit Mention oder Snowflake.",
   parseSlash() {
     return [];
   },
   async run(ctx, args, msg) {
-    const rows = db.getDb().prepare("SELECT * FROM players ORDER BY display_name COLLATE NOCASE").all();
+    const rows = readScoreboard()
+      .slice()
+      .sort((a, b) =>
+        String(a.display_name).localeCompare(String(b.display_name), "de", { sensitivity: "base" })
+      );
     if (!rows.length) {
-      await msg.reply("Keine Spieler.");
+      await sendChunks(msg, [EMPTY]);
       return;
     }
     const lines = rows.map(
-      (p) => `• **${p.display_name}** <@${p.discord_user_id}> — ${db.playerTotal(p.id)} Punkte`
+      (p) => `• **${sanitizeDisplayName(p.display_name)}** <@${p.discord_user_id}> — ${p.total} Punkte`
     );
-    await msg.reply({
-      content: lines.join("\n").slice(0, 1900),
-      allowedMentions: { parse: [] },
-    });
+    await sendChunks(msg, chunkLines("", lines));
   },
 };
 
 module.exports = cmd;
+module.exports.EMPTY = EMPTY;

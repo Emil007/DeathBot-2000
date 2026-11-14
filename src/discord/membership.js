@@ -3,53 +3,108 @@ const db = require("../db");
 /**
  * Darf der User an der announced-Saison teilnehmen?
  *
- * Prüft gegen die ANNOUNCED-Saison (2027): Kanal vorhanden, `live = 0`,
- * User hat `ViewChannel` auf genau diesem Kanal. Die running-Saison (2026)
- * geht NICHT in diese Funktion ein — 2026 live lässt den Assistenten offen,
- * sobald 2027 announced ist und einen Kanal hat.
+ * - keine announced-Saison und aktive Saison live → closed
+ * - keine announced-Saison und aktive Saison nicht live → not-open
+ * - announced-Saison, Phase nicht announced → not-open
+ * - Fetch 10003 → channel-missing
+ * - 429, 5xx, Timeout, guild.available === false → unavailable
+ * - kein Member / keine Sicht → not-member
+ * - Admin (config.adminId) darf auch ohne ViewChannel, sobald die
+ *   announced-Saison live=0 ist und einen Kanal hat.
  *
- * Admin (config.adminId) darf auch ohne ViewChannel (Flow vor erstem echten
- * Teilnehmer prüfbar) — announced-Saison muss trotzdem live=0 und Kanal haben.
- *
- * @returns {{ ok: boolean, reason?: "closed"|"channel"|"not-member", season?: object }}
+ * @returns {{ ok: boolean, reason?: "closed"|"not-open"|"channel-missing"|"unavailable"|"not-member", season?: object }}
  */
 async function canParticipate(client, config, userId) {
-  const season = db.getAnnouncedSeason();
-  if (!season || !season.announce_channel_id || season.phase !== "announced" || season.live !== 0) {
-    return { ok: false, reason: "closed" };
+  const announced = db.getAnnouncedSeason();
+  if (!announced) {
+    const active = safeActiveSeason();
+    if (active && Number(active.live) === 1) {
+      return { ok: false, reason: "closed", season: active };
+    }
+    return { ok: false, reason: "not-open", season: active || undefined };
+  }
+  if (announced.phase !== "announced") {
+    return { ok: false, reason: "not-open", season: announced };
+  }
+  if (Number(announced.live) !== 0) {
+    return { ok: false, reason: "closed", season: announced };
+  }
+  if (!announced.announce_channel_id) {
+    return { ok: false, reason: "closed", season: announced };
   }
 
-  const channel = await client.channels.fetch(season.announce_channel_id).catch(() => null);
-  if (!channel?.guild) {
-    return { ok: false, reason: "channel" };
-  }
-
+  let channel;
   try {
-    const member = await channel.guild.members.fetch(userId);
-    if (member) {
-      const isAdmin = String(userId) === String(config.adminId);
-      const perms = channel.permissionsFor(member);
-      // Admin darf auch ohne ViewChannel durch (Test-/Prüfflow vor echtem
-      // Teilnehmer). Sonst braucht es die Kanalsichtbarkeit (F12).
-      if (isAdmin || perms?.has("ViewChannel")) {
-        return { ok: true, season };
-      }
-      return { ok: false, reason: "not-member" };
-    }
+    channel = await client.channels.fetch(announced.announce_channel_id);
   } catch (e) {
-    // 10007 = Unknown Member: echtes "kein Mitglied". Andere Fetch-Fehler
-    // (429/Timeout/Recht) sind KEINE Ablehnung — sonst lehnt eine kurze
-    // Discord-Störung jede Anmeldung ab (F27).
-    if (e?.code === 10007 || e?.message?.includes("Unknown Member")) {
-      if (String(userId) === String(config.adminId)) return { ok: true, season };
-      return { ok: false, reason: "not-member" };
-    }
-    return { ok: false, reason: "unavailable" };
+    const reason = isUnknownChannel(e) ? "channel-missing" : "unavailable";
+    return { ok: false, reason, season: announced };
+  }
+  if (!channel?.guild) {
+    return { ok: false, reason: "channel-missing", season: announced };
+  }
+  if (channel.guild.available === false) {
+    return { ok: false, reason: "unavailable", season: announced };
   }
 
-  // Admin-Fallback für sonstige Edge-Fälle (fetch lieferte keinen Member)
-  if (String(userId) === String(config.adminId)) return { ok: true, season };
-  return { ok: false, reason: "not-member" };
+  const isAdmin = String(userId) === String(config.adminId);
+  let member = null;
+  try {
+    member = await channel.guild.members.fetch(userId);
+  } catch (e) {
+    if (isUnknownMember(e)) {
+      if (isAdmin) return { ok: true, season: announced };
+      return { ok: false, reason: "not-member", season: announced };
+    }
+    return { ok: false, reason: "unavailable", season: announced };
+  }
+
+  if (!member) {
+    if (isAdmin) return { ok: true, season: announced };
+    return { ok: false, reason: "not-member", season: announced };
+  }
+  const perms = channel.permissionsFor(member);
+  if (isAdmin || perms?.has?.("ViewChannel")) {
+    return { ok: true, season: announced };
+  }
+  return { ok: false, reason: "not-member", season: announced };
 }
 
-module.exports = { canParticipate };
+function safeActiveSeason() {
+  try {
+    return db.getActiveSeason();
+  } catch {
+    return null;
+  }
+}
+
+function isUnknownChannel(e) {
+  const code = e?.code ?? e?.rawError?.code;
+  return code === 10003 || /unknown channel/i.test(String(e?.message || ""));
+}
+
+function isUnknownMember(e) {
+  const code = e?.code ?? e?.rawError?.code;
+  return code === 10007 || /unknown member/i.test(String(e?.message || ""));
+}
+
+/** Satz zu einem canParticipate-Grund. Dieselben Sätze in DM und /picks. */
+function participationSentence(part) {
+  const jahr = part?.season?.year ?? part?.year ?? "?";
+  switch (part?.reason) {
+    case "closed":
+      return `Die Tippzeit für ${jahr} ist vorbei, deine Liste ist zu.`;
+    case "not-open":
+      return "Die Anmeldung ist noch nicht offen. Sobald sie aufgeht, schreibst du die Namen hierher.";
+    case "channel-missing":
+      return "Den Anmeldekanal gibt es nicht mehr. Sag einem Admin Bescheid, ich habe nichts gespeichert.";
+    case "unavailable":
+      return "Discord ist gerade nicht erreichbar. Ich habe die Zeile behalten und versuche sie beim nächsten Mal.";
+    case "not-member":
+      return "Keine Sicht auf den Anmeldekanal, keine Tipps. Eine DM ersetzt die Sicht nicht.";
+    default:
+      return "Die Anmeldung ist noch nicht offen. Sobald sie aufgeht, schreibst du die Namen hierher.";
+  }
+}
+
+module.exports = { canParticipate, participationSentence };

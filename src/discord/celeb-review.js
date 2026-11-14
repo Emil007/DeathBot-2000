@@ -1,3 +1,5 @@
+const fs = require("fs");
+const path = require("path");
 const {
   EmbedBuilder,
   ActionRowBuilder,
@@ -7,9 +9,115 @@ const {
   TextInputBuilder,
   TextInputStyle,
   StringSelectMenuBuilder,
+  MessageFlags,
 } = require("discord.js");
 const db = require("../db");
-const { proposeWikiForName, lookupUrl, normalizeWikiUrl } = require("../wiki/page-lookup");
+const pageLookup = require("../wiki/page-lookup");
+
+// ANNAHME: M1 (safe-text.js) und M10 (gate.js) sind in diesem Workspace noch nicht
+// gemerged. Fehlt die Datei, gilt ein vertragsgleicher Fallback. Ist sie da, gewinnt
+// ihr Export bei jedem Aufruf (kein eingefrorener Binding).
+const Ephemeral = MessageFlags.Ephemeral;
+const LOOKUP_FAIL =
+  "Lookup fehlgeschlagen. Die URL ist keine Wikipedia-Seite, oder Wikipedia antwortet nicht.";
+const REVIEW_INTRO =
+  "Erst **Bestätigen**, dann zählt der automatische Abgleich. **Kein Wiki** heißt: nie automatisch als tot werten.";
+const AFTER_CONFIRM = "Danach **Bestätigen**.";
+const NOW_CONFIRM = "Jetzt **Bestätigen**.";
+const BUTTON_LABEL_MAX = 80;
+
+const REVIEW_BUTTONS = [
+  { action: "confirm", label: "Bestätigen", style: ButtonStyle.Success },
+  { action: "wrong", label: "Falscher Link", style: ButtonStyle.Primary },
+  { action: "age", label: "Alter setzen", style: ButtonStyle.Secondary },
+  { action: "nowiki", label: "Kein Wiki", style: ButtonStyle.Danger },
+  { action: "skip", label: "Überspringen", style: ButtonStyle.Secondary },
+];
+
+function contractModule(absPath) {
+  if (!fs.existsSync(absPath)) return null;
+  return require(absPath);
+}
+
+function fallbackSanitizeDisplayName(raw) {
+  if (raw == null) return "„Unbenannt“";
+  let s = String(raw);
+  s = s.replace(/[\u0000-\u001F\u007F-\u009F\u2028\u2029]/g, "");
+  s = s.replace(/[*_~|`<>@[\]()]/g, "");
+  s = s.replace(/[ \t\f\v\u00a0]+/g, " ").trim();
+  if (s.length > 80) s = s.slice(0, 80).trim();
+  return s || "„Unbenannt“";
+}
+
+function fallbackWithWikiSlot(fn) {
+  if (!fallbackWithWikiSlot.state) {
+    fallbackWithWikiSlot.state = { active: 0, wait: [] };
+  }
+  const state = fallbackWithWikiSlot.state;
+  return new Promise((resolve, reject) => {
+    const start = () => {
+      state.active += 1;
+      Promise.resolve()
+        .then(() => fn())
+        .then(resolve, reject)
+        .finally(() => {
+          state.active -= 1;
+          const next = state.wait.shift();
+          if (next) next();
+        });
+    };
+    if (state.active < 2) start();
+    else state.wait.push(start);
+  });
+}
+
+function sanitizeDisplayName(raw) {
+  const mod = contractModule(path.join(__dirname, "safe-text.js"));
+  if (!mod) return fallbackSanitizeDisplayName(raw);
+  if (typeof mod.sanitizeDisplayName !== "function") {
+    throw new Error("safe-text.js must export sanitizeDisplayName");
+  }
+  return mod.sanitizeDisplayName(raw);
+}
+
+function mentionOpts() {
+  const mod = contractModule(path.join(__dirname, "safe-text.js"));
+  if (!mod) return { allowedMentions: { parse: [] } };
+  if (typeof mod.mentionOpts !== "function") {
+    throw new Error("safe-text.js must export mentionOpts");
+  }
+  return mod.mentionOpts();
+}
+
+function withWikiSlot(fn) {
+  const mod = contractModule(path.join(__dirname, "..", "wiki", "gate.js"));
+  if (!mod) return fallbackWithWikiSlot(fn);
+  if (typeof mod.withWikiSlot !== "function") {
+    throw new Error("gate.js must export withWikiSlot");
+  }
+  return mod.withWikiSlot(fn);
+}
+
+function hidden(content) {
+  return { content, flags: Ephemeral, ...mentionOpts() };
+}
+
+function said(content) {
+  return { content, ...mentionOpts() };
+}
+
+function buttonLabel(text) {
+  return String(text).slice(0, BUTTON_LABEL_MAX);
+}
+
+function displayWikiUrl(url) {
+  const norm = pageLookup.normalizeWikiUrl(url);
+  return norm?.url || null;
+}
+
+function hasProposedUrl(row) {
+  return Boolean(row && String(row.proposed_wiki_url || "").trim());
+}
 
 function reviewCustomId(action, celebId) {
   return `crev:${action}:${celebId}`;
@@ -51,8 +159,24 @@ function parseCandidates(row, proposal) {
   return [];
 }
 
+function proposalFromQueueRow(row) {
+  const candidates = parseCandidates(row, null);
+  const primary = candidates[0] || {};
+  return {
+    wikiUrl: row?.proposed_wiki_url || null,
+    wikiNorm: primary.norm || null,
+    lang: row?.proposed_lang || primary.lang || null,
+    proposedAge: row?.proposed_age ?? primary.proposedAge ?? null,
+    qid: primary.qid || null,
+    candidates: candidates.length ? candidates : undefined,
+    thumb: primary.thumb || null,
+    title: primary.title || null,
+  };
+}
+
 function buildReviewEmbed(row, proposal, progress) {
   const candidates = parseCandidates(row, proposal);
+  const wikiShown = displayWikiUrl(proposal?.wikiUrl || row.proposed_wiki_url);
   const lines = [
     progress ? `Fortschritt: **${progress.total}** in Warteschlange (inkl. dieser)` : null,
     row.possible_homonym || /homonym/i.test(row.celeb_name || "")
@@ -63,23 +187,21 @@ function buildReviewEmbed(row, proposal, progress) {
     proposal?.qid || row.wikidata_id
       ? `Wikidata: **${proposal?.qid || row.wikidata_id}**`
       : null,
-    proposal?.wikiUrl || row.proposed_wiki_url
-      ? `Vorschlag Wiki: ${proposal?.wikiUrl || row.proposed_wiki_url}`
-      : "_Kein Wikipedia-Treffer_",
+    wikiShown ? `Vorschlag Wiki: ${wikiShown}` : "_Kein Wikipedia-Treffer_",
   ];
   if (candidates.length > 1) {
     lines.push("", "**Weitere Treffer** (Menü wählen):");
     candidates.slice(0, 3).forEach((c, i) => {
       lines.push(
-        `${i + 1}. **${c.title}** (${c.lang || "?"})${c.proposedAge != null ? ` · Alter ${c.proposedAge}` : ""}`
+        `${i + 1}. **${sanitizeDisplayName(c.title)}** (${c.lang || "?"})${c.proposedAge != null ? ` · Alter ${c.proposedAge}` : ""}`
       );
     });
   }
-  lines.push("", "Bestätigen bevor Auto-Match. Manual-only = nie Wiki-Kill.");
+  lines.push("", REVIEW_INTRO);
 
   const embed = new EmbedBuilder()
     .setColor(0x222222)
-    .setTitle(`Wiki/Alter: ${row.celeb_name || row.name}`)
+    .setTitle(`Wiki/Alter: ${sanitizeDisplayName(row.celeb_name || row.name)}`)
     .setDescription(lines.filter(Boolean).join("\n"));
   if (proposal?.thumb || candidates[0]?.thumb) {
     embed.setThumbnail(proposal?.thumb || candidates[0]?.thumb);
@@ -89,26 +211,12 @@ function buildReviewEmbed(row, proposal, progress) {
 
 function buildReviewButtons(celebId) {
   return new ActionRowBuilder().addComponents(
-    new ButtonBuilder()
-      .setCustomId(reviewCustomId("confirm", celebId))
-      .setLabel("Confirm")
-      .setStyle(ButtonStyle.Success),
-    new ButtonBuilder()
-      .setCustomId(reviewCustomId("wrong", celebId))
-      .setLabel("Wrong link")
-      .setStyle(ButtonStyle.Primary),
-    new ButtonBuilder()
-      .setCustomId(reviewCustomId("age", celebId))
-      .setLabel("Set age")
-      .setStyle(ButtonStyle.Secondary),
-    new ButtonBuilder()
-      .setCustomId(reviewCustomId("nowiki", celebId))
-      .setLabel("No wiki")
-      .setStyle(ButtonStyle.Danger),
-    new ButtonBuilder()
-      .setCustomId(reviewCustomId("skip", celebId))
-      .setLabel("Skip")
-      .setStyle(ButtonStyle.Secondary)
+    REVIEW_BUTTONS.map((b) =>
+      new ButtonBuilder()
+        .setCustomId(reviewCustomId(b.action, celebId))
+        .setLabel(buttonLabel(b.label))
+        .setStyle(b.style)
+    )
   );
 }
 
@@ -119,7 +227,7 @@ function buildCandidateSelect(celebId, candidates) {
     .setPlaceholder("Anderen Wiki-Treffer wählen…")
     .addOptions(
       candidates.slice(0, 3).map((c, i) => ({
-        label: String(c.title || `Treffer ${i + 1}`).slice(0, 100),
+        label: sanitizeDisplayName(c.title || `Treffer ${i + 1}`).slice(0, 100),
         description: `${c.lang || "?"} · Alter ${c.proposedAge ?? "?"}`
           .slice(0, 100),
         value: String(i),
@@ -133,27 +241,25 @@ async function sendNextReview(ctx, channelOrUser, { season, seasonId } = {}) {
   const row = db.nextPendingReview(seasonId);
   if (!row) {
     if (typeof channelOrUser.send === "function") {
-      await channelOrUser.send("Review-Warteschlange leer.");
+      await channelOrUser.send(said("Review-Warteschlange leer."));
     } else if (typeof channelOrUser.reply === "function") {
-      await channelOrUser.reply({ content: "Review-Warteschlange leer." });
+      await channelOrUser.reply(said("Review-Warteschlange leer."));
     }
     return null;
   }
 
   const effSeason = season || db.getActiveSeason();
-  let proposal = {
-    wikiUrl: row.proposed_wiki_url,
-    proposedAge: row.proposed_age,
-    lang: row.proposed_lang,
-    candidates: parseCandidates(row, null),
-  };
-  if (!proposal.wikiUrl || !proposal.candidates?.length) {
+  let proposal = proposalFromQueueRow(row);
+  // Vorhandene proposed_wiki_url wiederverwenden — auch ohne Kandidatenliste.
+  if (!hasProposedUrl(row)) {
     try {
-      proposal = await proposeWikiForName(
-        ctx.config.userAgent,
-        row.celeb_name,
-        effSeason.start_date,
-        row.sheet_age_hint
+      proposal = await withWikiSlot(() =>
+        pageLookup.proposeWikiForName(
+          ctx.config.userAgent,
+          row.celeb_name,
+          effSeason.start_date,
+          row.sheet_age_hint
+        )
       );
       db.enqueueReview(row.celeb_id, proposal, {
         seasonId: seasonId ?? row.season_id ?? db.getActiveSeason().id,
@@ -185,6 +291,7 @@ async function sendNextReview(ctx, channelOrUser, { season, seasonId } = {}) {
       }),
     ],
     components,
+    ...mentionOpts(),
   };
   if (channelOrUser.send) return channelOrUser.send(payload);
   return channelOrUser.reply(payload);
@@ -200,16 +307,28 @@ async function queueCelebsForReview(ctx, celebIds, notifyTarget, { season } = {}
     if (celeb.wiki_confirmed && !celeb.manual_only && celeb.wiki_url) continue;
     if (celeb.manual_only && celeb.wiki_confirmed) continue;
 
-    let proposal = { proposedAge: celeb.sheet_age_hint };
-    try {
-      proposal = await proposeWikiForName(
-        ctx.config.userAgent,
-        celeb.name,
-        effSeason.start_date,
-        celeb.sheet_age_hint
-      );
-    } catch (e) {
-      console.warn("[review] propose failed", celeb.name, e.message);
+    const existingQ = db
+      .getDb()
+      .prepare("SELECT * FROM celeb_review_queue WHERE celeb_id = ?")
+      .get(celeb.id);
+
+    let proposal;
+    if (hasProposedUrl(existingQ)) {
+      proposal = proposalFromQueueRow(existingQ);
+    } else {
+      proposal = { proposedAge: celeb.sheet_age_hint };
+      try {
+        proposal = await withWikiSlot(() =>
+          pageLookup.proposeWikiForName(
+            ctx.config.userAgent,
+            celeb.name,
+            effSeason.start_date,
+            celeb.sheet_age_hint
+          )
+        );
+      } catch (e) {
+        console.warn("[review] propose failed", celeb.name, e.message);
+      }
     }
 
     // Merge if proposal matches existing identity (QID or wiki norm)
@@ -234,7 +353,7 @@ async function queueCelebsForReview(ctx, celebIds, notifyTarget, { season } = {}
 
   if (notifyTarget && queued > 0) {
     await notifyTarget.send?.(
-      `**${queued}** Celebs in Wiki-/Alter-Review. Buttons unten oder \`/review\`.`
+      said(`**${queued}** Celebs in Wiki-/Alter-Review. Buttons unten oder \`/review\`.`)
     );
     await sendNextReview(ctx, notifyTarget, { season: effSeason, seasonId: effSeasonId });
   }
@@ -243,7 +362,7 @@ async function queueCelebsForReview(ctx, celebIds, notifyTarget, { season } = {}
 
 function confirmFromProposal(celebId, celeb, q, proposalExtras = {}) {
   const url = proposalExtras.wikiUrl || q?.proposed_wiki_url || celeb.wiki_url;
-  const norm = url ? normalizeWikiUrl(url) : null;
+  const norm = url ? pageLookup.normalizeWikiUrl(url) : null;
   let candidates = [];
   try {
     candidates = q?.proposed_candidates ? JSON.parse(q.proposed_candidates) : [];
@@ -278,7 +397,7 @@ async function handleReviewInteraction(ctx, interaction) {
   if (!String(interaction.customId || "").startsWith("crev:")) return false;
   if (interaction.user.id !== ctx.config.adminId) {
     if (interaction.isRepliable()) {
-      await interaction.reply({ content: "Nur Admin.", ephemeral: true });
+      await interaction.reply(hidden("Nur Admin."));
     }
     return true;
   }
@@ -287,7 +406,7 @@ async function handleReviewInteraction(ctx, interaction) {
     const celebId = Number(interaction.customId.split(":")[2]);
     const age = parseInt(interaction.fields.getTextInputValue("age"), 10);
     if (!Number.isFinite(age) || age < 1 || age > 130) {
-      await interaction.reply({ content: "Ungültiges Alter.", ephemeral: true });
+      await interaction.reply(hidden("Ungültiges Alter."));
       return true;
     }
     const { season, seasonId } = seasonForQueue(celebId);
@@ -304,18 +423,18 @@ async function handleReviewInteraction(ctx, interaction) {
           `UPDATE celeb_review_queue SET proposed_age = ?, updated_at = datetime('now') WHERE celeb_id = ?`
         )
         .run(age, celebId);
-      await interaction.reply({
-        content: `Alter = **${age}** (${info.changes} Player-Picks in Saison ${season.year}). Danach Confirm.`,
-        ephemeral: true,
-      });
+      await interaction.reply(
+        hidden(
+          `Alter = **${age}** (${info.changes} Player-Picks in Saison ${season.year}). ${AFTER_CONFIRM}`
+        )
+      );
       return true;
     }
     const result = db.setCelebAge(celebId, age);
     if (!result.ok) {
-      await interaction.reply({
-        content: `Alter gesperrt: ${result.awards} Todes-Punkte existieren schon.`,
-        ephemeral: true,
-      });
+      await interaction.reply(
+        hidden(`Alter gesperrt: ${result.awards} Todes-Punkte existieren schon.`)
+      );
       return true;
     }
     db.getDb()
@@ -323,34 +442,45 @@ async function handleReviewInteraction(ctx, interaction) {
         `UPDATE celeb_review_queue SET proposed_age = ?, updated_at = datetime('now') WHERE celeb_id = ?`
       )
       .run(age, celebId);
-    await interaction.reply({
-      content: `Alter = **${age}**. Danach Confirm.`,
-      ephemeral: true,
-    });
+    await interaction.reply(hidden(`Alter = **${age}**. ${AFTER_CONFIRM}`));
     return true;
   }
 
   if (interaction.isModalSubmit() && interaction.customId.startsWith("crev:url:")) {
-    const celebId = Number(interaction.customId.split(":")[2]);
-    const url = interaction.fields.getTextInputValue("url").trim();
-    const celeb = db.getDb().prepare("SELECT * FROM celebs WHERE id = ?").get(celebId);
-    const { season, seasonId } = seasonForQueue(celebId);
+    // Ack zuerst (Discord-Fenster 3s), danach der langsame Lookup, dann editReply.
+    let deferred = false;
     try {
-      const proposal = await lookupUrl(
-        ctx.config.userAgent,
-        url,
-        season.start_date,
-        celeb?.sheet_age_hint
+      await interaction.deferReply({ flags: Ephemeral });
+      deferred = true;
+      const celebId = Number(interaction.customId.split(":")[2]);
+      const url = interaction.fields.getTextInputValue("url").trim();
+      const celeb = db.getDb().prepare("SELECT * FROM celebs WHERE id = ?").get(celebId);
+      const { season, seasonId } = seasonForQueue(celebId);
+      const proposal = await withWikiSlot(() =>
+        pageLookup.lookupUrl(
+          ctx.config.userAgent,
+          url,
+          season?.start_date,
+          celeb?.sheet_age_hint
+        )
       );
       db.enqueueReview(celebId, proposal, { seasonId });
       db.clearUrlWait(interaction.user.id);
-      await interaction.reply({
-        content: `Vorschlag für **${celeb?.name}**: ${proposal.wikiUrl} · Alter ${proposal.proposedAge ?? "?"} · QID ${proposal.qid || "—"}`,
-        ephemeral: true,
-      });
+      const shown = displayWikiUrl(proposal?.wikiUrl);
+      await interaction.editReply(
+        said(
+          `Vorschlag für **${sanitizeDisplayName(celeb?.name)}**: ${shown || "—"} · Alter ${proposal?.proposedAge ?? "?"} · QID ${proposal?.qid || "—"}`
+        )
+      );
       await sendNextReview(ctx, interaction.channel, { season, seasonId });
     } catch (e) {
-      await interaction.reply({ content: `Lookup fehlgeschlagen: ${e.message}`, ephemeral: true });
+      console.error("[review] url", e?.message || e);
+      const payload = said(LOOKUP_FAIL);
+      if (deferred || interaction.deferred || interaction.replied) {
+        await interaction.editReply(payload);
+      } else {
+        await interaction.reply({ ...payload, flags: Ephemeral });
+      }
     }
     return true;
   }
@@ -361,7 +491,7 @@ async function handleReviewInteraction(ctx, interaction) {
   const { action, celebId } = parsed;
   const celeb = db.getDb().prepare("SELECT * FROM celebs WHERE id = ?").get(celebId);
   if (!celeb) {
-    await interaction.reply({ content: "Celeb weg.", ephemeral: true });
+    await interaction.reply(hidden("Celeb weg."));
     return true;
   }
   const q = db
@@ -379,7 +509,7 @@ async function handleReviewInteraction(ctx, interaction) {
     }
     const chosen = candidates[idx];
     if (!chosen) {
-      await interaction.reply({ content: "Treffer ungültig.", ephemeral: true });
+      await interaction.reply(hidden("Treffer ungültig."));
       return true;
     }
     const { season, seasonId } = seasonForQueue(celebId);
@@ -393,9 +523,10 @@ async function handleReviewInteraction(ctx, interaction) {
       thumb: chosen.thumb,
     }, { seasonId });
     await interaction.update({
-      content: `Gewählt: **${chosen.title}**. Jetzt Confirm.`,
+      content: `Gewählt: **${sanitizeDisplayName(chosen.title)}**. ${NOW_CONFIRM}`,
       embeds: [],
       components: [],
+      ...mentionOpts(),
     });
     await sendNextReview(ctx, interaction.channel, { season, seasonId });
     return true;
@@ -413,9 +544,10 @@ async function handleReviewInteraction(ctx, interaction) {
     const { season, seasonId } = seasonForQueue(celebId);
     confirmFromProposal(celebId, celeb, q);
     await interaction.update({
-      content: `Bestätigt **${celeb.name}** → Auto-Match an.`,
+      content: `Bestätigt **${sanitizeDisplayName(celeb.name)}** → Auto-Match an.`,
       embeds: [],
       components: [],
+      ...mentionOpts(),
     });
     await sendNextReview(ctx, interaction.channel, { season, seasonId });
     return true;
@@ -428,9 +560,10 @@ async function handleReviewInteraction(ctx, interaction) {
     });
     const { season, seasonId } = seasonForQueue(celebId);
     await interaction.update({
-      content: `**${celeb.name}** = manual-only (kein Wiki-Auto-Kill).`,
+      content: `**${sanitizeDisplayName(celeb.name)}** = manual-only (kein Wiki-Auto-Kill).`,
       embeds: [],
       components: [],
+      ...mentionOpts(),
     });
     await sendNextReview(ctx, interaction.channel, { season, seasonId });
     return true;
@@ -447,9 +580,10 @@ async function handleReviewInteraction(ctx, interaction) {
       candidates: parseCandidates(q, null),
     }, { seasonId });
     await interaction.update({
-      content: `**${celeb.name}** übersprungen (ans Ende).`,
+      content: `**${sanitizeDisplayName(celeb.name)}** übersprungen (ans Ende).`,
       embeds: [],
       components: [],
+      ...mentionOpts(),
     });
     await sendNextReview(ctx, interaction.channel, { season, seasonId });
     return true;
@@ -458,7 +592,7 @@ async function handleReviewInteraction(ctx, interaction) {
   if (action === "age") {
     const modal = new ModalBuilder()
       .setCustomId(reviewCustomId("age", celebId))
-      .setTitle(`Alter: ${celeb.name}`.slice(0, 45));
+      .setTitle(`Alter: ${sanitizeDisplayName(celeb.name)}`.slice(0, 45));
     modal.addComponents(
       new ActionRowBuilder().addComponents(
         new TextInputBuilder()
@@ -479,7 +613,7 @@ async function handleReviewInteraction(ctx, interaction) {
     db.setUrlWait(interaction.user.id, celebId, expires);
     const modal = new ModalBuilder()
       .setCustomId(reviewCustomId("url", celebId))
-      .setTitle(`Wiki-URL: ${celeb.name}`.slice(0, 45));
+      .setTitle(`Wiki-URL: ${sanitizeDisplayName(celeb.name)}`.slice(0, 45));
     modal.addComponents(
       new ActionRowBuilder().addComponents(
         new TextInputBuilder()
@@ -513,19 +647,25 @@ async function tryConsumeReviewUrl(ctx, msg) {
   const celeb = db.getDb().prepare("SELECT * FROM celebs WHERE id = ?").get(wait.celeb_id);
   const { season, seasonId } = seasonForQueue(wait.celeb_id);
   try {
-    const proposal = await lookupUrl(
-      ctx.config.userAgent,
-      text.split(/\s+/).find((t) => /wikipedia\.org/i.test(t)),
-      season.start_date,
-      celeb.sheet_age_hint
+    const proposal = await withWikiSlot(() =>
+      pageLookup.lookupUrl(
+        ctx.config.userAgent,
+        text.split(/\s+/).find((t) => /wikipedia\.org/i.test(t)),
+        season?.start_date,
+        celeb?.sheet_age_hint
+      )
     );
     db.enqueueReview(wait.celeb_id, proposal, { seasonId });
+    const shown = displayWikiUrl(proposal?.wikiUrl);
     await msg.reply(
-      `Vorschlag **${celeb.name}**: ${proposal.wikiUrl} · Alter ${proposal.proposedAge ?? "?"} · QID ${proposal.qid || "—"}. \`/review\` fortsetzen.`
+      said(
+        `Vorschlag **${sanitizeDisplayName(celeb?.name)}**: ${shown || "—"} · Alter ${proposal?.proposedAge ?? "?"} · QID ${proposal?.qid || "—"}. \`/review\` fortsetzen.`
+      )
     );
     await sendNextReview(ctx, msg.channel, { season, seasonId });
   } catch (e) {
-    await msg.reply(`Lookup fehlgeschlagen: ${e.message}`);
+    console.error("[review] url paste", e?.message || e);
+    await msg.reply(said(LOOKUP_FAIL));
   }
   return true;
 }

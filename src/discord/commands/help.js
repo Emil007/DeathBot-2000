@@ -3,7 +3,6 @@ const {
   ButtonBuilder,
   ButtonStyle,
 } = require("discord.js");
-const db = require("../../db");
 const { uniqueCommands, suggestCommands } = require("../usage");
 
 const GROUP_ORDER = [
@@ -12,18 +11,6 @@ const GROUP_ORDER = [
   { id: "match", title: "Admin · Matching & Celebs" },
   { id: "points", title: "Admin · Punkte" },
 ];
-
-function setupNudge(config) {
-  try {
-    const season = db.getActiveSeason();
-    if (season && !season.live) {
-      return `Setup: \`/new-year\` → \`/import\` → \`/review\` → \`/go\` (Prefix \`${config.prefix}\` geht auch)`;
-    }
-  } catch {
-    /* ignore */
-  }
-  return null;
-}
 
 function groupOf(cmd) {
   if (cmd.group) return cmd.group;
@@ -64,11 +51,10 @@ function buildOverviewPages(ctx, isAdmin) {
     }
   }
 
-  const nudge = setupNudge(ctx.config);
   const header = [
-    "**DeathBot Hilfe** — Slash ist die Hauptbedienung; Prefix bleibt Fallback.",
-    "Detail: `/help command:import` oder `!help import`",
-    nudge,
+    "**DeathBot Hilfe** — Slash ist der ordentliche Weg, der Prefix der Notausgang.",
+    `Detail: \`/help command:import\` oder \`${p}help import\``,
+    `Noch nicht live: \`/import\` → \`/review\` → \`/go\`. Nächstes Jahr: \`/announce-season\`, am Start \`/new-year activate:true\`. Prefix \`${ctx.config.prefix}\` geht auch.`,
     "",
   ]
     .filter((x) => x != null && x !== "")
@@ -95,7 +81,7 @@ function detailCard(cmd, config) {
     `**/${cmd.name}**${cmd.admin ? " _(Admin)_" : ""}`,
     cmd.description || "",
     "",
-    "**Usage**",
+    "**Aufruf**",
     (cmd.usage || `\`/${cmd.name}\`\n\`${p}${cmd.name}\``).replaceAll("{prefix}", p),
   ];
   if (cmd.examples?.length) {
@@ -148,7 +134,11 @@ function pageRow(page, total) {
 async function sendOverview(ctx, msg, isAdmin, page = 0) {
   const pages = buildOverviewPages(ctx, isAdmin);
   const i = Math.max(0, Math.min(page, pages.length - 1));
-  await msg.reply({ content: pages[i], components: pageRow(i, pages.length) });
+  await msg.reply({
+    content: pages[i],
+    components: pageRow(i, pages.length),
+    allowedMentions: { parse: [] },
+  });
 }
 
 module.exports = {
@@ -156,7 +146,7 @@ module.exports = {
   aliases: ["commands", "hilfe"],
   admin: false,
   group: "everyone",
-  description: "Hilfe: Übersicht oder Details zu einem Befehl",
+  description: "Hilfe zu einem Befehl, bevor du daneben tippst",
   usage: "/help [command:<name>]\n{prefix}help [befehl]",
   examples: ["/help", "/help command:import", "{prefix}help go"],
   options: [
@@ -182,10 +172,16 @@ module.exports = {
         const hint = suggestions.length
           ? `Meintest du: ${suggestions.map((s) => `\`/${s}\``).join(", ")}?`
           : "Schau unter `/help`.";
-        await msg.reply(`Unbekannter Befehl \`${target}\`. ${hint}`);
+        await msg.reply({
+          content: `Befehl \`${target}\` gibt es nicht. ${hint}`,
+          allowedMentions: { parse: [] },
+        });
         return;
       }
-      await msg.reply(detailCard(cmd, ctx.config));
+      await msg.reply({
+        content: detailCard(cmd, ctx.config),
+        allowedMentions: { parse: [] },
+      });
       return;
     }
 
@@ -207,6 +203,7 @@ module.exports = {
     await interaction.update({
       content: pages[i],
       components: pageRow(i, pages.length),
+      allowedMentions: { parse: [] },
     });
     return true;
   },

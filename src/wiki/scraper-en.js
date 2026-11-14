@@ -1,6 +1,54 @@
 const axios = require("axios");
 const cheerio = require("cheerio");
 
+function calendarParts(instant, timeZone) {
+  const date = instant instanceof Date ? instant : new Date(instant);
+  const fmt = new Intl.DateTimeFormat("en-CA", {
+    timeZone,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+  });
+  const parts = fmt.formatToParts(date);
+  const pick = (type) => parts.find((p) => p.type === type).value;
+  return { year: Number(pick("year")), month: Number(pick("month")) };
+}
+
+function timeModuleMissing(err) {
+  if (!err || err.code !== "MODULE_NOT_FOUND") return false;
+  const first = String(err.message || "").split("\n")[0];
+  return /[/\\]db[/\\]time(?:\.js)?['"]?\s*$/.test(first);
+}
+
+/**
+ * Year and month come from M1 `calendarYear` / `calendarMonthIndex`.
+ * Missing `src/db/time.js` uses the same Intl rules — never getFullYear()/getMonth().
+ */
+function calendarApi() {
+  if (calendarApi.mod) return calendarApi.mod;
+  try {
+    calendarApi.mod = require("../db/time");
+  } catch (err) {
+    if (!timeModuleMissing(err)) throw err;
+    calendarApi.mod = {
+      calendarYear: (instant, timeZone) => calendarParts(instant, timeZone).year,
+      calendarMonthIndex: (instant, timeZone) => calendarParts(instant, timeZone).month - 1,
+    };
+  }
+  return calendarApi.mod;
+}
+
+function scrapeCalendar(opts = {}) {
+  const tz = opts.tz || "Europe/Vienna";
+  const now = opts.now != null ? new Date(opts.now) : new Date();
+  const api = calendarApi();
+  return {
+    tz,
+    year: api.calendarYear(now, tz),
+    monthIndex: api.calendarMonthIndex(now, tz),
+  };
+}
+
 const MONTHS = [
   "January", "February", "March", "April", "May", "June",
   "July", "August", "September", "October", "November", "December",
@@ -211,8 +259,9 @@ function monthFlagsFromUrl(url, year, monthIndex) {
 
 /**
  * @param {string} userAgent
- * @param {{ scope?: 'recent'|'full' }} [opts]
+ * @param {{ scope?: 'recent'|'full', tz?: string, now?: Date|string|number }} [opts]
  * recent = current + previous month; full = current month + all months YTD
+ * `tz` defaults to Europe/Vienna. `now` is the frozen instant (default: current time).
  *
  * Since Oct 2026 the EN wiki splits FINISHED months onto their own
  * "Deaths_in_<Month>_<Year>" pages (like the German wiki), while the current
@@ -225,8 +274,7 @@ function monthFlagsFromUrl(url, year, monthIndex) {
 async function scrapeEn(userAgent, opts = {}) {
   const scope = opts.scope || "full";
   const client = createClient(userAgent);
-  const year = new Date().getFullYear();
-  const monthIndex = new Date().getMonth();
+  const { year, monthIndex } = scrapeCalendar(opts);
   const urls = [];
 
   // Current (incomplete) month lives on the year page.
@@ -266,4 +314,4 @@ async function scrapeEn(userAgent, opts = {}) {
   return unique;
 }
 
-module.exports = { scrapeEn, wikiPathFromHref, extractEntriesFromHtml };
+module.exports = { scrapeEn, wikiPathFromHref, extractEntriesFromHtml, scrapeCalendar };

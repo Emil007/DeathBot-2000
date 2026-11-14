@@ -1,5 +1,20 @@
 const db = require("../../db");
 const { runWikiPoll } = require("../../jobs/wiki-poll");
+const { logError } = require("../log");
+
+function mentionOpts() {
+  try {
+    return require("../safe-text").mentionOpts();
+  } catch (e) {
+    if (e.code !== "MODULE_NOT_FOUND" || !String(e.message).includes("safe-text")) throw e;
+    return { allowedMentions: { parse: [] } };
+  }
+}
+
+function isTokenBurned(err) {
+  const code = err?.code ?? err?.rawError?.code;
+  return Number(code) === 50027;
+}
 
 const cmd = {
   name: "ungo",
@@ -48,24 +63,37 @@ const cmd = {
       return;
     }
 
+    const keep = async (content, where) => {
+      try {
+        await msg.reply({ content, ...mentionOpts() });
+      } catch (e) {
+        if (isTokenBurned(e)) {
+          await logError(ctx.client, ctx.config, e, { where, userId: msg.author?.id });
+          return;
+        }
+        throw e;
+      }
+    };
+
     const wasLive = db.isLive();
     if (wasLive) {
       db.setSeasonLive(false);
-      await msg.reply("Live aus — zurück im Setup-Modus.");
+      await keep("Live aus — zurück im Setup-Modus.", "ungo live off");
     } else {
-      await msg.reply("War schon nicht live. Seede Wiki-Cache neu…");
+      await keep("War schon nicht live. Seede Wiki-Cache neu…", "ungo already off");
     }
 
-    await msg.reply("Stilles Seeding (alles als gesehen markieren, keine Pings)…");
+    await keep("Stilles Seeding (alles als gesehen markieren, keine Pings)…", "ungo seed notice");
     await runWikiPoll(ctx.client, ctx.config, { mode: "seed" });
     const season = db.getActiveSeason();
-    await msg.reply(
+    await keep(
       [
         "✅ Cache neu geseedet.",
         `• live=**${season.live ? "ja" : "nein"}**`,
         `• Start: **${season.start_date || "?"}**`,
         "Poller läuft weiter im Seed-Modus bis `/go`.",
-      ].join("\n")
+      ].join("\n"),
+      "ungo done"
     );
   },
 };

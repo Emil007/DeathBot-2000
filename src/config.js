@@ -1,4 +1,5 @@
 const path = require("path");
+const { isValidTimeZone } = require("./db/time");
 
 function required(name) {
   const v = process.env[name];
@@ -22,6 +23,24 @@ function intEnv(name, fallback) {
 }
 
 const CUSTOM_MODES = new Set(["no", "mix", "only"]);
+
+// Fehlendes TZ ist der Default (Europe/Vienna), kein Fehler. Gesetzt, aber
+// leer oder ungültig, wird ernst geloggt und fällt auf Europe/Vienna zurück.
+// process.env.TZ wird hier nicht geschrieben.
+function resolveTimeZone() {
+  const raw = process.env.TZ;
+  if (raw == null) return "Europe/Vienna";
+  const trimmed = String(raw).trim();
+  if (!trimmed) {
+    console.error("[config] TZ is empty. Using Europe/Vienna.");
+    return "Europe/Vienna";
+  }
+  if (!isValidTimeZone(trimmed)) {
+    console.error(`[config] Invalid time zone "${trimmed}". Using Europe/Vienna.`);
+    return "Europe/Vienna";
+  }
+  return trimmed;
+}
 
 // PHRASES_BANK wählt, welche eingebaute Phrasebank geladen wird:
 //   new    = src/phrases/builtin-phrases.json      (Standard, die gemeine 241er-Bank)
@@ -74,10 +93,9 @@ function loadConfig() {
       "USER_AGENT",
       "DeathBot-2000/1.0 (Discord death pool bot; +https://github.com/Emil007/DeathBot-2000)"
     ),
-    // Zeitzone des Bots: Jahreswechsel/Erinnerungen rechnen in dieser TZ.
-    // Default Europe/Vienna (Wien — Emil), per TZ-Env konfigurierbar. Der
-    // Wert darf leer/UTC sein; die Guard-Logik schlägt dann in UTC an.
-    tz: optional("TZ", "Europe/Vienna"),
+    // Der Wert gilt für Kalender, Crons und, nach applyProcessTimezone, für die
+    // Prozesszone. Der Container ist sonst UTC.
+    tz: resolveTimeZone(),
   };
 }
 

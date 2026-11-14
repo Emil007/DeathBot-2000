@@ -18,12 +18,20 @@ function ms(n) {
   return `${(n / 1000).toFixed(1)}s`;
 }
 
+/** Fehlender Meta-Key ist „nein“. Leer, 0, false, nein, no ebenfalls. */
+function metaJaNein(raw) {
+  if (raw == null) return "nein";
+  const s = String(raw).trim().toLowerCase();
+  if (!s || s === "0" || s === "false" || s === "nein" || s === "no") return "nein";
+  return "ja";
+}
+
 const cmd = {
   name: "status",
   aliases: ["health", "ops"],
   admin: true,
   group: "season",
-  description: "Ops-Status: Poller, Counts, letzte Hits, Fehler",
+  description: "Ops-Status: Poller, Zähler, letzte Fehler",
   usage: "/status\n{prefix}status",
   examples: ["/status", "{prefix}status"],
   parseSlash() {
@@ -48,6 +56,14 @@ const cmd = {
           }
         : null;
 
+    const announced = db.getAnnouncedSeason();
+    const setupYn = metaJaNein(db.getMeta("channel_setup_open"));
+    const pendingTotal = db.countPendingReviews();
+    const openDrafts = db
+      .getDb()
+      .prepare(`SELECT COUNT(*) AS c FROM pick_drafts WHERE status != 'finalized'`)
+      .get().c;
+
     const lines = [
       "**DeathBot Status**",
       "",
@@ -57,15 +73,23 @@ const cmd = {
       }**`,
       `• Reviews offen: **${snap.pendingReviews}** · Unbestätigte Celebs: **${snap.unconfirmedCelebs}** · Unbestätigte Tode: **${snap.unconfirmedDead}**`,
       "",
+      "**Offen**",
+      announced
+        ? `• Announced-Saison: **ja** · Start **${announced.start_date || "?"}**`
+        : "• Announced-Saison: **nein**",
+      `• Kanal-Setup offen: **${setupYn}** · Setup-Nachricht: **${setupYn}**`,
+      `• Reviews gesamt: **${pendingTotal}**`,
+      `• Drafts nicht finalized: **${openDrafts}**`,
+      "",
       "**Poller**",
       `• Busy: **${p.busy ? "ja" : "nein"}**` +
-        (p.nightlyPending ? " · nightly pending" : ""),
+        (p.nightlyPending ? " · Nachtlauf ausstehend" : ""),
       `• Intervall: **${cfg.wikiPollerMinutes} min** · Nightly: **${cfg.nightlyFullScrapeHour}:00** · Uptime: ${ago(
         ops.startedAt
       ).replace(/^vor /, "")} (seit ${ops.startedAt.slice(0, 19)}Z)`,
       lastPoll
         ? `• Letzter Lauf: **${lastPoll.mode}** · ${
-            lastPoll.ok === false ? "FAIL" : "OK"
+            lastPoll.ok === false ? "Fehler" : "ok"
           } · ${ago(lastPoll.at)} · Dauer ${ms(lastPoll.durationMs)}`
         : "• Letzter Lauf: _noch keiner_",
     ];
@@ -89,14 +113,14 @@ const cmd = {
       "",
       "**Bestand**",
       `• Spieler **${snap.players}** · Picks (Saison) **${snap.picks}**`,
-      `• Celebs lebend **${snap.celebsAlive}** / tot **${snap.celebsDead}** · Auto-Watch **${snap.autoWatch}** · excluded **${snap.excluded}**`,
+      `• Celebs lebend **${snap.celebsAlive}** / tot **${snap.celebsDead}** · Auto-Watch **${snap.autoWatch}** · ausgeschlossen **${snap.excluded}**`,
       `• Wiki-seen **${snap.wikiSeen}** (EN ${snap.wikiSeenEn} / DE ${snap.wikiSeenDe}) · All-deaths announced **${snap.announcedTotal}**`,
       "",
       "**Channels**",
       `• Deathpool: ${db.resolveDeathpoolChannel(cfg) ? `\`${db.resolveDeathpoolChannel(cfg)}\`` : "_(per Start-Setup, noch keiner verknüpft)_"}`,
       `• All-deaths: ${cfg.channelAllDeaths ? `\`${cfg.channelAllDeaths}\`` : "_aus_"}`,
-      `• Admin: ${cfg.channelAdmin ? `\`${cfg.channelAdmin}\`` : "_DM-first_"}`,
-      `• Guild-ID: ${cfg.discordGuildId ? `\`${cfg.discordGuildId}\`` : "_fehlt (slash lag)_"}`
+      `• Admin: ${cfg.channelAdmin ? `\`${cfg.channelAdmin}\`` : "_zuerst per DM_"}`,
+      `• Guild-ID: ${cfg.discordGuildId ? `\`${cfg.discordGuildId}\`` : "_fehlt (Slash-Befehle hinken hinterher)_"}`
     );
 
     try {
@@ -142,7 +166,10 @@ const cmd = {
       }
     }
 
-    await msg.reply(lines.join("\n").slice(0, 1900));
+    await msg.reply({
+      content: lines.join("\n").slice(0, 1900),
+      allowedMentions: { parse: [] },
+    });
   },
 };
 

@@ -1,5 +1,13 @@
 const { usageReply } = require("../usage");
 const db = require("../../db");
+const { sendChunks, chunkLines, sanitizeDisplayName, acceptedWikiUrl } = require("./liste");
+
+function oneLine(raw) {
+  return String(raw ?? "")
+    .replace(/[\u0000-\u001F\u007F\u2028\u2029]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
 
 const cmd = {
   name: "celeb",
@@ -23,38 +31,43 @@ const cmd = {
   async run(ctx, args, msg) {
     const q = args.join(" ").trim();
     if (!q) {
-      await msg.reply(usageReply(cmd, ctx.config));
+      await sendChunks(msg, [usageReply(cmd, ctx.config)]);
       return;
     }
     const found = db.findCelebByName(q);
     if (!found.length) {
-      await msg.reply("Nichts gefunden.");
+      await sendChunks(msg, ["Nichts gefunden."]);
       return;
     }
-    const lines = found.map((c) => {
-      const season = db.getActiveSeason();
-      const winners = db.getWinnersForCeleb(c.id, season.id);
+    const season = db.getActiveSeason();
+    const blocks = found.map((c) => {
+      const winners = season ? db.getWinnersForCeleb(c.id, season.id) : [];
+      const url = acceptedWikiUrl(c.wiki_url);
+      const akas = db.getAkas(c.id).map((a) => sanitizeDisplayName(a)).filter(Boolean);
+      const blocked = db.getBlacklist(c.id).map((a) => sanitizeDisplayName(a)).filter(Boolean);
+      const note = c.description ? oneLine(c.description) : "";
       return [
-        `${c.is_alive ? "🟢" : "💀"} **${c.name}** (id ${c.id})` +
+        `${c.is_alive ? "🟢" : "💀"} **${sanitizeDisplayName(c.name)}** (id ${c.id})` +
           (c.exclude_from_auto ? " · excluded" : ""),
         c.age_at_pick != null ? `Age (season start): ${c.age_at_pick}` : null,
-        c.description ? `Note: ${c.description}` : null,
-        c.died_at ? `Died: ${c.died_at}` : null,
-        c.wiki_url ? c.wiki_url : null,
-        db.getAkas(c.id).length
-          ? `AKA: ${db.getAkas(c.id).join(", ")}`
-          : null,
-        db.getBlacklist(c.id).length
-          ? `Blacklist: ${db.getBlacklist(c.id).join(", ")}`
-          : null,
+        note ? `Note: ${note}` : null,
+        c.died_at ? `Died: ${oneLine(c.died_at)}` : null,
+        url,
+        akas.length ? `AKA: ${akas.join(", ")}` : null,
+        blocked.length ? `Blacklist: ${blocked.join(", ")}` : null,
         winners.length
-          ? `Picked by: ${winners.map((w) => w.display_name).join(", ")}`
+          ? `Picked by: ${winners.map((w) => sanitizeDisplayName(w.display_name)).join(", ")}`
           : "Picked by nobody",
       ]
         .filter(Boolean)
         .join("\n");
     });
-    await msg.reply(lines.join("\n\n").slice(0, 1900));
+    const lines = [];
+    for (let i = 0; i < blocks.length; i++) {
+      if (i) lines.push("");
+      lines.push(blocks[i]);
+    }
+    await sendChunks(msg, chunkLines("", lines));
   },
 };
 
