@@ -45,7 +45,7 @@ When a pick dies, winners are pinged in the deathpool channel. Points = **`max(1
 
 ---
 
-## For admins — open the next season (M4/M5 flow)
+## For admins — open the next season
 
 Seasons are **announced** while the current one is still running:
 
@@ -56,9 +56,11 @@ Seasons are **announced** while the current one is still running:
 
 Need to re-post the sign-up embed? **`/announce-season repost:true`** (channel can be changed and is saved).
 
-**Automatic reminders (not actions):** on **Nov 1st** and **Dec 1st** (00:00 Vienna time), Gregg pings the admin if the next season has not been opened yet — a nudge to run `/announce-season` before the new year. It never announces for you; opening + seeding + channel choice stays manual.
+**First start / missing deathpool channel (interactive setup):** if the bot starts and no deathpool channel is linked yet (no `CHANNEL_DEATHPOOL` env, nothing stored in the DB), it asks in the **announce channel** which channel should be the deathpool for the new season. After you pick one, the year rollover continues automatically. `/status` shows which channel is linked (`_(per Start-Setup, noch keiner verknüpft)_` until then).
 
-**Automatic year rollover (Jan 1st):** at **00:00 Vienna time** the bot posts a year-review of the just-finished season, archives it, activates the announced season, **creates a fresh `deathpool-{YEAR}` channel** (name uses the new year) and gives **every player** view/send access. The Discord server is resolved automatically from the configured deathpool channel (same server the announcement went to) — no `DISCORD_GUILD_ID` needed. If no guild is resolvable at all, the switch still runs and just reuses the configured deathpool channel.
+**Automatic reminders (not actions):** on **Nov 1st** and **Dec 1st** (in the configured `TZ`, default `Europe/Vienna`), the bot pings the admin if the next season has not been opened yet — a nudge to run `/announce-season` before the new year. It never announces for you; opening + seeding + channel choice stays manual.
+
+**Automatic year rollover (Jan 1st):** at **00:00 config `TZ`** the bot posts a year-review of the just-finished season, archives it, activates the announced season, **creates a fresh `deathpool-{YEAR}` channel** (name uses the new year) and gives **every player** view/send access. The Discord server is resolved automatically from the configured/DB-stored deathpool channel (same server the announcement went to). If no guild is resolvable at all, the switch still runs and just reuses the configured deathpool channel. **At this moment the bot also writes a permanent `season-start` backup** (see *Backups* below) so the picks of the new season are safe no matter what.
 
 ---
 
@@ -67,7 +69,7 @@ Need to re-post the sign-up embed? **`/announce-season repost:true`** (channel c
 ### Check that everything’s healthy
 - **`/status`** — last poll, counts, recent hits, errors, channel config, seasons | 
 - **`/check`** — run a wiki check now (setup = quiet reconcile; live = full poll)
-- **`/season`** — season start / live flag
+- **`/season`** — season start date / live flag
 
 ### Fix bad hits (no full restart)
 | Situation | Command |
@@ -80,9 +82,20 @@ Need to re-post the sign-up embed? **`/announce-season repost:true`** (channel c
 | Pause live + reseed quietly | `/ungo confirm:true` |
 
 ### Lists, wiki, points
-- Celeb tools: `/celeb`, `/age`, `/wiki`, `/aka`, `/blacklist`, …  
-- Points: `/add-points`, `/set-points`, `/bonus`  
-- Backup/restore: `/restore` (see `/help`)
+- Celeb tools: `/celeb`, `/age`, `/wiki`, `/aka`, `/alias`, `/import` (sheet/name import), `/blacklist` …
+- Points: `/add-points`, `/set-points`, `/bonus`
+- Season control: `/go` (go live), `/ungo` (pause), `/kill`, `/resurrect`
+
+---
+
+## Backups
+
+Two independent layers keep your data safe:
+
+- **Nightly (02:00, config `TZ`):** a ZIP under `data/backups/` containing `deathbot.sqlite` (WAL checkpointed) plus a `manifest.json` (season, stats, reason). **Keeps the last 14**, older ones are pruned.
+- **Season-start (permanent):** whenever a new season is activated via the year rollover (Jan 1st cron or `/new-year`), the bot writes an additional ZIP into `data/backups/season-start/`. This one is **never pruned** — it stays for the whole year (and beyond) as the fallback that holds at least the tipps/picks of the new season, even if everything else fails.
+
+Restore: `/restore` lets you pick a backup (from `data/restore/`).
 
 ---
 
@@ -103,7 +116,7 @@ Deathpool messages use the roast phrase bank. **All-deaths** stays informative (
 1. Discord app with **Message Content Intent**  
 2. Invite with scopes **`bot`** + **`applications.commands`**  
 3. Copy `docker-compose.yml`, fill `environment:` (no `.env` file), mount `./data`  
-4. Set at least: `TOKEN`, `ADMIN_ID`, `CHANNEL_DEATHPOOL`, **`DISCORD_GUILD_ID`** (instant slash updates)
+4. Set at least: `TOKEN`, `ADMIN_ID`. Recommended: **`DISCORD_GUILD_ID`** (instant slash updates). `CHANNEL_DEATHPOOL` is now **optional** — if empty, the one-time interactive channel setup picks it (see above).
 
 ```bash
 docker compose pull
@@ -114,28 +127,37 @@ Image: `ghcr.io/emil007/deathbot-2000:latest`
 
 Non-admins may **see** admin slash commands in Discord’s picker (Discord limitation) but get denied at runtime. Only `ADMIN_ID` is enforced.
 
-### Useful settings
+### Environment variables
 
-| Setting | Default idea |
-|---------|----------------|
+| Variable | Meaning / values |
+|----------|------------------|
+| `TOKEN` | Discord bot token (**required**) |
+| `ADMIN_ID` | Discord user ID with admin rights (**required**) |
+| `PREFIX` | Legacy text-command prefix (`!` by default) |
+| `DATA_DIR` | Data folder inside the container (`/app/data`) |
+| `DISCORD_GUILD_ID` | Guild for instant slash-command updates (recommended) |
+| `CHANNEL_DEATHPOOL` | Deathpool channel ID — **optional now**; empty → interactive start setup |
+| `CHANNEL_ALL_DEATHS` | Optional factual feed |
+| `CHANNEL_ADMIN` | Optional ops channel; empty = DM-first |
+| `CHANNEL_LOG` | Optional log channel for inputs/changes/errors (no scan-run logs) |
+| `ADMIN_ROLE_ID` | Optional role id with admin rights |
+| `ALERT_EMOJI` / `ALERT_EMOJI_REPEAT` | Death-announce branding (default `⚰️`, repeat `3`) |
+| `TZ` | Time zone for cron (“killed today” boundary, rollover, reminders). Default `Europe/Vienna` |
 | `WIKI_POLLER_MINUTES` | How often to poll recent deaths (`30`) |
 | `NIGHTLY_FULL_SCRAPE_HOUR` | Full-year scrape (`3`) |
 | `DAILY_SUMMARY_HOUR` | Daily digest (`9`) |
 | `DEATH_CONFIRM_DAYS` | Days before a hit is locked (`7`) |
 | `MAX_PICKS_PER_PLAYER` | Max names per player list (whole draft, across DMs) (`50`) |
 | `USER_AGENT` | Wikipedia User-Agent (own repo + contact recommended) |
-| `CHANNEL_ALL_DEATHS` | Optional factual feed |
-| `CHANNEL_ADMIN` | Optional ops channel; empty = DM-first |
-| `CHANNEL_LOG` | Optional log channel for inputs/changes/errors (no scan-run logs) |
 | `CUSTOM_PHRASES` | `no` / `mix` / `only` (+ `data/custom_phrases.txt`) |
-| `TZ` | Cron + “killed today” status day boundary |
+| `PHRASES_BANK` | Built-in roast bank: **`new`** (default, ~241 gemeine Sätze) / `old` (legacy 542) / `custom` |
 
 Bot presence: **Already N People killed today!** after the first all-deaths post; at **0** → `lurking.... bloody cats!`. Resets at local midnight (`TZ`).
 
-Nightly DB zip backup at **02:00** under `data/backups/` — keeps the **last 14** files.
+Nightly DB zip backup at **02:00** (`TZ`) under `data/backups/` — keeps the **last 14** files (see *Backups* for the permanent season-start copy).
 
 ---
 
 ## Quick mental model
 
-**Admin** announces the next season (`/announce-season`) → **players** hand in picks via DM → the bot auto-links names and reviews the unsure ones → **Admin** confirms (`/review`) → on the start day **`/new-year activate:true`** archives the old / activates the new season → bot watches Wikipedia → deathpool scores the pool, all-deaths (optional) shows the wider list → use **`/status`** / **`/invalidate`** when something looks wrong.
+**Admin** announces the next season (`/announce-season`) → **players** hand in picks via DM → the bot auto-links names and reviews the unsure ones → **Admin** confirms (`/review`) → on the start day **`/new-year activate:true`** archives the old / activates the new season and writes the permanent season-start backup → bot watches Wikipedia → deathpool scores the pool, all-deaths (optional) shows the wider list → use **`/status`** / **`/invalidate`** when something looks wrong.
