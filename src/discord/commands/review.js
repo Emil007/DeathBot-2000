@@ -11,15 +11,27 @@ const cmd = {
   examples: ["/review", "/review scope:pool", "{prefix}review"],
   details:
     "Zeigt standardmäßig die Anmeldungs-Queue (2027). scope:pool = laufender Pool. Nach /import erscheinen Karten mit Buttons; /review zeigt die nächste. Mit CHANNEL_ADMIN landen Karten dort.",
-  parseSlash() {
-    return [];
+  options: [
+    {
+      name: "scope",
+      description: "next (2027-Anmeldung) oder pool (laufender Pool)",
+      type: "STRING",
+      required: false,
+    },
+  ],
+  parseSlash(interaction) {
+    const s = interaction.options.getString("scope");
+    return s ? [`scope:${s}`] : [];
   },
   async run(ctx, args, msg) {
-    const scope = args.find((a) => String(a).toLowerCase().startsWith("scope:"));
-    const seasonId = scope && scope.split(":")[1] ? Number(scope.split(":")[1]) : undefined;
+    // F18: pool NICHT durch Number schicken — NaN fragt nach season_id NaN ab
+    // und findet nie etwas. explizit pool => laufender Pool (seasonId undefined),
+    // sonst die 2027-Anmeldungs-Queue.
+    const wantPool = args.some(
+      (a) => a === "pool" || String(a).toLowerCase().startsWith("scope:pool")
+    );
     const announced = db.getAnnouncedSeason();
-    // Wenn kein scope übergeben und eine announced-Saison existiert: die Anmeldung-Queue zeigen
-    const effSeasonId = seasonId ?? (announced && !args.some((a) => a === "pool" || String(a).startsWith("scope:pool")) ? announced.id : undefined);
+    const effSeasonId = wantPool ? undefined : announced?.id ?? undefined;
     const n = db.countPendingReviews({ seasonId: effSeasonId });
     if (!n) {
       await msg.reply("Review-Warteschlange ist leer.");
@@ -37,7 +49,7 @@ const cmd = {
           : ":")
     );
     if (effSeasonId && announced?.id === effSeasonId) {
-      const { queueCelebsForReview, sendNextReview } = require("../celeb-review");
+      const { sendNextReview } = require("../celeb-review");
       await sendNextReview(ctx, target || msg.channel, { season: announced, seasonId: effSeasonId });
     } else {
       await sendNextReview(ctx, target || msg.channel);

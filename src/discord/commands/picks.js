@@ -38,7 +38,7 @@ const cmd = {
         return;
       }
     }
-    await respondPick(ctx, target, msg.author.id, season);
+    await respondPick(ctx, target, msg.author.id, season, [], msg.author.username);
     if (msg.guildId && target !== msg.channel) {
       await msg.reply("Ich habe dir deine Tipp-Liste per DM geschickt — Namen einfach dort hin schreiben.");
     }

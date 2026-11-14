@@ -15,6 +15,24 @@ function reviewCustomId(action, celebId) {
   return `crev:${action}:${celebId}`;
 }
 
+/**
+ * Saison der Queue-Zeile eines Celebs — damit die Navigation (sendNextReview,
+ * lookupUrl, enqueueReview) in der announced-Saison bleibt statt in die aktive
+ * (2026) zu springen (F14).
+ */
+function seasonForQueue(celebId) {
+  const q = db
+    .getDb()
+    .prepare("SELECT season_id FROM celeb_review_queue WHERE celeb_id = ?")
+    .get(celebId);
+  if (!q?.season_id) {
+    const s = db.getActiveSeason();
+    return { season: s, seasonId: s.id };
+  }
+  const season = db.getDb().prepare("SELECT * FROM seasons WHERE id = ?").get(q.season_id);
+  return { season, seasonId: q.season_id };
+}
+
 function parseReviewCustomId(id) {
   const m = String(id).match(/^crev:(\w+):(\d+)$/);
   if (!m) return null;
@@ -272,6 +290,26 @@ async function handleReviewInteraction(ctx, interaction) {
       await interaction.reply({ content: "Ungültiges Alter.", ephemeral: true });
       return true;
     }
+    const { season, seasonId } = seasonForQueue(celebId);
+    const isAnnounced = season?.phase === "announced";
+    if (isAnnounced) {
+      // Das maßgebliche 2027er-Alter liegt auf picks.age_at_pick (F15):
+      // Feed alle Spieler, die den Celeb in dieser Saison gepickt haben.
+      const info = db
+        .getDb()
+        .prepare("UPDATE picks SET age_at_pick = ? WHERE celeb_id = ? AND season_id = ?")
+        .run(age, celebId, seasonId);
+      db.getDb()
+        .prepare(
+          `UPDATE celeb_review_queue SET proposed_age = ?, updated_at = datetime('now') WHERE celeb_id = ?`
+        )
+        .run(age, celebId);
+      await interaction.reply({
+        content: `Alter = **${age}** (${info.changes} Player-Picks in Saison ${season.year}). Danach Confirm.`,
+        ephemeral: true,
+      });
+      return true;
+    }
     const result = db.setCelebAge(celebId, age);
     if (!result.ok) {
       await interaction.reply({
@@ -296,7 +334,7 @@ async function handleReviewInteraction(ctx, interaction) {
     const celebId = Number(interaction.customId.split(":")[2]);
     const url = interaction.fields.getTextInputValue("url").trim();
     const celeb = db.getDb().prepare("SELECT * FROM celebs WHERE id = ?").get(celebId);
-    const season = db.getActiveSeason();
+    const { season, seasonId } = seasonForQueue(celebId);
     try {
       const proposal = await lookupUrl(
         ctx.config.userAgent,
@@ -304,13 +342,13 @@ async function handleReviewInteraction(ctx, interaction) {
         season.start_date,
         celeb?.sheet_age_hint
       );
-      db.enqueueReview(celebId, proposal);
+      db.enqueueReview(celebId, proposal, { seasonId });
       db.clearUrlWait(interaction.user.id);
       await interaction.reply({
         content: `Vorschlag für **${celeb?.name}**: ${proposal.wikiUrl} · Alter ${proposal.proposedAge ?? "?"} · QID ${proposal.qid || "—"}`,
         ephemeral: true,
       });
-      await sendNextReview(ctx, interaction.channel);
+      await sendNextReview(ctx, interaction.channel, { season, seasonId });
     } catch (e) {
       await interaction.reply({ content: `Lookup fehlgeschlagen: ${e.message}`, ephemeral: true });
     }
@@ -344,6 +382,7 @@ async function handleReviewInteraction(ctx, interaction) {
       await interaction.reply({ content: "Treffer ungültig.", ephemeral: true });
       return true;
     }
+    const { season, seasonId } = seasonForQueue(celebId);
     db.enqueueReview(celebId, {
       wikiUrl: chosen.url,
       wikiNorm: chosen.norm,
@@ -352,13 +391,13 @@ async function handleReviewInteraction(ctx, interaction) {
       qid: chosen.qid,
       candidates,
       thumb: chosen.thumb,
-    });
+    }, { seasonId });
     await interaction.update({
       content: `Gewählt: **${chosen.title}**. Jetzt Confirm.`,
       embeds: [],
       components: [],
     });
-    await sendNextReview(ctx, interaction.channel);
+    await sendNextReview(ctx, interaction.channel, { season, seasonId });
     return true;
   }
 
@@ -366,12 +405,13 @@ async function handleReviewInteraction(ctx, interaction) {
 
   if (action === "confirm") {
     confirmFromProposal(celebId, celeb, q);
+    const { season, seasonId } = seasonForQueue(celebId);
     await interaction.update({
       content: `Bestätigt **${celeb.name}** → Auto-Match an.`,
       embeds: [],
       components: [],
     });
-    await sendNextReview(ctx, interaction.channel);
+    await sendNextReview(ctx, interaction.channel, { season, seasonId });
     return true;
   }
 
@@ -380,29 +420,32 @@ async function handleReviewInteraction(ctx, interaction) {
       age: q?.proposed_age ?? celeb.age_at_pick ?? celeb.sheet_age_hint,
       manualOnly: true,
     });
+    const { season, seasonId } = seasonForQueue(celebId);
     await interaction.update({
       content: `**${celeb.name}** = manual-only (kein Wiki-Auto-Kill).`,
       embeds: [],
       components: [],
     });
-    await sendNextReview(ctx, interaction.channel);
+    await sendNextReview(ctx, interaction.channel, { season, seasonId });
     return true;
   }
 
   if (action === "skip") {
+    const { season, seasonId } = seasonForQueue(celebId);
+    // Neu-Einreihung hinten mit DERSELBEN Saison — nie in die aktive/NULL-Queue.
     db.getDb().prepare(`DELETE FROM celeb_review_queue WHERE celeb_id = ?`).run(celebId);
     db.enqueueReview(celebId, {
       wikiUrl: q?.proposed_wiki_url,
       proposedAge: q?.proposed_age,
       lang: q?.proposed_lang,
       candidates: parseCandidates(q, null),
-    });
+    }, { seasonId });
     await interaction.update({
       content: `**${celeb.name}** übersprungen (ans Ende).`,
       embeds: [],
       components: [],
     });
-    await sendNextReview(ctx, interaction.channel);
+    await sendNextReview(ctx, interaction.channel, { season, seasonId });
     return true;
   }
 
@@ -462,7 +505,7 @@ async function tryConsumeReviewUrl(ctx, msg) {
 
   db.clearUrlWait(msg.author.id);
   const celeb = db.getDb().prepare("SELECT * FROM celebs WHERE id = ?").get(wait.celeb_id);
-  const season = db.getActiveSeason();
+  const { season, seasonId } = seasonForQueue(wait.celeb_id);
   try {
     const proposal = await lookupUrl(
       ctx.config.userAgent,
@@ -470,11 +513,11 @@ async function tryConsumeReviewUrl(ctx, msg) {
       season.start_date,
       celeb.sheet_age_hint
     );
-    db.enqueueReview(wait.celeb_id, proposal);
+    db.enqueueReview(wait.celeb_id, proposal, { seasonId });
     await msg.reply(
       `Vorschlag **${celeb.name}**: ${proposal.wikiUrl} · Alter ${proposal.proposedAge ?? "?"} · QID ${proposal.qid || "—"}. \`/review\` fortsetzen.`
     );
-    await sendNextReview(ctx, msg.channel);
+    await sendNextReview(ctx, msg.channel, { season, seasonId });
   } catch (e) {
     await msg.reply(`Lookup fehlgeschlagen: ${e.message}`);
   }
@@ -487,4 +530,6 @@ module.exports = {
   handleReviewInteraction,
   tryConsumeReviewUrl,
   buildReviewButtons,
+  seasonForQueue,
+  reviewCustomId,
 };

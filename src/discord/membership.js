@@ -27,11 +27,14 @@ async function canParticipate(client, config, userId) {
   try {
     const member = await channel.guild.members.fetch(userId);
     if (member) {
+      const isAdmin = String(userId) === String(config.adminId);
       const perms = channel.permissionsFor(member);
-      if (!perms?.has("ViewChannel")) {
-        return { ok: false, reason: "not-member" };
+      // Admin darf auch ohne ViewChannel durch (Test-/Prüfflow vor echtem
+      // Teilnehmer). Sonst braucht es die Kanalsichtbarkeit (F12).
+      if (isAdmin || perms?.has("ViewChannel")) {
+        return { ok: true, season };
       }
-      return { ok: true, season };
+      return { ok: false, reason: "not-member" };
     }
   } catch (e) {
     // 10007 = Unknown Member

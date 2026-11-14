@@ -17,7 +17,7 @@ const { canParticipate } = require("./membership");
 const { proposeWikiForName, lookupUrl } = require("../wiki/page-lookup");
 const { queueCelebsForReview, sendNextReview } = require("./celeb-review");
 const { resolveAdminTarget } = require("./admin-notify");
-const { logEvent } = require("./log");
+const { logEvent, logError } = require("./log");
 
 const DONE_RE = /^(fertig|done|end|liste fertig)$/i;
 const REMOVE_RE = /^entfern\w*\s+(\d+)$/i;
@@ -29,13 +29,16 @@ const WIKI_URL_RE = /^(?:https?:\/\/)?(?:en|de)\.wikipedia\.org\/wiki\/[^\s]+$/i
 
 /** In-Memory-Queue: ein Wiki-Auflösungs-Lauf pro User, nicht parallel. */
 const busyUsers = new Set();
+/** User, die während ihres Laufs weitere Namen geschickt haben (Nachlauf). */
+const rerunUsers = new Set();
 
 /** link_status je nach Proposal. Exportiert für Tests. */
 function classifyProposal(proposal) {
   const cands = proposal?.candidates || [];
   if (!proposal?.wikiUrl) return { linkStatus: "unlinked" };
-  const distinctQids = new Set(cands.map((c) => c.qid).filter(Boolean));
-  if (cands.length >= 2 && distinctQids.size >= 2) return { linkStatus: "ambiguous" };
+  // Zwei Treffer sind eine Auswahl — auch wenn weiter einer ohne QID ist (F22):
+  // ein stilles Verknüpfen auf den ersten Treffer wäre falsch.
+  if (cands.length >= 2) return { linkStatus: "ambiguous" };
   return { linkStatus: "linked" };
 }
 
@@ -91,16 +94,16 @@ function buildPickSelect(entries) {
   return new ActionRowBuilder().addComponents(menu);
 }
 
-async function respondPick(ctx, channel, userId, season, extra = []) {
+async function respondPick(ctx, channel, userId, season, extra = [], displayName = null) {
   let player = db
     .getDb()
     .prepare("SELECT * FROM players WHERE discord_user_id = ?")
     .get(String(userId));
   if (!player) {
-    const info = db
-      .prepare("INSERT INTO players (display_name, discord_user_id, base_points) VALUES (?, ?, 0)")
-      .run(String(userId), String(userId));
-    player = db.getDb().prepare("SELECT * FROM players WHERE id = ?").get(info.lastInsertRowid);
+    player = db.upsertPlayer({
+      displayName: displayName || String(userId),
+      discordUserId: String(userId),
+    });
   }
   const draft = db.getOrCreateDraft(player.id, season.id);
   const entries = draft.status === "finalized" ? enrichDeadFlags(listDraftEntriesForFinalized(player.id, season.id)) : db.listDraftEntries(draft.id);
@@ -432,6 +435,10 @@ async function tryConsumePickMessage(ctx, msg) {
       await msg.reply("Noch keine Liste angelegt.");
       return true;
     }
+    if (draft.status !== "draft") {
+      await msg.reply(`Deine Liste ist eingefroren — mit \`unlock\` öffnest du sie wieder, um Namen zu ändern.`);
+      return true;
+    }
     const entries = db.listDraftEntries(draft.id);
     const entry = entries[num - 1];
     if (!entry) {
@@ -459,6 +466,10 @@ async function tryConsumePickMessage(ctx, msg) {
     const draft = player && db.getDraftForPlayer(player.id, season.id);
     if (!draft) {
       await msg.reply("Noch keine Liste angelegt.");
+      return true;
+    }
+    if (draft.status !== "draft") {
+      await msg.reply(`Deine Liste ist eingefroren — mit \`unlock\` öffnest du sie wieder, um Namen zu ändern.`);
       return true;
     }
     const entries = db.listDraftEntries(draft.id);
@@ -511,46 +522,84 @@ async function tryConsumePickMessage(ctx, msg) {
  * stecken in proposeWikiForName.
  */
 async function resolvePendingSynchronous(ctx, channel, userId, season, draftId, mode) {
-  if (busyUsers.has(userId)) return;
+  // Bereits laufende Auflösung: nicht droppen, sondern Nachlauf anfordern (F9).
+  // Die parallel eingetroffene DM hat ihre Namen schon in die DB geschrieben —
+  // der laufende Lauf verarbeitet sie nach seinem aktuellen Durchlauf.
+  if (busyUsers.has(userId)) {
+    rerunUsers.add(userId);
+    return;
+  }
   busyUsers.add(userId);
+  let progressMsg = null;
   try {
-    const entries = db.listDraftEntries(draftId);
-    for (const e of entries) {
-      if (e.link_status !== "pending") continue;
-      try {
-        const proposal = await proposeWikiForName(
-          ctx.config.userAgent,
-          e.raw_name,
-          season.start_date,
-          null
-        );
-        const { linkStatus } = classifyProposal(proposal);
-        if (linkStatus === "ambiguous") {
-          db.setDraftEntryLinked(e.id, {
-            wikiUrl: proposal.wikiUrl,
-            wikiNorm: proposal.wikiNorm,
-            qid: proposal.qid,
-            proposedAge: proposal.proposedAge,
-            candidates_json: JSON.stringify(proposal.candidates || []),
-            linkStatus,
-          });
-        } else if (linkStatus === "linked") {
-          db.setDraftEntryLinked(e.id, {
-            wikiUrl: proposal.wikiUrl,
-            wikiNorm: proposal.wikiNorm,
-            qid: proposal.qid,
-            proposedAge: proposal.proposedAge,
-            linkStatus,
-          });
-        } else {
-          db.setDraftEntryLinked(e.id, { linkStatus });
-        }
-      } catch (e) {
-        console.warn("[pick] propose failed", e.raw_name, e.message);
-        db.setDraftEntryLinked(e.id, { linkStatus: "unlinked" });
+    do {
+      rerunUsers.delete(userId);
+      const entries = db.listDraftEntries(draftId);
+      const pendings = entries.filter((e) => e.link_status === "pending");
+      if (!pendings.length) break;
+      // F25: Fortschritt statt stillem Warten bei langen Listen
+      if (channel.send && !progressMsg) {
+        progressMsg = await channel
+          .send({ content: `Auflösung läuft… 0/${entries.length}` })
+          .catch(() => null);
       }
+      let i = 0;
+      for (const e of pendings) {
+        i++;
+        if (progressMsg?.edit) {
+          await progressMsg
+            .edit({ content: `Auflösung ${i}/${entries.length}: ${e.raw_name}` })
+            .catch(() => {});
+        }
+        try {
+          const proposal = await proposeWikiForName(
+            ctx.config.userAgent,
+            e.raw_name,
+            season.start_date,
+            null
+          );
+          const { linkStatus } = classifyProposal(proposal);
+          if (linkStatus === "ambiguous") {
+            db.setDraftEntryLinked(e.id, {
+              wikiUrl: proposal.wikiUrl,
+              wikiNorm: proposal.wikiNorm,
+              qid: proposal.qid,
+              proposedAge: proposal.proposedAge,
+              candidatesJson: JSON.stringify(proposal.candidates || []),
+              linkStatus,
+            });
+          } else if (linkStatus === "linked") {
+            db.setDraftEntryLinked(e.id, {
+              wikiUrl: proposal.wikiUrl,
+              wikiNorm: proposal.wikiNorm,
+              qid: proposal.qid,
+              proposedAge: proposal.proposedAge,
+              candidatesJson: JSON.stringify(proposal.candidates || []),
+              linkStatus,
+            });
+          } else {
+            db.setDraftEntryLinked(e.id, {
+              linkStatus,
+              candidatesJson: JSON.stringify(proposal.candidates || []),
+            });
+          }
+        } catch (err) {
+          // Ein Wiki-Fehler ist KEIN "kein Treffer": wird NICHT pending gelassen,
+          // sondern als unlinked markiert — sonst blockt `fertig` dauerhaft (F8).
+          console.warn("[pick] propose failed", e.raw_name, err.message);
+          db.setDraftEntryLinked(e.id, { linkStatus: "unlinked", candidatesJson: null });
+          logError(ctx.client, ctx.config, err, {
+            where: "pick propose " + e.raw_name,
+            userId,
+          }).catch(() => {});
+        }
+      }
+    } while (rerunUsers.has(userId));
+
+    if (progressMsg?.edit) {
+      await progressMsg.edit({ content: "Auflösung abgeschlossen." }).catch(() => {});
     }
-    // Fortschritt zeigen (falls es Ambiguities gibt)
+    // Ambiguities nochmal zeigen
     const all = db.listDraftEntries(draftId);
     if (all.some((x) => x.link_status === "ambiguous")) {
       const select = buildPickSelect(all);

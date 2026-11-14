@@ -49,6 +49,15 @@ const cmd = {
       await msg.reply(usageReply(cmd, ctx.config));
       return;
     }
+    const current = db.getActiveSeason();
+    // F13: Eine laufende Saison hat einen festen Stichtag. Das 2027er-Datum wird
+    // ausschliesslich ueber /announce-season gesetzt, nie auf die aktive Zeile.
+    if (current.phase === "running" && current.live === 1) {
+      await msg.reply(
+        "Startdatum der laufenden Saison ist fest. Das naechste Datum setzt `/announce-season` — dieses Kommando geht nur in der Setup-Phase."
+      );
+      return;
+    }
     const s = db.setSeasonStartDate(d);
     await msg.reply(
       `Startdatum gesetzt: **${s.start_date}** (Alter in Listen = Stand dieses Tags). Live=${s.live ? "ja" : "nein"}`

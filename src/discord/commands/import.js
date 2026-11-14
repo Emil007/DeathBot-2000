@@ -60,17 +60,19 @@ function applyImportRows(player, rows) {
         } else if (row.diedAt && !fresh.is_alive) {
           const existing = db
             .getDb()
-            .prepare("SELECT 1 FROM death_awards WHERE celeb_id = ? AND player_id = ?")
-            .get(celeb.id, player.id);
+            .prepare(
+              "SELECT 1 FROM death_awards WHERE celeb_id = ? AND player_id = ? AND season_id = ?"
+            )
+            .get(celeb.id, player.id, season.id);
           if (!existing) {
             const score = db.scoreForAge(fresh.age_at_pick ?? fresh.sheet_age_hint);
             if (score > 0) {
               db.addPoints(player.id, score);
               db.getDb()
                 .prepare(
-                  `INSERT INTO death_awards (celeb_id, player_id, points) VALUES (?, ?, ?)`
+                  `INSERT INTO death_awards (celeb_id, player_id, points, season_id) VALUES (?, ?, ?, ?)`
                 )
-                .run(celeb.id, player.id, score);
+                .run(celeb.id, player.id, score, season.id);
               deadAwarded++;
             }
           }

@@ -63,9 +63,6 @@ CREATE TABLE IF NOT EXISTS celeb_review_queue (
   FOREIGN KEY (celeb_id) REFERENCES celebs(id) ON DELETE CASCADE
 );
 
-CREATE INDEX IF NOT EXISTS idx_review_season_status
-  ON celeb_review_queue(season_id, status);
-
 CREATE TABLE IF NOT EXISTS picks (
   player_id INTEGER NOT NULL,
   celeb_id INTEGER NOT NULL,
@@ -130,9 +127,6 @@ CREATE TABLE IF NOT EXISTS death_awards (
   FOREIGN KEY (celeb_id) REFERENCES celebs(id) ON DELETE CASCADE,
   FOREIGN KEY (player_id) REFERENCES players(id) ON DELETE CASCADE
 );
-
-CREATE UNIQUE INDEX IF NOT EXISTS idx_death_awards_celeb_player_season
-  ON death_awards(celeb_id, player_id, season_id);
 
 CREATE TABLE IF NOT EXISTS celeb_url_wait (
   admin_user_id TEXT PRIMARY KEY,
@@ -318,14 +312,9 @@ function migrate(db) {
       UPDATE death_awards SET season_id = (SELECT id FROM seasons WHERE active = 1 LIMIT 1)
       WHERE season_id IS NULL;
     `);
-    // Unique-Index auf (celeb_id, player_id) würde 2027 die zweite Gutschrift
-    // derselben Person blockieren -> saisonweiter Index, NULL-gestückter Altbestand
-    // ist damit verloren, applyDeath schreibt ab diesem Release immer season_id mit.
-    db.exec(`DROP INDEX IF EXISTS idx_death_awards_celeb_player`);
-    db.exec(`
-      CREATE UNIQUE INDEX IF NOT EXISTS idx_death_awards_celeb_player_season
-        ON death_awards(celeb_id, player_id, season_id);
-    `);
+    // Achtung: der alte Personen-Index (celeb_id, player_id) darf hier NICHT neu
+    // angelegt werden — er blockt die zweite Saison-Gutschrift. Der Final-Block
+    // am Ende von migrate droppt ihn und legt den saisonweiten an.
   }
 
   // M2: QID auf den All-Deaths-Tabellen (nullable, kein Backfill über Bestand)
@@ -334,23 +323,12 @@ function migrate(db) {
   const annCols = cols("announced_deaths");
   if (annCols.size && !annCols.has("qid")) db.exec(`ALTER TABLE announced_deaths ADD COLUMN qid TEXT`);
 
-  // Dedupe death_awards before unique index
-  db.exec(`
-    DELETE FROM death_awards
-    WHERE id NOT IN (
-      SELECT MIN(id) FROM death_awards GROUP BY celeb_id, player_id
-    );
-  `);
-
   db.exec(`
     CREATE UNIQUE INDEX IF NOT EXISTS idx_celebs_wiki_url_norm
       ON celebs(wiki_url_norm) WHERE wiki_url_norm IS NOT NULL;
 
     CREATE UNIQUE INDEX IF NOT EXISTS idx_celebs_wikidata_id
       ON celebs(wikidata_id) WHERE wikidata_id IS NOT NULL;
-
-    CREATE UNIQUE INDEX IF NOT EXISTS idx_death_awards_celeb_player
-      ON death_awards(celeb_id, player_id);
 
     CREATE TABLE IF NOT EXISTS celeb_review_queue (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -381,9 +359,6 @@ function migrate(db) {
       expires_at TEXT NOT NULL,
       FOREIGN KEY (celeb_id) REFERENCES celebs(id) ON DELETE CASCADE
     );
-
-    CREATE INDEX IF NOT EXISTS idx_review_season_status
-      ON celeb_review_queue(season_id, status);
 
     CREATE TABLE IF NOT EXISTS pick_drafts (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -422,6 +397,23 @@ function migrate(db) {
       FOREIGN KEY (player_id) REFERENCES players(id) ON DELETE CASCADE
     );
   `);
+
+  // Saison-Indizes erst NACH den ALTERs anlegen: Auf einer Live-DB vor M3 fehlen
+  // season_id-Spalten noch, ein Index im SCHEMA-String haette den Start crasht.
+  // Ausserdem den alten Personen-Index (celeb_id, player_id) droppen.
+  const finalReviewCols = cols("celeb_review_queue");
+  if (finalReviewCols.size && finalReviewCols.has("season_id")) {
+    db.exec(
+      "CREATE INDEX IF NOT EXISTS idx_review_season_status ON celeb_review_queue(season_id, status)"
+    );
+  }
+  const finalAwardCols = cols("death_awards");
+  if (finalAwardCols.size && finalAwardCols.has("season_id")) {
+    db.exec("DROP INDEX IF EXISTS idx_death_awards_celeb_player");
+    db.exec(
+      "CREATE UNIQUE INDEX IF NOT EXISTS idx_death_awards_celeb_player_season ON death_awards(celeb_id, player_id, season_id)"
+    );
+  }
 }
 
 module.exports = { SCHEMA, migrate };
