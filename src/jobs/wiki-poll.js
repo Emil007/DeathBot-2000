@@ -343,24 +343,85 @@ async function runWikiPollInner(client, config, { mode = "live" } = {}) {
   }
 
   if ((mode === "live" || mode === "nightly") && config.channelAllDeaths) {
-    for (const e of uniqueNewEn) {
+    // M2: Identitäten einmal pro Kandidat auflösen, dann deduplicieren.
+    const { planAnnouncements } = require("../wiki/announce-dedup");
+    const { fetchDeathBrief } = require("../wiki/death-brief");
+
+    const candidates = [...uniqueNewEn, ...newDeOnly];
+    // Nur Einträge, deren EN-Pendant NICHT schon in diesem Poll gedealt wird,
+    // und die nicht bereits gestempelt sind, bekommen eine eigene brief-Auflösung.
+    const deferredIds = new Set(deferredDeEn.map((t) => t.deId));
+    const resolvable = candidates.filter((e) => !deferredIds.has(e.id));
+
+    const history = db.recentAnnouncedIdentities(
+      new Date(Date.now() - config.deathConfirmDays * 2 * 24 * 60 * 60 * 1000)
+        .toISOString()
+        .slice(0, 19)
+        .replace("T", " ")
+    );
+
+    const resolvedEntries = [];
+    for (const e of resolvable) {
+      if (e.resolved) {
+        resolvedEntries.push(e);
+        continue;
+      }
+      let brief = null;
       try {
-        await announceAllDeath(client, config, e, { isDeOnly: false });
-        db.markWikiAnnounced(e.id);
+        brief = await fetchDeathBrief(e.url, config.userAgent, {
+          listText: e.text,
+          beruf: e.beruf || null,
+          redName: !!e.redName,
+        });
+        e.resolved = {
+          qid: brief.qid || null,
+          isHuman: brief.isHuman ?? null,
+          url: brief.url || e.url,
+          pageMissing: !!brief.pageMissing,
+          error: null,
+        };
+        e.brief = brief;
       } catch (err) {
-        console.error("[poll] all-death EN", err.message);
+        e.resolved = { qid: null, isHuman: null, url: e.url, pageMissing: false, error: err.message };
+        console.warn("[poll] brief resolve failed", e.id, err.message);
+      }
+      resolvedEntries.push(e);
+    }
+
+    const { post, bind, defer } = planAnnouncements(resolvedEntries, history);
+    for (const d of defer) {
+      console.log(
+        new Date().toISOString(),
+        "[poll] deferring (resolve error) — not stamped",
+        d.id
+      );
+    }
+
+    for (const e of post) {
+      try {
+        await announceAllDeath(client, config, e, {
+          isDeOnly: e.lang === "de",
+          brief: e.brief || undefined,
+        });
+        db.markWikiAnnounced(e.id, null, e.resolved?.qid || null);
+      } catch (err) {
+        console.error("[poll] all-death", e.lang, err.message);
       }
     }
-    for (const e of newDeOnly) {
-      try {
-        await announceAllDeath(client, config, e, { isDeOnly: true });
-        db.markWikiAnnounced(e.id);
-      } catch (err) {
-        console.error("[poll] all-death DE", err.message);
+    // Verlierer erst stempeln, wenn ihr Gewinner wirklich gesendet wurde.
+    for (const b of bind) {
+      if (b.loserId === b.winnerId) {
+        // historisch bereits gepostet — nicht erneut posten, nur sicher stempeln
+        db.markWikiAnnounced(b.loserId);
+        continue;
       }
+      const winnerRow = db
+        .getDb()
+        .prepare("SELECT announced_at FROM wiki_seen WHERE entry_id = ?")
+        .get(b.winnerId);
+      if (winnerRow?.announced_at) db.markWikiAnnounced(b.loserId);
     }
-    // Stamp DE only after its EN counterpart is really announced — survives EN
-    // send failures (both stay un-announced → retried next poll).
+    // DE-nur-Verlierer der EN-Brücke wie bisher (deferredDeEn) nachziehen.
     for (const t of deferredDeEn) {
       const enRow = db
         .getDb()

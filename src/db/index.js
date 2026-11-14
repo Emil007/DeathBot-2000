@@ -1273,27 +1273,53 @@ function isWikiSeen(entryId) {
 
 function markWikiSeen(entry) {
   db.prepare(
-    `INSERT OR IGNORE INTO wiki_seen (entry_id, lang, text, url) VALUES (?, ?, ?, ?)`
-  ).run(entry.id, entry.lang || null, entry.text || null, entry.url || null);
+    `INSERT OR IGNORE INTO wiki_seen (entry_id, lang, text, url, qid) VALUES (?, ?, ?, ?, ?)`
+  ).run(
+    entry.id,
+    entry.lang || null,
+    entry.text || null,
+    entry.url || null,
+    entry.qid || null
+  );
 }
 
 /** Non-recent marker for entries handled by a seed (never actually posted). */
 const ANNOUNCED_EPOCH = "1970-01-01 00:00:00";
 
-function markWikiAnnounced(entryId, at = null) {
+function markWikiAnnounced(entryId, at = null, qid = null) {
   // Stamp only the FIRST successful announce. Re-scrapes (restart seed, re-poll)
   // must never refresh announced_at, otherwise the daily summary counts every
   // known entry as "new since yesterday" after every container restart.
   const existing = db
-    .prepare("SELECT announced_at FROM wiki_seen WHERE entry_id = ?")
+    .prepare("SELECT announced_at, qid FROM wiki_seen WHERE entry_id = ?")
     .get(entryId);
   if (existing?.announced_at) return;
   const ts = at || db.prepare("SELECT datetime('now') AS t").get().t;
-  db.prepare(`UPDATE wiki_seen SET announced_at = ? WHERE entry_id = ?`).run(ts, entryId);
   db.prepare(
-    `INSERT OR IGNORE INTO announced_deaths (entry_id, name, url, lang, announced_at)
-     SELECT entry_id, text, url, lang, ? FROM wiki_seen WHERE entry_id = ?`
-  ).run(ts, entryId);
+    `UPDATE wiki_seen SET announced_at = ?, qid = COALESCE(?, qid) WHERE entry_id = ?`
+  ).run(ts, qid, entryId);
+  db.prepare(
+    `INSERT OR IGNORE INTO announced_deaths (entry_id, name, url, lang, qid, announced_at)
+     SELECT entry_id, text, url, lang, COALESCE(?, qid), ? FROM wiki_seen WHERE entry_id = ?`
+  ).run(qid, ts, entryId);
+}
+
+/**
+ * Identitäten der zuletzt angekündigten Karten für den Dedup vor dem Posten.
+ * @param {string} sinceIso Datum/Fenster (z.B. 14 Tage alt)
+ * @returns {{ qids: Set<string>, humanNames: Set<string> }}
+ */
+function recentAnnouncedIdentities(sinceIso) {
+  const rows = db
+    .prepare("SELECT qid, lang, url, name FROM announced_deaths WHERE announced_at >= ?")
+    .all(sinceIso);
+  const qids = new Set();
+  const humanNames = new Set();
+  for (const r of rows) {
+    if (r.qid) qids.add(r.qid);
+    if (r.name) humanNames.add(String(r.name).toLowerCase());
+  }
+  return { qids, humanNames };
 }
 
 function seedAllWikiSeen(entries) {
@@ -1620,6 +1646,7 @@ module.exports = {
   isWikiSeen,
   markWikiSeen,
   markWikiAnnounced,
+  recentAnnouncedIdentities,
   seedAllWikiSeen,
   repairAnnouncedBursts,
   countJunkAnnouncements,

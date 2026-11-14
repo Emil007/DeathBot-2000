@@ -142,7 +142,7 @@ async function announceRetraction(client, config, { celeb, awards }) {
   });
 }
 
-async function announceAllDeath(client, config, entry, { isDeOnly = false } = {}) {
+async function announceAllDeath(client, config, entry, { isDeOnly = false, brief: preBrief = null } = {}) {
   if (!config.channelAllDeaths) return;
   const channel = await client.channels.fetch(config.channelAllDeaths).catch(() => null);
   if (!channel?.isTextBased()) return;
@@ -152,11 +152,15 @@ async function announceAllDeath(client, config, entry, { isDeOnly = false } = {}
   // (the most useful line we have) and Kurzinfo must not repeat it.
   const redName = !!(entry && entry.redName);
 
-  const brief = await fetchDeathBrief(entry.url, config.userAgent, {
-    listText: entry.text,
-    beruf: entry.beruf || null,
-    redName: !!entry.redName,
-  });
+  // M2: ein bereits im Poll aufgelöster brief (qid, isHuman, pageMissing) wird
+  // wiederverwendet statt doppelt gefetcht zu werden. Sonst wie bisher.
+  const brief =
+    preBrief ||
+    (await fetchDeathBrief(entry.url, config.userAgent, {
+      listText: entry.text,
+      beruf: entry.beruf || null,
+      redName: !!entry.redName,
+    }));
 
   // If the linked article is NOT a person (band/org, e.g. "Died Pretty" for
   // Chris Welsh), keep the human name from the death-list line as card title.
@@ -227,6 +231,19 @@ async function announceAllDeath(client, config, entry, { isDeOnly = false } = {}
     listNote ||
     "_Neuer Eintrag auf der Wikipedia-Todesliste._";
 
+  // F05: Das Link-Feld zeigt NUR auf eine Personen-Seite (isHuman + Seite
+  // vorhanden). Band-/Org-/Sammelseiten und fehlende Artikel erscheinen dort
+  // nie — stattdessen die Listen-URL oder ein Hinweis.
+  let linkValue;
+  if (brief.isHuman === true && !brief.pageMissing) {
+    linkValue = `[Wikipedia](${brief.url || entry.url})`;
+  } else if (entry.listUrl) {
+    linkValue = `[Wikipedia-Liste](${entry.listUrl})`;
+  } else if (brief.pageMissing) {
+    linkValue = "Kein eigener Wikipedia-Artikel";
+  } else {
+    linkValue = `[Wikipedia](${brief.url || entry.url})`;
+  }
   const embed = new EmbedBuilder()
     .setColor(isDeOnly ? 0x3d4f5c : 0x2b3a42)
     .setTitle(isDeOnly ? `🇩🇪 ${name}` : `🌍 ${name}`)
@@ -240,7 +257,7 @@ async function announceAllDeath(client, config, entry, { isDeOnly = false } = {}
         : []),
       {
         name: "Link",
-        value: `[Wikipedia](${brief.url || entry.url})`,
+        value: linkValue,
       }
     )
     .setTimestamp(new Date());

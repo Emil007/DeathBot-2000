@@ -170,6 +170,7 @@ CREATE TABLE IF NOT EXISTS wiki_seen (
   lang TEXT,
   text TEXT,
   url TEXT,
+  qid TEXT,
   first_seen_at TEXT NOT NULL DEFAULT (datetime('now')),
   announced_at TEXT
 );
@@ -179,6 +180,7 @@ CREATE TABLE IF NOT EXISTS announced_deaths (
   name TEXT,
   url TEXT,
   lang TEXT,
+  qid TEXT,
   announced_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
@@ -312,6 +314,12 @@ function migrate(db) {
         ON death_awards(celeb_id, player_id, season_id);
     `);
   }
+
+  // M2: QID auf den All-Deaths-Tabellen (nullable, kein Backfill über Bestand)
+  const seenCols = cols("wiki_seen");
+  if (seenCols.size && !seenCols.has("qid")) db.exec(`ALTER TABLE wiki_seen ADD COLUMN qid TEXT`);
+  const annCols = cols("announced_deaths");
+  if (annCols.size && !annCols.has("qid")) db.exec(`ALTER TABLE announced_deaths ADD COLUMN qid TEXT`);
 
   // Dedupe death_awards before unique index
   db.exec(`

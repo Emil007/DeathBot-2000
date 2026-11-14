@@ -62,6 +62,14 @@ function firstPersonLink($el, lang) {
 }
 
 /**
+ * Red link (no article): Parsoid/HTML keeps /wiki/X?action=edit&redlink=1.
+ */
+function isRedLink(a) {
+  const href = String(a?.attribs?.href ?? a?.href ?? "") + (a?.attr ? String(a.attr("href") || "") : "");
+  return String(a?.attribs?.class || "").split(/\s+/).includes("new") || /[?&]redlink=1\b/.test(href) || /[?&]redlink=/i.test(href);
+}
+
+/**
  * True when a wiki path points to a LIST / navigational article (deaths index,
  * day-of-year lists, births lists) instead of a biography. Entries that link to
  * these must never be announced as deaths.
@@ -81,19 +89,38 @@ function isNavText(text) {
   );
 }
 
-function extractEntriesFromHtml(html, lang) {
+function extractEntriesFromHtml(html, lang, listUrl) {
   const $ = cheerio.load(html);
   const entries = [];
   const seen = new Set();
+
+  // listUrl: die gerade geholte Listen-/Monats-URL — für den „Kein eigener
+  // Artikel“-Fall (F05/F02) als verlässliche Fallback-Quelle.
 
   $(".mw-parser-output ul li").each((_, el) => {
     const $el = $(el);
     if ($el.parents("#toc, .navbox, .reflist, .references").length > 0) return;
 
+    // Ersten blauen Link als id/url nehmen; Rotlink als erster Anker ⇒ redName
     let wikiPath = null;
+    let redName = false;
     $el.find("a").each((__, a) => {
-      if (wikiPath) return;
-      wikiPath = wikiPathFromHref($(a).attr("href"), lang);
+      const $a = $(a);
+      const href = $a.attr("href");
+      if (isRedLink($a)) {
+        redName = true;
+        // rotlinks dürfen NICHT zur ID werden (Query ist schon abgeschnitten),
+        // aber wir brauchen einen blauen Treffer, falls vorhanden.
+        const p = wikiPathFromHref(href, lang);
+        if (p && !wikiPath) wikiPath = p;
+        return true; // weiter, ein späterer blauer Link zählt mehr
+      }
+      const p = wikiPathFromHref(href, lang);
+      if (p) {
+        wikiPath = p;
+        return false; // erster blauer Link gewinnt
+      }
+      return true;
     });
     // Drop entries pointing to Wikipedia list/nav pages (the EN wiki now keeps
     // finished months on their own pages and lists them in "Previous months"
@@ -107,6 +134,9 @@ function extractEntriesFromHtml(html, lang) {
     // Skip navigation / list-article text (robust against future nav formats)
     if (isNavText(text)) return;
 
+    // Die id bleibt IMMER en:${wikiPath} (auch bei Rotlink) — eine neue
+    // en:red:-Form würde schon gesehene Rotlink-Personen unter neuer ID
+    // erneut announcen. Die Dedup-Entscheidung fällt in planAnnouncements.
     const id = `${lang}:${wikiPath}`;
     if (seen.has(id)) return;
     seen.add(id);
@@ -135,12 +165,17 @@ function extractEntriesFromHtml(html, lang) {
       text,
       url: `https://${lang}.wikipedia.org${wikiPath}`,
       lang,
+      ...(redName ? { redName: true } : {}),
+      ...(listUrl ? { listUrl } : {}),
       ...(day != null ? { day } : {}),
     });
   });
 
+  // listUrl übergeben wir über einen Closure-Global, gesetzt von scrapeUrl.
+  listUrlRef = null;
   return entries;
 }
+
 
 function parseDayId(id) {
   if (!id) return null;
@@ -151,7 +186,7 @@ function parseDayId(id) {
 async function scrapeUrl(client, url, lang = "en") {
   try {
     const response = await client.get(url);
-    return extractEntriesFromHtml(response.data, lang);
+    return extractEntriesFromHtml(response.data, lang, url);
   } catch (e) {
     console.error("[wiki-en]", url, e.message);
     return [];

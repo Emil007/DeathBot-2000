@@ -149,6 +149,9 @@ function personNameFromText(text) {
     .replace(/\[\d+\]/g, "")
     .split(",")[0]
     .split("(")[0]
+    // Interlanguage-Suffixe wie "[pt]", "[ko]", "[nl]" ab dem NAMEN schneiden:
+    // sie gehörten nie zum Karten-Titel und zerstörten den Dedup-Key.
+    .replace(/\s*\[[a-zA-Z]{2,3}\]\s*$/g, "")
     .replace(/[\u0300-\u036f]+$/g, "") // orphan combining marks at end
     .replace(/[*†‡"'+]+$/g, "") // stray symbol artifacts at end
     .trim();
@@ -328,6 +331,8 @@ async function fetchDeathBrief(pageUrl, userAgent, { listText = null, beruf = nu
     thumb: null,
     url: pageUrl,
     isHuman: null,
+    qid: null,
+    pageMissing: false,
   };
 
   if (!parsed) return fallback;
@@ -353,7 +358,9 @@ async function fetchDeathBrief(pageUrl, userAgent, { listText = null, beruf = nu
     if (status !== 200) return fallback;
 
     const page = Object.values(data?.query?.pages || {})[0];
-    if (!page || page.missing != null) return fallback;
+    if (!page || page.missing != null) {
+      return { ...fallback, pageMissing: true };
+    }
 
     const name = stripDisambiguator(page.title) || nameGuess;
     const extract = firstSentences(page.extract);
@@ -458,6 +465,8 @@ async function fetchDeathBrief(pageUrl, userAgent, { listText = null, beruf = nu
         thumb: thumb || imgUrl || null,
         url: fullUrl || pageUrl,
         isHuman,
+        qid: qid || null,
+        pageMissing: false,
       };
     }
 
@@ -489,6 +498,8 @@ async function fetchDeathBrief(pageUrl, userAgent, { listText = null, beruf = nu
       thumb: thumb || imgUrl,
       url: fullUrl,
       isHuman,
+      qid: qid || null,
+      pageMissing: false,
     };
   } catch (e) {
     console.warn("[death-brief]", e.message);

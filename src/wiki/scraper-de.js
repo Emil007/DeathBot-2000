@@ -31,7 +31,7 @@ async function resolveEnglish(client, germanUrl) {
   return href || null;
 }
 
-function extractFromLists($, lang) {
+function extractFromLists($, lang, listUrl) {
   const entries = [];
   const seen = new Set();
   $(".mw-parser-output ul li").each((_, el) => {
@@ -65,6 +65,7 @@ function extractFromLists($, lang) {
       text,
       url: `https://${lang}.wikipedia.org${wikiPath}`,
       lang,
+      ...(listUrl ? { listUrl } : {}),
     });
   });
   return entries;
@@ -80,7 +81,7 @@ function isRedLink($a) {
 }
 
 /** Modern DE nekrolog months use wikitable rows: Tag | Name | Beruf | Alter | Beleg */
-function extractFromTables($, lang) {
+function extractFromTables($, lang, listUrl) {
   const entries = [];
   const seen = new Set();
   $(".mw-parser-output table.wikitable tr").each((_, el) => {
@@ -162,6 +163,7 @@ function extractFromTables($, lang) {
       ...(redName ? { redName: true } : {}),
       ...(beruf ? { beruf } : {}),
       ...(deathDate ? { ...deathDate } : {}),
+      ...(listUrl ? { listUrl } : {}),
     });
   });
   return entries;
@@ -230,8 +232,8 @@ async function scrapeUrl(client, url) {
   try {
     const response = await client.get(url);
     const $ = cheerio.load(response.data);
-    const fromTables = extractFromTables($, "de");
-    const fromLists = extractFromLists($, "de");
+    const fromTables = extractFromTables($, "de", url);
+    const fromLists = extractFromLists($, "de", url);
     // Prefer whichever found more (tables dominate modern monthly pages)
     const merged = new Map();
     for (const e of [...fromLists, ...fromTables]) merged.set(e.id, e);
