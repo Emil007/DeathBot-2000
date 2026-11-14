@@ -127,10 +127,38 @@ function findPoolMatches(entries) {
   return matches;
 }
 
+/**
+ * R2-8: gleiche Matchlogik, aber gegen die ANNOUNCED-Saison-Picks (2027).
+ * Fängt Tode von 2027-only-Celebs, die der 2026er-Auto-Pool nie sieht —
+ * sonst stirbt im Dezember unbemerkt und wird am 1.1. verworfen.
+ */
+function findPoolMatchesForAnnounced(entries) {
+  const celebs = db.getAliveCelebsForAnnounced();
+  if (!celebs.length) return [];
+  const matches = [];
+
+  for (const celeb of celebs) {
+    const akas = db.getAkas(celeb.id);
+    const blacklist = db.getBlacklist(celeb.id);
+    for (const entry of entries) {
+      if (entryMatchesCeleb(entry, celeb, akas, blacklist)) {
+        matches.push({
+          celeb,
+          entry,
+          age: extractAge(entry.text) ?? celeb.age_at_pick ?? null,
+        });
+        break;
+      }
+    }
+  }
+  return matches;
+}
+
 module.exports = {
   extractAge,
   entryMatchesCeleb,
   findPoolMatches,
+  findPoolMatchesForAnnounced,
   significantTokens,
   titleFromWikiPath,
   tokenInText,

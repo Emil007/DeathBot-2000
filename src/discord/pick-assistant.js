@@ -31,6 +31,9 @@ const WIKI_URL_RE = /^(?:https?:\/\/)?(?:en|de)\.wikipedia\.org\/wiki\/[^\s]+$/i
 const busyUsers = new Set();
 /** User, die während ihres Laufs weitere Namen geschickt haben (Nachlauf). */
 const rerunUsers = new Set();
+/** R2-4: User-Interventionen (URL/link/falsch/Menü) stoppen den laufenden
+ * Auto-Resolver, damit er die manuelle Auswahl nicht überschreibt. */
+const interruptUsers = new Set();
 
 /** link_status je nach Proposal. Exportiert für Tests. */
 function classifyProposal(proposal) {
@@ -51,21 +54,37 @@ function draftEmbed(entries, season, draftStatus = "draft") {
         return `${i + 1}. **${e.raw_name}** — ${link}${age}${e.link_status === "ambiguous" ? " ⚠️" : ""}${dead}`;
       })
     : ["_(noch keine Namen)_"];
+  const intro = [
+    draftStatus === "finalized"
+      ? "🔒 **Liste eingefroren** — Personen, die vor dem Saisonstart sterben, werden dir hier gemeldet; mit `unlock` kannst du bis zum Start jederzeit ändern."
+      : "Schick Namen einzeln oder als Liste (eine Zeile / Semikolon / Strich).",
+    draftStatus === "finalized"
+      ? "`unlock` (bearbeiten) · `fertig` war schon"
+      : "`entfernen 3` · `ändern 3 Neuer Name` · `fertig`/`done`, wenn die Liste passt.",
+    "",
+  ];
   const embed = new EmbedBuilder()
     .setColor(draftStatus === "finalized" ? 0x1f8b4c : 0x222a33)
-    .setTitle(`Deine Tipps für Saison ${season?.year || "?"} (Start ${season?.start_date || "?"})`)
-    .setDescription(
-      [
-        draftStatus === "finalized"
-          ? "🔒 **Liste eingefroren** — Personen, die vor dem Saisonstart sterben, werden dir hier gemeldet; mit `unlock` kannst du bis zum Start jederzeit ändern."
-          : "Schick Namen einzeln oder als Liste (eine Zeile / Semikolon / Strich).",
-        draftStatus === "finalized"
-          ? "`unlock` (bearbeiten) · `fertig` war schon"
-          : "`entfernen 3` · `ändern 3 Neuer Name` · `fertig`/`done`, wenn die Liste passt.",
-        "",
-        ...lines,
-      ].join("\n")
-    );
+    .setTitle(`Deine Tipps für Saison ${season?.year || "?"} (Start ${season?.start_date || "?"})`);
+  // R2-6: 50 linkierte Namen passen NICHT in die 4096-Zeichen-Description.
+  // Kurze Listen inline, lange Listen in nummerierte Felder (1–12, 13–24, …),
+  // die die Nummerierung für `falsch N`/`link N` beibehalten.
+  if (lines.length <= 12) {
+    embed.setDescription([...intro, ...lines].join("\n"));
+  } else {
+    embed.setDescription(intro.join("\n"));
+    const per = 12;
+    for (let start = 0; start < lines.length; start += per) {
+      const chunkLines = lines.slice(start, start + per);
+      const n0 = start +(1);
+      const n1 = Math.min(start + per, lines.length);
+      embed.addFields({
+        name: `Einträge ${n0}–${n1}`,
+        value: chunkLines.join("\n").slice(0, 1024),
+        inline: false,
+      });
+    }
+  }
   return embed;
 }
 
@@ -179,6 +198,7 @@ async function handlePickInteraction(ctx, interaction) {
     await interaction.followUp?.({ content: "Kandidat ungültig.", ephemeral: true }).catch(() => {});
     return true;
   }
+  interruptUsers.add(userId); // R2-4: laufenden Resolver stoppen
   db.setDraftEntryLinked(entryId, {
     wikiUrl: chosen.url,
     wikiNorm: chosen.norm,
@@ -186,6 +206,7 @@ async function handlePickInteraction(ctx, interaction) {
     proposedAge: chosen.proposedAge,
     linkStatus: "linked",
   });
+  interruptUsers.delete(userId);
   await logEvent(ctx.client, ctx.config, {
     kind: "pick-link",
     summary: `Kandidat gewählt: ${entry.raw_name} → ${chosen.title} (Saison ${season.year})`,
@@ -243,12 +264,16 @@ async function tryConsumePickMessage(ctx, msg) {
       await msg.reply("Alle Einträge sind bereits verlinkt — nutze `link <Nummer> <URL>`, um einen gezielt zu ändern.");
       return true;
     }
-    // Kurz auf laufende Auto-Auflösung warten, damit keine Überschreibung passiert
+    // Kurz auf laufende Auto-Auflösung warten, damit keine Überschreibung passiert.
+    // R2-4: NICHT droppen — Nachlauf anfordern, der laufende Lauf stoppt bei der
+    // nächsten Interrupt-Prüfung und löscht danach das Flag.
     if (busyUsers.has(msg.author.id)) {
-      await msg.reply("Moment, ich löse noch Namen auf — gleich nochmal schicken (oder `fertig` warten).");
+      rerunUsers.add(msg.author.id);
+      interruptUsers.add(msg.author.id);
+      await msg.reply("Moment, ich löse noch Namen auf — deinen Link setze ich gleich um.");
       return true;
     }
-    busyUsers.add(msg.author.id);
+    interruptUsers.add(msg.author.id);
     try {
       const proposal = await lookupUrl(ctx.config.userAgent, body, season.start_date, null);
       db.setDraftEntryLinked(target.id, {
@@ -258,6 +283,7 @@ async function tryConsumePickMessage(ctx, msg) {
         proposedAge: proposal.proposedAge,
         linkStatus: "linked",
       });
+      await msg.reply(`🔗 ${target.raw_name} → **${proposal.title || body}**`);
       await logEvent(ctx.client, ctx.config, {
         kind: "pick-link-url",
         summary: `${target.raw_name} → ${body} (Saison ${season.year})`,
@@ -268,9 +294,11 @@ async function tryConsumePickMessage(ctx, msg) {
         `Mit dieser URL konnte nichts verlinkt werden (**${err.message}**). Nur en./de.wikipedia.org/wiki/…-Links zu Personen funktionieren.`
       );
     } finally {
-      busyUsers.delete(msg.author.id);
+      interruptUsers.delete(msg.author.id);
     }
-    await respondPick(ctx, msg.channel, msg.author.id, season);
+    // R2-4: verbleibende pending-Einträge werden danach weiter aufgelöst — ein
+    // einzelner Link-Paste darf den Rest NICHT als pending blockieren (`fertig`).
+    void resolvePendingSynchronous(ctx, msg.channel, msg.author.id, season, draft.id, "add");
     return true;
   }
 
@@ -288,14 +316,32 @@ async function tryConsumePickMessage(ctx, msg) {
     const entries = db.listDraftEntries(draft.id);
     const match = body.match(WRONG_RE);
     const num = match?.[1] ? Number(match[1]) : null;
-    const target = num ? entries[num - 1] : entries.find((e) => e.link_status === "linked" || e.link_status === "ambiguous");
+    const cands = entries.filter(
+      (e) => e.link_status === "linked" || e.link_status === "ambiguous"
+    );
+    let target;
+    if (num) {
+      target = entries[num - 1];
+    } else if (cands.length === 1) {
+      // R2-5: nur bei EINDEUTIG einer verlinkten/ambigen Zeile raten. Bei
+      // mehreren weiß der User nicht, welche gemeint ist — Nummer verlangen.
+      target = cands[0];
+    } else if (cands.length > 1) {
+      await msg.reply(
+        `Mehrere verlinkte Einträge — sag mir, welcher falsch ist: \`falsch <Nummer>\``
+      );
+      await respondPick(ctx, msg.channel, msg.author.id, season);
+      return true;
+    }
     if (!target) {
       await msg.reply("Kein verlinkter Eintrag gefunden. Nutze `falsch <Nummer>`.");
       return true;
     }
     // Link entfernen → wieder pending zur Neu-Auflösung (gemeint war ein anderer
     // oder keiner: User kann neu wählen oder per Link-Paste auflösen).
+    interruptUsers.add(msg.author.id); // R2-4: laufenden Resolver stoppen
     db.replaceDraftEntryName(target.id, target.raw_name);
+    interruptUsers.delete(msg.author.id);
     await logEvent(ctx.client, ctx.config, {
       kind: "pick-wrong",
       summary: `${target.raw_name} als falsch markiert (Link entfernt)`,
@@ -329,6 +375,7 @@ async function tryConsumePickMessage(ctx, msg) {
       return true;
     }
     try {
+      interruptUsers.add(msg.author.id); // R2-4: laufenden Resolver stoppen
       const proposal = await lookupUrl(ctx.config.userAgent, url, season.start_date, null);
       db.setDraftEntryLinked(target.id, {
         wikiUrl: proposal.wikiUrl,
@@ -340,6 +387,8 @@ async function tryConsumePickMessage(ctx, msg) {
       await msg.reply(`🔗 ${target.raw_name} → **${proposal.title || url}**`);
     } catch (err) {
       await msg.reply(`Mit dieser URL konnte nichts verlinkt werden (**${err.message}**).`);
+    } finally {
+      interruptUsers.delete(msg.author.id);
     }
     await respondPick(ctx, msg.channel, msg.author.id, season);
     return true;
@@ -505,6 +554,11 @@ async function tryConsumePickMessage(ctx, msg) {
   if (parsed.duplicates.length) {
     await msg.reply(`Doppelte ignoriert: ${parsed.duplicates.join(", ")}`);
   }
+  if (parsed.truncated) {
+    await msg.reply(
+      `⚠️ Mehr als **50** Namen — ich habe bei 50 abgeschnitten, der Rest (${body.split(/[\n;,]|-|/).filter(Boolean).length} erkannt) wurde ignoriert. Teil sie in zwei Meldungen auf.`
+    );
+  }
   await respondPick(ctx, msg.channel, msg.author.id, season);
   // Ambiguities direkt zeigen
   const entries = db.listDraftEntries(draft.id);
@@ -545,6 +599,11 @@ async function resolvePendingSynchronous(ctx, channel, userId, season, draftId, 
       }
       let i = 0;
       for (const e of pendings) {
+        // R2-4: User hat währenddessen manuell eingegriffen (URL/link/falsch/
+        // Menü) — laufenden Auto-Lauf stoppen statt dessen Wahl zu überschreiben.
+        if (interruptUsers.has(userId)) {
+          break;
+        }
         i++;
         if (progressMsg?.edit) {
           await progressMsg
@@ -629,6 +688,10 @@ async function warnAnnouncedPreStartDeaths(ctx) {
   let sent = 0;
   for (const r of rows) {
     try {
+      // R2-7: Stempel NUR nach erfolgreicher Zustellung — bei DM-Fehler bleibt
+      // die Zeile unstamped und der nächste Poll versucht es erneut. Sonst gibt
+      // es für ein fehlgeschlagenes Send nie einen zweiten Versuch.
+      let delivered = !r.user_discord_id; // ohne Discord-ID nichts versendbar
       if (r.user_discord_id) {
         try {
           const user = await ctx.client.users.fetch(r.user_discord_id);
@@ -638,12 +701,13 @@ async function warnAnnouncedPreStartDeaths(ctx) {
               `Schreib mir \`unlock\`, ersetze den Namen und frier die Liste wieder ein — bis zum Start (${season.start_date || "Saisonstart"}) ist das jederzeit möglich.`,
             ].join("\n")
           );
+          delivered = true;
           sent++;
         } catch (e) {
           console.warn("[pick] death-warn DM failed", r.celeb_name, e.message);
         }
       }
-      db.markAnnouncedDeathWarned(season.id, r.player_id, r.celeb_id);
+      if (delivered) db.markAnnouncedDeathWarned(season.id, r.player_id, r.celeb_id);
     } catch (e) {
       console.warn("[pick] death-warn row failed", r.celeb_name, e.message);
     }

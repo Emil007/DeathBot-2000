@@ -475,8 +475,8 @@ function mergeCelebs(canonicalId, duplicateId) {
   if (canonicalId === duplicateId) return canonicalId;
   const tx = db.transaction(() => {
     db.prepare(
-      `INSERT OR IGNORE INTO picks (player_id, celeb_id, season_id)
-       SELECT player_id, ?, season_id FROM picks WHERE celeb_id = ?`
+      `INSERT OR IGNORE INTO picks (player_id, celeb_id, season_id, age_at_pick)
+       SELECT player_id, ?, season_id, age_at_pick FROM picks WHERE celeb_id = ?`
     ).run(canonicalId, duplicateId);
     db.prepare(`DELETE FROM picks WHERE celeb_id = ?`).run(duplicateId);
     db.prepare(
@@ -536,6 +536,17 @@ function mergeCelebs(canonicalId, duplicateId) {
 }
 
 function applyWikiConfirm(celebId, { wikiUrl, wikiNorm, wikiUrlDe, wikidataId, age, manualOnly }) {
+  // R2-1/F4: announced-Eigenschaft des EINGEHENDEN (2027er) Celebs VOR dem
+  // Merge einfrieren — der Merge löscht dessen Queue-Zeile, und nach dem
+  // Merge zeigt celebId auf den kanonischen (2026er) Celeb ohne announced-Queue.
+  const preQueue = db
+    .prepare("SELECT season_id FROM celeb_review_queue WHERE celeb_id = ?")
+    .get(celebId);
+  const incomingAnnounced = !!(
+    preQueue?.season_id &&
+    db.prepare("SELECT phase FROM seasons WHERE id = ?").get(preQueue.season_id)?.phase === "announced"
+  );
+
   // Identity: Wikidata QID first, then wiki_url_norm
   if (wikidataId) {
     const byQ = findCelebByWikidataId(wikidataId);
@@ -549,14 +560,18 @@ function applyWikiConfirm(celebId, { wikiUrl, wikiNorm, wikiUrlDe, wikidataId, a
   }
 
   // Nach dem Merge neu lesen: die kanonische Zeile kann eine eigene Queue-Zeile
-  // oder ein bestätigter 2026er-Celeb sein (F4).
+  // oder ein bestätigter 2026er-Celeb sein (F4). announced gilt auch, wenn die
+  // EINGEHENDE Karte announced war (R2-1) — sonst verliert der 2027er-Confirm
+  // seine Saison-Zuordnung und läuft fälschlich den 2026er-Branch.
   const qAfter = db
     .prepare("SELECT season_id FROM celeb_review_queue WHERE celeb_id = ?")
     .get(celebId);
-  const isAnnounced = !!(
-    qAfter?.season_id &&
-    db.prepare("SELECT phase FROM seasons WHERE id = ?").get(qAfter.season_id)?.phase === "announced"
-  );
+  const isAnnounced =
+    incomingAnnounced ||
+    !!(
+      qAfter?.season_id &&
+      db.prepare("SELECT phase FROM seasons WHERE id = ?").get(qAfter.season_id)?.phase === "announced"
+    );
 
   if (manualOnly) {
     if (isAnnounced) {
@@ -622,6 +637,21 @@ function applyWikiConfirm(celebId, { wikiUrl, wikiNorm, wikiUrlDe, wikidataId, a
            wikidata_id = COALESCE(?, wikidata_id)
          WHERE id = ?`
       ).run(finalUrl, finalNorm, finalDe, wikidataId || null, celebId);
+      // R2-3/F15: Confirm allein (ohne Alter-Button) muss das Alter trotzdem
+      // an picks.age_at_pick bringen — sonst bleibt der Dezember-Score 0.
+      // COALESCE fill-if-empty: ein bewusst per Alter-Button gepflegtes Alter
+      // wird NICHT überschrieben.
+      if (age != null) {
+        const ann = db
+          .prepare("SELECT id FROM seasons WHERE phase = 'announced' AND live = 0")
+          .get();
+        if (ann) {
+          db.prepare(
+            `UPDATE picks SET age_at_pick = COALESCE(age_at_pick, ?)
+             WHERE celeb_id = ? AND season_id = ?`
+          ).run(age, celebId, ann.id);
+        }
+      }
     } else {
       db.prepare(
         `UPDATE celebs SET
@@ -892,11 +922,16 @@ function setDraftEntryLinked(
 ) {
   // candidates_json NICHT via COALESCE: ein neuer eindeutiger Kandidat muss einen
   // alten mehrdeutigen Satz ersetzen, sonst waehlt der User aus veralteten Daten (F7).
+  // qid NICHT coalescen (R2-2): wenn der Aufrufer explizit ein qid mitgibt
+  // (auch null = "keins"), ersetzt es die alte Zuordnung. Eine neue URL-Linkung
+  // ohne Wikidata-QID darf die vorige Person NICHT stehen lassen — sonst findet
+  // finalizeDraft über das alte qid die falsche Person.
+  const hasQid = qid !== undefined; // undefined = nicht Teil des Updates
   db.prepare(
     `UPDATE pick_draft_entries SET
        wiki_url = COALESCE(?, wiki_url),
        wiki_norm = COALESCE(?, wiki_norm),
-       qid = COALESCE(?, qid),
+       qid = CASE WHEN ? = 1 THEN ? ELSE qid END,
        proposed_age = COALESCE(?, proposed_age),
        candidates_json = ?,
        link_status = COALESCE(?, link_status)
@@ -904,6 +939,7 @@ function setDraftEntryLinked(
   ).run(
     wikiUrl ?? null,
     wikiNorm ?? null,
+    hasQid ? 1 : 0,
     qid ?? null,
     proposedAge ?? null,
     candidatesJson ?? null,
@@ -1061,6 +1097,27 @@ function getAliveCelebsForAuto() {
          AND wiki_confirmed = 1`
     )
     .all();
+}
+
+/**
+ * R2-8: lebende Celebs, die in der ANNOUNCED-Saison (2027) gepickt wurden —
+ * auch wenn sie NICHT im 2026er-Auto-Pool stehen (exclude_from_auto=1). Sie
+ * müssen vor dem Saisonstart auf Tode geprüft werden, sonst stirbt jemand im
+ * Dezember unbemerkt und wird am 1.1. als „Vorjahrestod” verworfen.
+ */
+function getAliveCelebsForAnnounced() {
+  const ann = db
+    .prepare(`SELECT id FROM seasons WHERE phase = 'announced' AND live = 0`)
+    .get();
+  if (!ann) return [];
+  return db
+    .prepare(
+      `SELECT DISTINCT c.* FROM celebs c
+       JOIN picks pk ON pk.celeb_id = c.id
+       WHERE c.is_alive = 1
+         AND pk.season_id = ?`
+    )
+    .all(ann.id);
 }
 
 function getAkas(celebId) {
@@ -1710,6 +1767,7 @@ module.exports = {
   clearPicksForPlayer,
   setPick,
   getAliveCelebsForAuto,
+  getAliveCelebsForAnnounced,
   getAkas,
   getBlacklist,
   addAka,

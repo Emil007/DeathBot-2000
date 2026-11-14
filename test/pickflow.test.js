@@ -137,3 +137,73 @@ test("command regexes match user input", () => {
   assert.ok(assistant.WRONG_RE.test("falsch 3"));
   assert.ok(assistant.WRONG_RE.test("nein 2"));
 });
+
+test("R2-2: relink ohne qid löscht das alte qid (kein COALESCE-Stale)", () => {
+  const season = db.getAnnouncedSeason();
+  const pid = db
+    .getDb()
+    .prepare("INSERT INTO players (display_name, discord_user_id, base_points) VALUES ('R2T','657','0')")
+    .run().lastInsertRowid;
+  const draft = db.getOrCreateDraft(pid, season.id);
+  db.addDraftNames(draft.id, ["Alpha Test"]);
+  const e = db.listDraftEntries(draft.id)[0];
+
+  // erst Person A mit qid QA verlinken
+  db.setDraftEntryLinked(e.id, {
+    wikiUrl: "https://en.wikipedia.org/wiki/Alpha_Test",
+    wikiNorm: "alpha test",
+    qid: "QA",
+    linkStatus: "linked",
+  });
+  assert.strictEqual(db.listDraftEntries(draft.id)[0].qid, "QA");
+
+  // relink auf Person B OHNE qid (Seite hat keine Wikidata) → QA muss weg
+  db.setDraftEntryLinked(e.id, {
+    wikiUrl: "https://en.wikipedia.org/wiki/Beta_Test",
+    wikiNorm: "beta test",
+    qid: null,
+    linkStatus: "linked",
+  });
+  const after = db.listDraftEntries(draft.id)[0];
+  assert.strictEqual(after.qid, null, "stale qid must be cleared on relink");
+  assert.strictEqual(after.wiki_norm, "beta test");
+
+  // qid undefined = Teil nicht angefasst (z.B. nur linkStatus-Update)
+  db.setDraftEntryLinked(e.id, { wikiUrl: "https://en.wikipedia.org/wiki/Beta_Test", wikiNorm: "beta test", qid: "QB", linkStatus: "linked" });
+  db.setDraftEntryLinked(e.id, { linkStatus: "linked" });
+  assert.strictEqual(db.listDraftEntries(draft.id)[0].qid, "QB", "undefined qid keeps existing");
+});
+
+test("R2-3: Confirm (ohne Alter-Button) übernimmt Alter auf picks.age_at_pick", () => {
+  db.openAnnouncedSeason({ year: 2027, startDate: "2027-01-01", channelId: "c1", note: null });
+  const season = db.getAnnouncedSeason();
+  assert.ok(season, "announced season must exist");
+  const pid = db
+    .getDb()
+    .prepare("INSERT INTO players (display_name, discord_user_id, base_points) VALUES ('R2A','658','0')")
+    .run().lastInsertRowid;
+  const c = db.findOrCreateCeleb({ name: "Aged Person", age: null });
+  db.getDb()
+    .prepare("INSERT INTO picks (player_id, celeb_id, season_id, age_at_pick) VALUES (?, ?, ?, NULL)")
+    .run(pid, c.celeb.id, season.id);
+  // Die Queue-Zeile MUSS die announced-Saison tragen, damit applyWikiConfirm
+  // in den announced-Zweig läuft (sonst läuft der 2026er-Branch).
+  db.enqueueReview(c.celeb.id, {
+    wikiUrl: "https://en.wikipedia.org/wiki/Aged_Person",
+    wikiNorm: "en:aged_person",
+    proposedAge: 67,
+  }, { seasonId: season.id });
+
+  db.applyWikiConfirm(c.celeb.id, {
+    wikiUrl: "https://en.wikipedia.org/wiki/Aged_Person",
+    wikiNorm: "en:aged_person",
+    age: 67,
+    manualOnly: false,
+  });
+
+  const pick = db
+    .getDb()
+    .prepare("SELECT age_at_pick FROM picks WHERE celeb_id = ? AND season_id = ?")
+    .get(c.celeb.id, season.id);
+  assert.strictEqual(pick.age_at_pick, 67, "confirm alone must fill picks.age_at_pick");
+});

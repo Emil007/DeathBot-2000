@@ -1,7 +1,7 @@
 const { scrapeEn } = require("../wiki/scraper-en");
 const { scrapeDe } = require("../wiki/scraper-de");
 const { resolveEnglishArticle } = require("../wiki/page-lookup");
-const { findPoolMatches, entryMatchesCeleb } = require("../wiki/match");
+const { findPoolMatches, entryMatchesCeleb, findPoolMatchesForAnnounced } = require("../wiki/match");
 const {
   findPoolDeathsByCategory,
   celebStillMarkedDead,
@@ -490,6 +490,42 @@ async function runWikiPollInner(client, config, { mode = "live" } = {}) {
         () => {}
       );
     }
+  }
+
+  // R2-8: 2027-only-Celebs auf Tode prüfen — die 2026er-Pool-Logik sieht sie
+  // nicht (exclude_from_auto=1), also sucht ein Extra-Lauf in den OHNE-IDs
+  // gescrapten Todeslisten. applyDeath findet für 2027-only keinen 2026er-Pick →
+  // keine falschen Punkte, nur is_alive=0, damit warnAnnouncedPreStartDeaths
+  // den Einreicher warnen kann.
+  try {
+    const announcedHits = findPoolMatchesForAnnounced(poolEntries);
+    for (const m of announcedHits) {
+      if (m.celeb.is_alive !== 1) continue;
+      await processDeathpoolHit(
+        client,
+        config,
+        { celeb: m.celeb, entry: m.entry, wikiAge: m.age },
+        {
+          announce: false,
+          confirmed: false,
+          source: "announced-prestart",
+        }
+      );
+      await logEvent(client, config, {
+        kind: "announced-death",
+        summary: `2027-Pick-Tod erkannt (Pre-Start): ${m.celeb.name}`,
+        detail: `via ${m.entry?.text || "Liste"}`,
+      }).catch(() => {});
+    }
+    if (announcedHits.length) {
+      console.log(
+        new Date().toISOString(),
+        `[poll] announced pre-start deaths: ${announcedHits.length}`
+      );
+    }
+  } catch (err) {
+    console.error("[poll] announced pre-start death scan failed", err.message);
+    await logError(client, config, err, { where: "announced-prestart" }).catch(() => {});
   }
 
   if (mode === "nightly") {
