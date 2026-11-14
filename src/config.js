@@ -35,7 +35,11 @@ function loadConfig() {
     prefix: optional("PREFIX", "!"),
     adminId: required("ADMIN_ID"),
     discordGuildId: optional("DISCORD_GUILD_ID", ""),
-    channelDeathpool: required("CHANNEL_DEATHPOOL"),
+    // Seit dem interaktiven Kanal-Setup (src/jobs/channel-setup.js) ist
+    // CHANNEL_DEATHPOOL OPTIONAL: Der Deathpool-Kanal wird beim Start
+    // automatisch gefunden/angelegt oder per Admin-Frage gewählt. Leer =
+    // der Bot startet ohne festes Ziel (Versand dann ohne Ziel, siehe docs).
+    channelDeathpool: optional("CHANNEL_DEATHPOOL", ""),
     channelAllDeaths: optional("CHANNEL_ALL_DEATHS", ""),
     channelAdmin: optional("CHANNEL_ADMIN", ""),
     channelLog: optional("CHANNEL_LOG", ""),
@@ -59,7 +63,10 @@ function loadConfig() {
       "USER_AGENT",
       "DeathBot-2000/1.0 (Discord death pool bot; +https://github.com/Emil007/DeathBot-2000)"
     ),
-    tz: optional("TZ", "UTC"),
+    // Zeitzone des Bots: Jahreswechsel/Erinnerungen rechnen in dieser TZ.
+    // Default Europe/Vienna (Wien — Emil), per TZ-Env konfigurierbar. Der
+    // Wert darf leer/UTC sein; die Guard-Logik schlägt dann in UTC an.
+    tz: optional("TZ", "Europe/Vienna"),
   };
 }
 

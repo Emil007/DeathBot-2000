@@ -166,9 +166,11 @@ function setSeasonDeathpoolChannel(seasonId, channelId) {
   return db.prepare("SELECT * FROM seasons WHERE id = ?").get(seasonId);
 }
 
-// F06: Der effektive Deathpool-Versandkanal — die in der laufenden Saison
-// gespeicherte deathpool_channel_id gewinnt vor dem Env-Fallback. Gibt die
-// ID zurück (String) oder null, wenn weder gespeichert noch konfiguriert.
+// F06: Der effektive Deathpool-Versandkanal — nur noch die in der laufenden
+// Saison gespeicherte deathpool_channel_id. Seit dem interaktiven Kanal-Setup
+// (src/jobs/channel-setup.js) gibt es KEINEN Env-Fallback mehr:
+// CHANNEL_DEATHPOOL ist optional und config.channelDeathpool zählt als leer.
+// Gibt die ID zurück (String) oder null, wenn keine gespeichert ist.
 function resolveDeathpoolChannel(config) {
   let running = null;
   try {
@@ -178,7 +180,7 @@ function resolveDeathpoolChannel(config) {
   }
   const stored = running?.deathpool_channel_id;
   if (stored) return stored;
-  return config?.channelDeathpool || null;
+  return null;
 }
 
 function archiveRunningSeason(seasonId) {

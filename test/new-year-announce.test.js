@@ -152,6 +152,26 @@ test("assertActivateDateAllowed force bypasses date (F01)", () => {
   assert.strictEqual(res.ok, true, "force skips the date check");
 });
 
+test("assertActivateDateAllowed is timezone-configurable (config.tz)", () => {
+  // 23:30Z am 31.12.: in Berlin 00:30 am 01.01. (erreicht), in UTC noch 31.12.
+  const frozen = new Date("2026-12-31T23:30:00Z");
+  assert.strictEqual(
+    assertActivateDateAllowed("2027-01-01", false, frozen, "Europe/Berlin").ok,
+    true,
+    "00:30 Berlin = Wechsel erlaubt"
+  );
+  assert.strictEqual(
+    assertActivateDateAllowed("2027-01-01", false, frozen, "UTC").ok,
+    false,
+    "UTC sieht noch den 31.12. → Guard blockt"
+  );
+  // Default-Argument bleibt Europe/Vienna (rückwärtskompatibel).
+  assert.strictEqual(
+    assertActivateDateAllowed("2027-01-01", false, new Date("2026-12-31T23:00:00Z")).ok,
+    true
+  );
+});
+
 // ---- F11: Repost aktualisiert die Notiz im Embed ----
 
 test("F11: repost keeps a previously set note and the NEW note wins (old ≠ empty)", async () => {

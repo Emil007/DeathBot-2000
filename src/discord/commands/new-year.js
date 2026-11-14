@@ -14,26 +14,28 @@ function parseDate(s) {
 }
 
 /**
- * Datum in Europe/Vienna (YYYY-MM-DD) — F01: Wechsel-Entscheidungen hängen am
- * Wiener Kalendertag (Cron feuert 00:00 Europe/Vienna, also 23:00 UTC am
- * 31.12.). Ein UTC-Datum läge am 31.12. noch einen Tag hinter dem Saisonstart.
- * `date` ist injizierbar für Tests.
+ * Datum in der Bot-Zeitzone (YYYY-MM-DD) — F01: Wechsel-Entscheidungen hängen am
+ * TZ-Kalendertag (Cron feuert 00:00 config.tz). Ein UTC-Datum läge am 31.12. noch
+ * einen Tag hinter dem Saisonstart. `date` ist injizierbar für Tests.
+ *
+ * `timeZone` ist konfigurierbar (config.tz). Default Europe/Vienna — bleibt
+ * damit rückwärtskompatibel zu Aufrufen ohne Zeitzonen-Argument.
  */
-function todayInVienna(date = new Date()) {
+function todayInVienna(date = new Date(), timeZone = "Europe/Vienna") {
   if (date == null) date = new Date();
   return new Intl.DateTimeFormat("en-CA", {
-    timeZone: "Europe/Vienna",
+    timeZone: timeZone || "Europe/Vienna",
     year: "numeric",
     month: "2-digit",
     day: "2-digit",
   }).format(date);
 }
 
-/** Wechsel erst ab Saisonstart erlaubt (force hebt nur das Datum auf). */
-function assertActivateDateAllowed(startDate, force, now = new Date()) {
+/** Wechsel erst ab Saisonstart erlaubt (force hebt nur das Datum auf). timeZone = config.tz. */
+function assertActivateDateAllowed(startDate, force, now = new Date(), timeZone = "Europe/Vienna") {
   if (force) return { ok: true };
   if (!startDate) return { ok: false, reason: "Kein Startdatum gesetzt." };
-  if (todayInVienna(now) < startDate) {
+  if (todayInVienna(now, timeZone) < startDate) {
     return { ok: false, reason: `Wechsel erst ab dem Saisonstart (**${startDate}**) möglich. \`force:true\` nur für Testläufe.` };
   }
   return { ok: true };
@@ -145,7 +147,7 @@ const cmd = {
         return;
       }
       const force = has("force");
-      const dateGuard = assertActivateDateAllowed(announced.start_date, force);
+      const dateGuard = assertActivateDateAllowed(announced.start_date, force, new Date(), ctx.config.tz);
       if (!dateGuard.ok) {
         await msg.reply(dateGuard.reason);
         return;

@@ -2,6 +2,7 @@ const cron = require("node-cron");
 const { ChannelType } = require("discord.js");
 const db = require("../db");
 const { logEvent, logError } = require("../discord/log");
+const { sendAdmin } = require("../discord/admin-notify");
 const { createPackage } = require("../backup");
 
 /** Nächstes Jahr relativ zur laufenden Saison/aktuellen Datum. */
@@ -43,24 +44,27 @@ function formatSeasonReviewText(review, runningYear) {
 }
 
 /**
- * Datum in Europe/Vienna (YYYY-MM-DD) — F01: Der Cron feuert 00:00 Wiener Zeit
- * (= 23:00 UTC am 31.12.). Ein UTC-Datum täte den Wechsel am 31.12. statt am
- * 01.01., wodurch der Guard „start_date > heute" nie erfüllt würde. `date` ist
- * injizierbar für Tests mit eingefrorenem Instant.
+ * Datum in der Bot-Zeitzone (YYYY-MM-DD) — F01: Der Cron feuert 00:00 Wiener
+ * Zeit (= 23:00 UTC am 31.12.). Ein UTC-Datum täte den Wechsel am 31.12. statt
+ * am 01.01., wodurch der Guard „start_date > heute" nie erfüllt würde. `date`
+ * ist injizierbar für Tests mit eingefrorenem Instant.
+ *
+ * `timeZone` ist konfigurierbar (config.tz). Default Europe/Vienna — bleibt
+ * damit rückwärtskompatibel zu Aufrufen, die kein Zeitzonen-Argument mitgeben.
  */
-function todayInVienna(date = new Date()) {
+function todayInVienna(date = new Date(), timeZone = "Europe/Vienna") {
   if (date == null) date = new Date();
   return new Intl.DateTimeFormat("en-CA", {
-    timeZone: "Europe/Vienna",
+    timeZone: timeZone || "Europe/Vienna",
     year: "numeric",
     month: "2-digit",
     day: "2-digit",
   }).format(date);
 }
 
-/** Ist heute (Wien) der 01.01.? — Stichtag für den einmaligen Jahresbericht (F20). */
-function isNewYearDayVienna(date = new Date()) {
-  return todayInVienna(date).endsWith("-01-01");
+/** Ist heute (in der Bot-TZ) der 01.01.? — Stichtag für den einmaligen Jahresbericht (F20). */
+function isNewYearDayVienna(date = new Date(), timeZone = "Europe/Vienna") {
+  return todayInVienna(date, timeZone).endsWith("-01-01");
 }
 
 /**
@@ -74,14 +78,16 @@ function isNewYearDayVienna(date = new Date()) {
 async function runYearRollover(client, config, { force = false, now = null } = {}) {
   const announced = db.getAnnouncedSeason();
   const running = db.getActiveSeason();
+  // Bot-Zeitzone aus config.tz (Default Europe/Vienna), konfigurierbar per TZ-Env.
+  const tz = config.tz || "Europe/Vienna";
 
-  // Nichts zu wechseln. Nur am Wiener 01.01. GENAU EINMAL eine echte Jahresbilanz
+  // Nichts zu wechseln. Nur am Bot-TZ-01.01. GENAU EINMAL eine echte Jahresbilanz
   // der laufenden Saison posten (Live-Summen, KEINE Snapshots), als Rückgrat
   // für Handwechsel/Deploys, bei denen keine announced-Saison angelegt wurde.
   if (!announced) {
-    const today = todayInVienna(now);
+    const today = todayInVienna(now, tz);
     const reviewKey = "year_rollover_annual_review";
-    if (isNewYearDayVienna(now) && db.getMeta(reviewKey) !== today.slice(0, 4)) {
+    if (isNewYearDayVienna(now, tz) && db.getMeta(reviewKey) !== today.slice(0, 4)) {
       // Flag VOR dem Post setzen: sendet der Post (z. B. Zielkanal weg), ist er
       // nicht wiederholbar — genau einmal pro Jahr.
       db.setMeta(reviewKey, today.slice(0, 4));
@@ -101,12 +107,12 @@ async function runYearRollover(client, config, { force = false, now = null } = {
     return { switched: false, reason: "no-announced" };
   }
 
-  // F01: Wechsel erst, wenn das WIENER Datum >= start_date. Der Cron läuft
-  // 00:00 Europe/Vienna; ein Nachhol-Run (Bot-Ausfall) kommt am selben Wiener
-  // Tag oder später — überfällige start_date passieren, zukünftige blocken.
+  // F01: Wechsel erst, wenn das Bot-TZ-Datum >= start_date. Der Cron läuft
+  // 00:00 config.tz; ein Nachhol-Run (Bot-Ausfall) kommt am selben TZ-Tag
+  // oder später — überfällige start_date passieren, zukünftige blocken.
   // F20(a): vor dem Stichtag gibt es KEINEN Post — keine Abschlussbilanz der
   // laufenden Saison ohne deren Snapshots.
-  if (!force && announced.start_date && todayInVienna(now) < announced.start_date) {
+  if (!force && announced.start_date && todayInVienna(now, tz) < announced.start_date) {
     return { switched: false, reason: "not-yet", start: announced.start_date };
   }
 
@@ -281,8 +287,8 @@ async function postReview(client, config, season, liveYear, preferredChannelId =
  *
  * Guild-Auflösung (in dieser Reihenfolge):
  *   1. config.discordGuildId (explizit gesetzt)
- *   2. aus dem Deathpool-Kanal abgeleitet — client.channels.fetch(channelDeathpool).guild
- *      (= derselbe Server wie das Announcement, falls er da gepostet wurde)
+ *   2. aus dem Deathpool-Kanal abgeleitet — client.channels.fetch(resolveDeathpoolChannel).guild
+ *      (derselbe Server wie das Announcement, falls er da gepostet wurde)
  *   3. sonst: keine Guild → Kanal-Erstellung übersprungen (nicht fatal)
  */
 async function createNextSeasonChannel(client, config, year) {
@@ -291,12 +297,18 @@ async function createNextSeasonChannel(client, config, year) {
     guild = await client.guilds.fetch(config.discordGuildId).catch(() => null);
   }
   if (!guild) {
-    // Ableitung aus dem Deathpool-Kanal (gleicher Server wie Announcement)
-    const deriveChannelId = config.channelDeathpool || config.channelAllDeaths;
+    // Ableitung aus dem Deathpool-Kanal (gleicher Server wie Announcement) —
+    // NUR an den gespeicherten Kanal der aktiven Saison (kein Env-Fallback
+    // mehr: CHANNEL_DEATHPOOL ist seit dem interaktiven Kanal-Setup leer und
+    // zählt als „kein Kanal"). 
+    const deriveChannelId = db.resolveDeathpoolChannel(config) || config.channelAllDeaths;
     if (deriveChannelId) {
       const ch = await client.channels.fetch(deriveChannelId).catch(() => null);
       guild = ch?.guild || null;
       if (guild) console.log(`[year-rollover] Guild aus Kanal ${deriveChannelId} abgeleitet: ${guild.name || guild.id}`);
+    } else {
+      // Klar loggen, wenn kein Kanal da ist (Setup hat nichts verknüpft).
+      console.log("[year-rollover] kein Kanal zur Guild-Ableitung (weder gespeichert noch CHANNEL_ALL_DEATHS)");
     }
   }
   if (!guild?.channels?.create) {
@@ -307,7 +319,7 @@ async function createNextSeasonChannel(client, config, year) {
     // abgeleitet) — kein stilles Überspringen.
     await logError(client, config, err, {
       where: "year-rollover createChannel guild",
-      detail: `guild=${guild?.id || config.discordGuildId || "none"} deriveFrom=${config.channelDeathpool || config.channelAllDeaths || "none"}`,
+      detail: `guild=${guild?.id || config.discordGuildId || "none"} deriveFrom=${db.resolveDeathpoolChannel(config) || config.channelAllDeaths || "none"}`,
     });
     return null;
   }
@@ -414,6 +426,11 @@ async function syncChannelOverwrites(client, channel, config) {
  * Erinnerung an den Admin (01.11. & 01.12.), wenn die neue Saison noch nicht
  * eröffnet wurde (keine announced-Saison und aktives Jahr = das kommende Jahr
  * ist noch nicht vorbereitet).
+ *
+ * ZIEL-VEREINHEITLICHUNG: Das Admin-Ziel wird NICHT mehr händisch aufgelöst,
+ * sondern über den zentralen Pfad src/discord/admin-notify.js (resolveAdminTarget/
+ * sendAdmin): CHANNEL_ADMIN-Kanal, sonst DM an config.adminId. Erfolgs- und
+ * Fehlerlogik (reminded/ reason 'no-target' + logError) bleibt erhalten.
  */
 async function remindAdminToAnnounce(client, config) {
   const announced = db.getAnnouncedSeason();
@@ -430,27 +447,27 @@ async function remindAdminToAnnounce(client, config) {
     "Erstelle sie manuell mit `/announce-season announce_channel:#Kanal` (oder `!announce-season #Kanal`), " +
     "bevor am 01.01. gewechselt wird — sonst verpasst Gregg den Kanal-Start.";
 
-  // F07: Ziel auflösen — CHANNEL_ADMIN, sonst DM an den Admin. sendAdmin hat
-  // KEINEN DM-Fallback: bei leerem CHANNEL_ADMIN ginge sonst nichts raus, aber
-  // es würde trotzdem reminded:true / reason:'sent' geloggt.
-  let targetObj = null;
-  if (config.channelAdmin) {
+  // Ziel über den zentralen sendAdmin-Pfad: CHANNEL_ADMIN-Kanal, sonst DM an
+  // config.adminId. resolveAdminTarget kennt config.adminId nicht selbst — der
+  // Admin-User wird (nur wenn kein CHANNEL_ADMIN gesetzt ist) hier geholt und
+  // als preferDmUser mitgegeben. sendAdmin liefert null zurück, wenn kein
+  // sendbares Ziel existiert.
+  const ctx = { client, config };
+  let preferDmUser = null;
+  if (!config.channelAdmin && config.adminId) {
     try {
-      const ch = await client.channels.fetch(config.channelAdmin).catch(() => null);
-      if (ch?.isTextBased?.() || ch?.send) targetObj = ch;
+      const u = await client.users.fetch(config.adminId).catch(() => null);
+      if (u?.createDM) {
+        const dm = await u.createDM().catch(() => null);
+        if (dm?.send) preferDmUser = { ...u, createDM: async () => dm };
+      }
     } catch {
-      targetObj = null;
+      preferDmUser = null;
     }
   }
-  if (!targetObj && config.adminId) {
-    try {
-      const user = await client.users.fetch(config.adminId).catch(() => null);
-      if (user?.createDM) targetObj = await user.createDM().catch(() => null);
-    } catch {
-      targetObj = null;
-    }
-  }
-  if (!targetObj?.send) {
+
+  const delivered = await sendAdmin(ctx, text, { preferDmUser });
+  if (!delivered) {
     const err = new Error(
       "remindAdminToAnnounce: kein Ziel (kein CHANNEL_ADMIN und Admin-DM fehlgeschlagen)"
     );
@@ -458,12 +475,6 @@ async function remindAdminToAnnounce(client, config) {
     return { reminded: false, reason: "no-target", target };
   }
 
-  try {
-    await targetObj.send({ content: text });
-  } catch (e) {
-    await logError(client, config, e, { where: "remindAdminToAnnounce send" });
-    return { reminded: false, reason: "no-target", target };
-  }
   await logEvent(client, config, {
     kind: "admin-reminder",
     summary: `Erinnerung: Runde ${target} noch nicht eröffnet`,
@@ -472,10 +483,11 @@ async function remindAdminToAnnounce(client, config) {
   return { reminded: true, reason: "sent", target };
 }
 
-/** Startet den Jahreswechsel-Cron: 1. Januar, 00:00 Wiener Zeit (explizit, egal ob Host/Container). */
+/** Startet den Jahreswechsel-Cron: 1. Januar, 00:00 in config.tz (explizit, egal ob Host/Container). */
 function startYearRollover(client, config) {
+  const tz = config.tz || "Europe/Vienna";
   const expr = "0 0 1 1 *";
-  console.log(`[year-rollover] scheduled (cron: ${expr}, tz: Europe/Vienna)`);
+  console.log(`[year-rollover] scheduled (cron: ${expr}, tz: ${tz})`);
   cron.schedule(
     expr,
     () => {
@@ -485,12 +497,12 @@ function startYearRollover(client, config) {
         logError(client, config, e, { where: "year-rollover cron" });
       });
     },
-    { timezone: "Europe/Vienna" }
+    { timezone: tz }
   );
 
   // Erinnerungen 01.11. & 01.12., 00:00 (Vorlauf zum 01.01.).
   const remindExpr = "0 0 1 11,12 *";
-  console.log(`[year-rollover] reminders scheduled (cron: ${remindExpr}, tz: Europe/Vienna)`);
+  console.log(`[year-rollover] reminders scheduled (cron: ${remindExpr}, tz: ${tz})`);
   cron.schedule(
     remindExpr,
     () => {
@@ -499,10 +511,10 @@ function startYearRollover(client, config) {
         logError(client, config, e, { where: "year-rollover reminder cron" });
       });
     },
-    { timezone: "Europe/Vienna" }
+    { timezone: tz }
   );
 
-  return { expr, remindExpr, timezone: "Europe/Vienna" };
+  return { expr, remindExpr, timezone: tz };
 }
 
 

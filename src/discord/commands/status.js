@@ -93,7 +93,7 @@ const cmd = {
       `• Wiki-seen **${snap.wikiSeen}** (EN ${snap.wikiSeenEn} / DE ${snap.wikiSeenDe}) · All-deaths announced **${snap.announcedTotal}**`,
       "",
       "**Channels**",
-      `• Deathpool: \`${cfg.channelDeathpool}\``,
+      `• Deathpool: ${db.resolveDeathpoolChannel(cfg) ? `\`${db.resolveDeathpoolChannel(cfg)}\`` : "_(per Start-Setup, noch keiner verknüpft)_"}`,
       `• All-deaths: ${cfg.channelAllDeaths ? `\`${cfg.channelAllDeaths}\`` : "_aus_"}`,
       `• Admin: ${cfg.channelAdmin ? `\`${cfg.channelAdmin}\`` : "_DM-first_"}`,
       `• Guild-ID: ${cfg.discordGuildId ? `\`${cfg.discordGuildId}\`` : "_fehlt (slash lag)_"}`

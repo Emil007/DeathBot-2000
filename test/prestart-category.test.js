@@ -126,7 +126,7 @@ test("F14c: category hit without a death-list entry marks announced celeb dead �
   const fakeClient = { channels: { fetch: async () => null } };
   const result = await processDeathpoolHit(
     fakeClient,
-    { channelDeathpool: "1", userAgent: "test" },
+    { userAgent: "test" },
     { celeb: mine.celeb, entry: mine.entry, wikiAge: mine.age },
     { announce: false, confirmed: false, source: "announced-prestart" }
   );
@@ -202,7 +202,7 @@ test("F24: category-year before running season → 0 points + warnable, no award
   const fakeClient = { channels: { fetch: async () => null } };
   const result = await processDeathpoolHit(
     fakeClient,
-    { channelDeathpool: "1", userAgent: "test" },
+    { userAgent: "test" },
     { celeb: mine.celeb, entry: mine.entry, wikiAge: mine.age },
     { announce: false, confirmed: false, source: "announced-prestart" }
   );
@@ -347,14 +347,18 @@ test("F27: unknown age on a real hit prints 'Alter unbekannt' (no misleading 0-P
   const sent = [];
   const channel = { isTextBased: () => true, send: async (m) => sent.push(m) };
   const fakeClient = { channels: { fetch: async () => channel } };
+  // Kein Env-Fallback mehr: der Zielkanal kommt aus der gespeicherten Saison-ID.
+  const activeF27 = db.getActiveSeason();
+  db.setSeasonDeathpoolChannel(activeF27.id, "f27-stored-1");
   const { processDeathpoolHit } = require("../src/discord/announce");
   await processDeathpoolHit(
     fakeClient,
-    { channelDeathpool: "1", userAgent: "test", alertEmojiRepeat: 1, alertEmoji: "💀" },
+    { userAgent: "test", alertEmojiRepeat: 1, alertEmoji: "💀" },
     { celeb: mine.celeb, entry: mine.entry, wikiAge: mine.age },
     { announce: true, confirmed: false, source: "announced-prestart" }
   );
   assert.strictEqual(sent.length, 1, "announce must be posted");
+  db.setSeasonDeathpoolChannel(activeF27.id, null);
   const details = sent[0].embeds[0].data.fields.find((f) => f.name === "Details").value;
   assert.match(details, /Alter unbekannt/, "unknown age must be called out");
   assert.doesNotMatch(details, /0 Punkte/, "no misleading 0-Punkte hint for unknown age");

@@ -21,6 +21,7 @@ const { suggestCommands } = require("./discord/usage");
 const { startWikiPoller } = require("./jobs/wiki-poll");
 const { startDailySummary } = require("./jobs/daily-summary");
 const { startYearRollover, runYearRollover } = require("./jobs/year-rollover");
+const { runDeathpoolChannelSetup, handleChannelSetupInteraction } = require("./jobs/channel-setup");
 const { startAutoBackup } = require("./backup");
 const { startPresence } = require("./discord/presence");
 
@@ -92,14 +93,19 @@ async function main() {
     setTimeout(() => startWikiPoller(client, config), 1500);
     startDailySummary(client, config);
     startYearRollover(client, config);
-    // F02: Nachholen nach Bot-Ausfall am 01.01. — der Cron läuft nur zur
-    // festen Zeit. Beim (Wieder-)Start einmal prüfen: der Wiener Datums-Guard
-    // lässt überfällige start_date durch und blockt zukünftige; ein zweiter
-    // Lauf nach Erfolg ist durch getAnnouncedSeason()==null abgedeckt.
-    // F25: Fehler über logError in den Logkanal, nicht nur stdout.
-    runYearRollover(client, config).catch((e) => {
-      console.error("[year-rollover] startup catch-up failed", e.message);
-      logError(client, config, e, { where: "year-rollover startup catch-up" });
+    // Interaktives Deathpool-Kanal-Setup (ersetzt CHANNEL_DEATHPOOL):
+    // Der Start-Nachhol (runYearRollover) läuft erst, wenn ein Zielkanal sicher
+    // ist — das Kanal-Setup feuert onDecided genau einmal, sobald entschieden
+    // ist (oder sofort synchron, wenn die aktive Saison schon einen Kanal hat).
+    // Die übrige Start-Routine (slash-Registrierung, Poller, Backup) läuft
+    // weiter, NUR der Deathpool-Start-Nachhol wartet auf den Kanaldi.
+    runDeathpoolChannelSetup(client, config, {
+      onDecided: () =>
+        runYearRollover(client, config).catch((e) => {
+          // F25: Fehler über logError in den Logkanal, nicht nur stdout.
+          console.error("[year-rollover] startup catch-up failed", e.message);
+          logError(client, config, e, { where: "year-rollover startup catch-up" });
+        }),
     });
     startAutoBackup(config, client);
     startPresence(client, config, db);
@@ -108,6 +114,9 @@ async function main() {
   client.on("interactionCreate", async (interaction) => {
     try {
       if (await helpCmd.handleButton?.(ctx, interaction)) return;
+      // Interaktives Kanal-Setup VOR dem Pick-Assistenten — Buttons/Select des
+      // Deathpool-Kanal-Setups sind keine pka:-Interaktionen.
+      if (await handleChannelSetupInteraction(interaction, client, config)) return;
       if (await handlePickInteraction(ctx, interaction)) return;
       if (await handleReviewInteraction(ctx, interaction)) return;
 

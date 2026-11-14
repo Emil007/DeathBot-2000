@@ -11,7 +11,12 @@ services:
       ADMIN_ID: "PUT_YOUR_DISCORD_USER_ID_HERE"
       # Instant slash-command updates in this server (also registered globally for DMs):
       DISCORD_GUILD_ID: "PUT_DISCORD_SERVER_ID_HERE"
-      CHANNEL_DEATHPOOL: "PUT_DEATHPOOL_CHANNEL_ID_HERE"
+      # Optional/legacy: CHANNEL_DEATHPOOL is NO LONGER required. The bot finds
+      # or creates the deathpool channel automatically at startup, or asks the
+      # admin via an interactive channel-setup (buttons + dropdown) when a
+      # matching channel already exists. Comment this out to let the setup
+      # decide; if set, it is only a hint for the derive-fallback (not a target).
+      # CHANNEL_DEATHPOOL: "PUT_DEATHPOOL_CHANNEL_ID_HERE"
       # Optional all-deaths channel (never pings). Comment in and set an id to enable:
       # CHANNEL_ALL_DEATHS: "PUT_ALL_DEATHS_CHANNEL_ID_HERE"
       CHANNEL_ALL_DEATHS: ""
@@ -27,7 +32,9 @@ services:
       WIKI_POLLER_MINUTES: "30"
       DAILY_SUMMARY_HOUR: "9"
       DATA_DIR: "/app/data"
-      # Bot-Zeitzone: Jahreswechsel/Erinnerungen rechnen in Europe/Vienna (Wien).
+      # Bot-Zeitzone: Jahreswechsel/Erinnerungen rechnen in dieser Zone.
+      # Europe/Vienna (Wien) ist der Code-Default — ändere den Wert hier auf
+      # deine lokale Zone (z.B. Europe/Berlin), der Bot folgt config.tz.
       TZ: "Europe/Vienna"
       ALERT_EMOJI: "⚰️"
       ALERT_EMOJI_REPEAT: "3"

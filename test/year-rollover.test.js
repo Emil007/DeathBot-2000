@@ -14,6 +14,7 @@ const { loadConfig } = require("../src/config");
 const db = require("../src/db");
 const {
   runYearRollover,
+  startYearRollover,
   formatSeasonReviewText,
   remindAdminToAnnounce,
   createNextSeasonChannel,
@@ -81,6 +82,102 @@ test("todayInVienna formats in Europe/Vienna (F01)", () => {
   assert.ok(/^\d{4}-\d{2}-\d{2}$/.test(todayInVienna(null)));
 });
 
+// ---- TZ-Konfig: config.tz steuert den Datums-Guard ----
+
+test("todayInVienna honors a configured timezone (config.tz, default Europe/Vienna)", () => {
+  const inst = new Date("2026-12-31T23:00:00Z");
+  // Default beim Aufruf ohne Argument: Europe/Vienna (rückwärtskompatibel).
+  assert.strictEqual(todayInVienna(inst), "2027-01-01");
+  // Explizit Europa/Berlin: 23:00 UTC = 00:00 Berlin → 01.01.
+  assert.strictEqual(todayInVienna(inst, "Europe/Berlin"), "2027-01-01");
+  // UTC: 23:00 UTC bleibt am 31.12. → Guard beeinflusst.
+  assert.strictEqual(todayInVienna(inst, "UTC"), "2026-12-31");
+  assert.strictEqual(isNewYearDayVienna(inst, "UTC"), false);
+  assert.strictEqual(isNewYearDayVienna(inst, "Europe/Vienna"), true);
+  // config-Default greift: config.tz ist Europe/Vienna (loadConfig ohne TZ-Env).
+  assert.strictEqual(config.tz, "Europe/Vienna", "config.tz default is Europe/Vienna");
+});
+
+test("runYearRollover uses config.tz for the start-date guard (TZ-configurable)", async () => {
+  resetToRunningCurrentYear();
+  const runningBefore = db.getActiveSeason();
+  db.openAnnouncedSeason({
+    year: runningBefore.year + 1,
+    startDate: `${runningBefore.year + 1}-01-01`,
+    channelId: "777",
+    note: null,
+  });
+
+  const bucket = [];
+  const channel = makeFakeChannel(bucket);
+  const created = [];
+  const fakeGuild = {
+    id: "guild-1",
+    channels: {
+      fetch: async () => [],
+      create: async (opts) => {
+        created.push(opts);
+        return { id: "newchan-tz", name: opts.name, permissionOverwrites: { cache: new Map() } };
+      },
+    },
+  };
+  const client = {
+    guilds: { fetch: async () => fakeGuild },
+    channels: { fetch: async () => channel },
+  };
+
+  // 23:30 UTC am 31.12. == 31.12. in UTC, aber 00:30 am 01.01. in Berlin.
+  // Mit config.tz = Europe/Berlin ist der Start erreicht → Wechsel (kein force).
+  const berlinCfg = { ...config, discordGuildId: "guild-1", tz: "Europe/Berlin", channelLog: "" };
+  const frozen = new Date("2026-12-31T23:30:00Z");
+  const res = await runYearRollover(client, berlinCfg, { force: false, now: frozen });
+  assert.strictEqual(res.switched, true, "switch happens in the configured TZ");
+
+  // Derselbe Instant mit config.tz = UTC: 31.12. → noch NICHT erreicht (Guard).
+  resetToRunningCurrentYear();
+  db.openAnnouncedSeason({
+    year: new Date().getFullYear() + 1,
+    startDate: `${new Date().getFullYear() + 1}-01-01`,
+    channelId: "777",
+    note: null,
+  });
+  const utcCfg = { ...config, discordGuildId: "guild-1", tz: "UTC", channelLog: "" };
+  const res2 = await runYearRollover(client, utcCfg, { force: false, now: frozen });
+  assert.strictEqual(res2.switched, false);
+  assert.strictEqual(res2.reason, "not-yet");
+});
+
+test("startYearRollover returns timezone: config.tz and schedules in it", async () => {
+  // node-cron's setTimeout hält den Event-Loop am Leben (nächster Fire weit in
+  // der Zukunft) — deshalb cron im Test stubben und danach wiederherstellen.
+  const cronPath = require.resolve("node-cron");
+  const origCron = require.cache[cronPath]?.exports;
+  const scheduled = [];
+  require.cache[cronPath] = {
+    exports: {
+      schedule: (expr, fn, opts) => {
+        scheduled.push({ expr, opts });
+        return { stop: () => {} };
+      },
+    },
+  };
+  const yrPath = require.resolve("../src/jobs/year-rollover");
+  delete require.cache[yrPath];
+  const yr = require(yrPath);
+  try {
+    const out = yr.startYearRollover({}, { tz: "Europe/Berlin" });
+    assert.strictEqual(out.timezone, "Europe/Berlin", "returned timezone is config.tz");
+    assert.strictEqual(scheduled.length, 2, "both crons scheduled");
+    assert.strictEqual(scheduled[0].opts.timezone, "Europe/Berlin", "cron runs in config.tz");
+    assert.strictEqual(scheduled[1].opts.timezone, "Europe/Berlin");
+  } finally {
+    require.cache[cronPath] = origCron || { exports: {} };
+    delete require.cache[yrPath];
+    // Nach dem Stub wieder das ECHTE Modul laden, damit spätere Tests sehen.
+    require(yrPath);
+  }
+});
+
 // ---- F01: Guard-Weg mit überschriebenem Datum (kein force) ----
 
 test("runYearRollover switches at 23:00Z on Dec 31 (= Jan 1 Vienna) without force (F01)", async () => {
@@ -97,12 +194,30 @@ test("runYearRollover switches at 23:00Z on Dec 31 (= Jan 1 Vienna) without forc
 
   const bucket = [];
   const channel = makeFakeChannel(bucket);
-  const client = makeFakeClient(channel);
+  // Seit dem interaktiven Kanal-Setup gibt es keinen Env-Fallback mehr: der
+  // neue Kanal entsteht über die Guild (DISCORD_GUILD_ID-Pfad), daran hängt
+  // dann auch die Bilanz + Ack (preferredChannelId = neuer Kanal).
+  const created = [];
+  const fakeGuild = {
+    id: "guild-1",
+    channels: {
+      fetch: async () => [],
+      create: async (opts) => {
+        created.push(opts);
+        return { id: "newchan-f01", name: opts.name, permissionOverwrites: { cache: new Map() } };
+      },
+    },
+  };
+  const client = {
+    guilds: { fetch: async () => fakeGuild },
+    channels: { fetch: async () => channel },
+  };
+  const cfg = { ...config, discordGuildId: "guild-1" };
 
   // Eingefrorener Instant: Cron-Zeitpunkt 00:00 Europe/Vienna am 01.01. =
   // 2026-12-31T23:00:00Z. start_date (2027-01-01) ist erreicht => Wechsel OHNE force.
   const frozen = new Date("2026-12-31T23:00:00Z");
-  const res = await runYearRollover(client, config, { force: false, now: frozen });
+  const res = await runYearRollover(client, cfg, { force: false, now: frozen });
 
   assert.strictEqual(res.switched, true, "must switch at Vienna Jan 1 without force");
   assert.strictEqual(res.reason, undefined);
@@ -328,6 +443,35 @@ test("remindAdminToAnnounce stays silent when new season already announced", asy
   assert.strictEqual(res.reason, "already-announced");
 });
 
+test("remindAdminToAnnounce sends to CHANNEL_ADMIN when set (central sendAdmin path, F07)", async () => {
+  db.getDb().exec(`
+    DELETE FROM season_point_snapshots;
+    DELETE FROM seasons;
+  `);
+  db.ensureActiveSeason();
+  db.setSeasonLive(true);
+  assert.strictEqual(db.getAnnouncedSeason(), null);
+  const running = db.getActiveSeason();
+
+  const channelSent = [];
+  const fakeClient = {
+    channels: {
+      fetch: async (id) =>
+        id === "admin-chan-9"
+          ? { id: "admin-chan-9", isTextBased: () => true, send: async (payload) => { channelSent.push(payload); return {}; } }
+          : null,
+    },
+    users: { fetch: async () => null }, // darf NICHT gebraucht werden, wenn CHANNEL_ADMIN gesetzt ist
+  };
+  const cfg = { ...config, channelAdmin: "admin-chan-9" };
+
+  const res = await remindAdminToAnnounce(fakeClient, cfg);
+  assert.strictEqual(res.reminded, true, "reminder delivered to admin channel");
+  assert.strictEqual(res.reason, "sent");
+  assert.strictEqual(channelSent.length, 1, "exactly one message to CHANNEL_ADMIN");
+  assert.ok(channelSent[0].content.includes(String(running.year + 1)), "channel message mentions target year");
+});
+
 // ---- createNextSeasonChannel (unverändert) ----
 
 test("createNextSeasonChannel creates deathpool-{year} and invites players", async () => {
@@ -378,15 +522,24 @@ test("createNextSeasonChannel derives guild from deathpool channel (no guild id)
     },
   };
   const cfg = { ...config, discordGuildId: "" }; // NICHT gesetzt
+  // Der Ableitungs-Kanal kommt aus der gespeicherten deathpool_channel_id der
+  // aktiven Saison (KEIN Env-Fallback mehr).
+  const running = db.getActiveSeason();
+  db.setSeasonDeathpoolChannel(running.id, "stored-derive-9");
   const client = {
     guilds: { fetch: async () => null },
     channels: {
-      fetch: async () => ({ isTextBased: () => true, guild: fakeGuild }),
+      fetch: async (id) => {
+        if (String(id) === "stored-derive-9")
+          return { isTextBased: () => true, guild: fakeGuild };
+        return null;
+      },
     },
   };
   const ch = await createNextSeasonChannel(client, cfg, 2028);
   assert.ok(ch, "channel created via derived guild");
   assert.strictEqual(created[0].name, "deathpool-2028");
+  db.setSeasonDeathpoolChannel(running.id, null);
 });
 
 // ---- F06: Kanal wirklich benutzen ----
@@ -428,13 +581,15 @@ test("F06: runYearRollover writes new channel id to deathpool_channel_id, NOT an
   assert.strictEqual(activated.announce_channel_id, "777", "announce_channel_id unchanged (Anmeldungskanal)");
 });
 
-test("F06: resolveDeathpoolChannel prefers stored id over env fallback", () => {
+test("F06: resolveDeathpoolChannel prefers stored id, no env fallback anymore", () => {
   const running = db.getActiveSeason();
   db.setSeasonDeathpoolChannel(running.id, "stored-chan-42");
   assert.strictEqual(db.resolveDeathpoolChannel(config), "stored-chan-42");
-  // Env-Fallback greift erst ohne gespeicherte ID
+  // Seit dem interaktiven Kanal-Setup gibt es KEINEN Env-Fallback mehr:
+  // selbst wenn CHANNEL_DEATHPOOL gesetzt wäre, liefert resolve ohne
+  // gespeicherte ID null (config.channelDeathpool zählt als leer).
   db.setSeasonDeathpoolChannel(running.id, null);
-  assert.strictEqual(db.resolveDeathpoolChannel(config), config.channelDeathpool);
+  assert.strictEqual(db.resolveDeathpoolChannel(config), null, "no env fallback even with env set");
 });
 
 // ---- F15: Kanal-Anlage härten ----
@@ -529,7 +684,8 @@ test("F15: create failure triggers logError and confirmation text („Wechsel oh
       fetch: async () => makeFakeChannel(sent),
     },
   };
-  const cfg = { ...config, discordGuildId: "guild-1" };
+  // Kein Env-Fallback mehr: der Rückfall-Versand läuft über CHANNEL_ALL_DEATHS.
+  const cfg = { ...config, discordGuildId: "guild-1", channelAllDeaths: "alldeaths-1" };
 
   const res = await runYearRollover(client, cfg, { force: true });
   assert.strictEqual(res.switched, true, "switch still commits");
@@ -629,6 +785,9 @@ test("F20: annual review on Vienna Jan 1 (no-announced) posts REAL live totals i
 
   // runYearRollover am Wiener 01.01. (2025-12-31T23:00:00Z == 2026-01-01 Wien), keine announced-Saison
   const bucket = [];
+  // Kein Env-Fallback mehr: der Deathpool-Zielkanal kommt aus der Saison.
+  const runningSeason = db.getActiveSeason();
+  db.setSeasonDeathpoolChannel(runningSeason.id, "f20-stored-1");
   const client = { channels: { fetch: async () => makeFakeChannel(bucket) } };
   const frozen = new Date("2025-12-31T23:00:00Z");
   const res = await runYearRollover(client, config, { force: false, now: frozen });
@@ -797,7 +956,9 @@ test("F23: guild-null sets newChannelFailed so ack says „Wechsel ohne neuen Ka
     guilds: { fetch: async () => null },
     channels: { fetch: async () => fakeChannel },
   };
-  const cfg = { ...config, discordGuildId: "" }; // nicht gesetzt
+  // Kein Guild-ID, kein Deathpool gespeichert → Guild-Ableitung schlägt fehl.
+  // Der switch-ack/Ersatz-Versand läuft über CHANNEL_ALL_DEATHS.
+  const cfg = { ...config, discordGuildId: "", channelAllDeaths: "alldeaths-2" };
 
   const res = await runYearRollover(client, cfg, { force: true });
   assert.strictEqual(res.switched, true, "switch still commits");
