@@ -20,6 +20,7 @@ const { registerSlashCommands } = require("./discord/slash");
 const { suggestCommands } = require("./discord/usage");
 const { startWikiPoller } = require("./jobs/wiki-poll");
 const { startDailySummary } = require("./jobs/daily-summary");
+const { startYearRollover } = require("./jobs/year-rollover");
 const { startAutoBackup } = require("./backup");
 const { startPresence } = require("./discord/presence");
 
@@ -60,6 +61,7 @@ async function main() {
     // Let the gateway settle before the heavy startup seed (avoids missed 3s slash acks)
     setTimeout(() => startWikiPoller(client, config), 1500);
     startDailySummary(client, config);
+    startYearRollover(client, config);
     startAutoBackup(config, client);
     startPresence(client, config, db);
   });

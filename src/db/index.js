@@ -1363,6 +1363,46 @@ function listScores() {
     .sort((a, b) => b.total - a.total);
 }
 
+/**
+ * Jahresauswertung einer archivierten Saison: Punktestände aus dem Snapshot,
+ * Todesfälle (via death_awards) und Treffer pro Spieler. Für den automatischen
+ * Jahreswechsel (1.1., Mitternacht).
+ */
+function seasonReview(seasonId) {
+  const season = db.prepare("SELECT * FROM seasons WHERE id = ?").get(seasonId);
+  if (!season) return null;
+
+  const snapRows = db
+    .prepare(
+      `SELECT s.*, p.display_name FROM season_point_snapshots s
+       INNER JOIN players p ON p.id = s.player_id
+       WHERE s.season_id = ?`
+    )
+    .all(seasonId);
+
+  const awardRows = db
+    .prepare(
+      `SELECT da.*, c.name AS celeb_name, p.display_name FROM death_awards da
+       INNER JOIN celebs c ON c.id = da.celeb_id
+       INNER JOIN players p ON p.id = da.player_id
+       WHERE da.season_id = ?`
+    )
+    .all(seasonId);
+
+  const byPlayer = {};
+  for (const s of snapRows) {
+    byPlayer[s.player_id] = { name: s.display_name, total: s.total, points: s.base_points + s.bonus_points, hits: 0 };
+  }
+  for (const a of awardRows) {
+    if (!byPlayer[a.player_id]) byPlayer[a.player_id] = { name: a.display_name, total: 0, points: 0, hits: 0 };
+    byPlayer[a.player_id].hits++;
+  }
+  const rows = Object.values(byPlayer)
+    .map((r) => ({ ...r, total: r.total || 0 }))
+    .sort((a, b) => b.total - a.total || b.hits - a.hits);
+  return { season, rows, deaths: awardRows.length };
+}
+
 function getPlayerPicks(discordUserId) {
   const player = db.prepare("SELECT * FROM players WHERE discord_user_id = ?").get(String(discordUserId));
   if (!player) return null;
@@ -1754,6 +1794,7 @@ module.exports = {
   getAnnouncedSeasonPicksForPlayer,
   getAnnouncedPreStartDeathsUnwarned,
   markAnnouncedDeathWarned,
+  seasonReview,
   setPickAgeAtPick,
   celebHasRunningPick,
   nameKey,

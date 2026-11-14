@@ -56,6 +56,10 @@ Seasons are **announced** while the current one is still running:
 
 Need to re-post the sign-up embed? **`/announce-season repost:true`** (channel can be changed and is saved).
 
+**Automatic reminders (not actions):** on **Nov 1st** and **Dec 1st** (00:00 Vienna time), Gregg pings the admin if the next season has not been opened yet — a nudge to run `/announce-season` before the new year. It never announces for you; opening + seeding + channel choice stays manual.
+
+**Automatic year rollover (Jan 1st):** at **00:00 Vienna time** the bot posts a year-review of the just-finished season, archives it, activates the announced season, **creates a fresh `deathpool-{YEAR}` channel** (name uses the new year) and gives **every player** view/send access. The Discord server is resolved automatically from the configured deathpool channel (same server the announcement went to) — no `DISCORD_GUILD_ID` needed. If no guild is resolvable at all, the switch still runs and just reuses the configured deathpool channel.
+
 ---
 
 ## For admins — while the season runs

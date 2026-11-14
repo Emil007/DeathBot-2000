@@ -6,35 +6,65 @@ const db = require("../../db");
 const { logEvent, logError } = require("../log");
 
 /**
+ * Standard-Ankündigungstext (Gregg, Variante B, ohne ersten Satz). Nur Platz-
+ * halter — Jahreszahlen/Daten kommen zur Laufzeit aus der DB/Config, damit der
+ * Text jedes Jahr wieder verwendbar ist.
+ */
+const DEFAULT_ANNOUNCE_TITLE = "Ich weiß, wer stirbt. Du tippst.";
+
+const DEFAULT_ANNOUNCE_TEMPLATE = `Ich bin Gregg, der Tod in Text, und der Buchhalter, bei dem dein Ende schon steht. Wer stirbt, weiß ich. Du tippst nur und nennst das Mut. Es ist erbärmlich. Deine Liste ändert an meinem Ergebnis nichts.
+
+Deathpool **{YEAR}** ist offen. Ich will deine Namen. Du wettest, welche Prominenten ich abhole. Liegt du richtig, gibt es Punkte, und die Gruppe sieht deinen Namen neben der Leiche. Das ist der Ruhm hier und das aufregendste Spiel in diesem Haufen. Ein Jahr Spannung, von mir verkauft, von dir bezahlt. Den Ausgang habe ich. Du kaufst das Zittern.
+
+Sitzt du bei den Alten im Deathpool, kenne ich deine Liste. Dieselben Feiglinge, Instinkt nennst du das. Bist du neu, lies bis unten. Trost gibt es nicht. **{RUNNING_YEAR}** läuft weiter, getrennt. Nichts wird auf **{YEAR}** umgebucht.
+
+**Anleitung. Einmal. Kein zweites Wort.**
+
+**Sicht.** Diesen Kanal sehen heißt, du darfst mitmachen. Den Deathpool-Kanal musst du sehen, dort lege ich die Treffer hin. Siehst du ihn nicht, bist du raus. Keine Hintertür. Eine Direktnachricht ersetzt die Sicht nicht.
+
+**Namen.** Per Direktnachricht an mich, Gregg. In diesen Kanal sind sie Müll.
+
+**Format.** Ein Name pro Zeile, oder mehrere mit \`;\` getrennt. Ein Komma trennt nicht: \`Meier, Müller\` ist eine Person, die es nicht gibt. Ein Bindestrich schneidet nur mit Leerzeichen links und rechts. \`Jean-Luc\` bleibt ein Name. Doppelte zählen einmal, ich sage dir welche. Maximal **{MAX_PICKS}** Namen, über alle Direktnachrichten, nicht pro Nachricht. Den Rest schneide ich ab und melde ihn. Die Antwort zeigt, was bleibt.
+
+**Wikipedia.** Ich ordne jeden Namen zu. Namensvetter: ich frage, du wählst aus den Treffern. Ohne Wahl bleibt der Eintrag offen, \`fertig\` friert ihn nicht ein.
+
+**Schloss.** Du siehst die Liste als Antwort. \`fertig\` oder \`done\` friert sie ein. Bis **{START_DATE}** darfst du kneifen. Wie immer. \`unlock\`, dann \`entfernen 3\`, \`ändern 3 Neuer Name\`, oder neue Namen, danach wieder \`fertig\`, sonst bleibt sie offen. Die Zahl ist die Stelle. Der Admin bestätigt, \`/review\`, im Hintergrund. Am **{START_DATE}** schalte ich live. Dann zu.
+
+**Vor dem Start.** Stirbt jemand vor **{START_DATE}** auf deiner Liste, schreibe ich dir. Tauschen geht. Punkte gibt es dafür nicht.
+
+**Tarif.** Alter am **{START_DATE}**: \`max(1, 100 - Alter)\`. Jünger bringt mehr. Weniger als **1** gibt es nicht.`;
+
+/**
+ * Ersetzt die Template-Platzhalter des Announcement-Texts durch Werte aus der
+ * Season-DB / Config. NUR diese vier — keine Jahreszahlen im Code.
+ * {YEAR}, {RUNNING_YEAR}, {START_DATE}, {MAX_PICKS}
+ */
+function renderSeasonTemplate(template, { year, runningYear, startDate, maxPicks }) {
+  const NP = Number.isFinite(Number(maxPicks)) ? Number(maxPicks) : 50;
+  return String(template ?? "")
+    .split("{YEAR}").join(String(year))
+    .split("{RUNNING_YEAR}").join(String(runningYear ?? ""))
+    .split("{START_DATE}").join(String(startDate))
+    .split("{MAX_PICKS}").join(String(NP));
+}
+
+/**
  * Embed für die Teilnahme-Ankündigung der nächsten Runde.
  * Feste Sätze — der Tipp-Assistent (M4) erklärt exakt diese Schritte.
  * Exportiert für Tests.
  */
-function buildSeasonEmbed({ year, startDate, channelName, note, runningYear }) {
-  const lines = [
-    `🆕 **Neue Runde ${year}** — Tipp-Phase gestartet!`,
-    "",
-    `**Start:** ${startDate}. Die laufende Runde **${runningYear}** läuft bis dahin ganz normal weiter (Punkte gelten für **${year}**, nicht für den laufenden Stand).`,
-    "",
-    `Wer in **${channelName || "diesem Kanal"}** dabei ist, schickt mir eine **Direktnachricht** mit seinen Tipps.`,
-    "Wer den Kanal nicht sehen kann, nimmt nicht teil.",
-    "",
-    "**So gibst du deine Tipps ab:**",
-    "1. Schreib mir eine **DM** — Namen einzeln **oder als Liste** (eine pro Zeile, oder getrennt durch `;` bzw. Strich mit Leerzeichen ` - `).",
-    "2. Ich verknüpfe jeden Namen mit **Wikipedia** und zeige dir deine Liste.",
-    "3. Du kannst Namen `entfernen 3` / `ändern 3 Neuer Name` oder weitere hinzufügen — bis du `fertig`/`done` sagst.",
-    "",
-    `**Punkte:** Alter zum **${startDate}** → \`max(1, 100 − Alter)\` (jünger = mehr Punkte).`,
-    "",
-    "Danach bestätigt der Admin die Wikipedia-Zuordnung (`/review`) und schaltet am Starttag live (`/new-year activate:true`).",
-  ];
-  if (note) lines.push("", `📝 **Notiz:** ${note}`);
-  const embed = new EmbedBuilder()
+function buildSeasonEmbed({ year, startDate, channelName, note, runningYear, maxPicks, template, title }) {
+  const NP = Number.isFinite(Number(maxPicks)) ? Number(maxPicks) : 50;
+  const vars = { year, runningYear, startDate, maxPicks: NP };
+  const useTemplate = template || DEFAULT_ANNOUNCE_TEMPLATE;
+  const useTitle = title || DEFAULT_ANNOUNCE_TITLE;
+  let description = renderSeasonTemplate(useTemplate, vars);
+  if (note) description += `\n\n📝 **Notiz:** ${note}`;
+  return new EmbedBuilder()
     .setColor(0x2a9d3f)
-    .setTitle(`Nächste Runde: ${year}`)
-    .setDescription(lines.join("\n"))
+    .setTitle(useTitle ? renderSeasonTemplate(useTitle, vars) : `Nächste Runde: ${year}`)
+    .setDescription(description)
     .setTimestamp(new Date());
-  return embed;
 }
 
 const DEFAULT_YEAR = () => {
@@ -149,18 +179,15 @@ const cmd = {
       const running = db.getActiveSeason();
       // F26: fehlgeschlagenes Embed darf NICHT als Erfolg gemeldet werden
       try {
-        await channel.send({
-          embeds: [
-            buildSeasonEmbed({
-              year: announced.year,
-              startDate: announced.start_date,
-              channelName: channel.name,
-              note: announced.announce_note || note || null,
-              runningYear: running?.year,
-            }),
-          ],
-          allowedMentions: { parse: [] },
+        const embed = buildSeasonEmbed({
+          year: announced.year,
+          startDate: announced.start_date,
+          channelName: channel.name,
+          note: announced.announce_note || note || null,
+          runningYear: running?.year,
+          maxPicks: ctx.config.maxPicksPerPlayer,
         });
+        await channel.send({ embeds: [embed], allowedMentions: { parse: [] } });
       } catch (e) {
         await logError(ctx.client, ctx.config, e, {
           where: "announce-season repost",
@@ -208,18 +235,15 @@ const cmd = {
     let embedSent = false;
     if (channel?.send) {
       try {
-        await channel.send({
-          embeds: [
-            buildSeasonEmbed({
-              year: season.year,
-              startDate: season.start_date,
-              channelName: channel.name,
-              note: season.announce_note,
-              runningYear: running?.year,
-            }),
-          ],
-          allowedMentions: { parse: [] },
+        const embed = buildSeasonEmbed({
+          year: season.year,
+          startDate: season.start_date,
+          channelName: channel.name,
+          note: season.announce_note,
+          runningYear: running?.year,
+          maxPicks: ctx.config.maxPicksPerPlayer,
         });
+        await channel.send({ embeds: [embed], allowedMentions: { parse: [] } });
         embedSent = true;
       } catch (e) {
         await logError(ctx.client, ctx.config, e, { where: "announce-season send" });
@@ -238,7 +262,7 @@ const cmd = {
         `• Start: **${season.start_date}** · live: **nein**`,
         `• Kanal: <#${channelId}>`,
         embedSent
-          ? "• 2026 läuft unverändert weiter (Punkte/Kills)."
+          ? `• ${running?.year ?? "Die laufende Runde"} läuft unverändert weiter (Punkte/Kills).`
           : "• ⚠️ Embed-Posten **fehlgeschlagen** — Saison ist trotzdem angelegt, `repost:true` nutzen.",
         "",
         `Anleitung zum Tippen steht im Embed. ${announced ? "Repost: `/announce-season repost:true`" : ""}`,
@@ -249,3 +273,6 @@ const cmd = {
 
 module.exports = cmd;
 module.exports.buildSeasonEmbed = buildSeasonEmbed;
+module.exports.renderSeasonTemplate = renderSeasonTemplate;
+module.exports.DEFAULT_ANNOUNCE_TEMPLATE = DEFAULT_ANNOUNCE_TEMPLATE;
+module.exports.DEFAULT_ANNOUNCE_TITLE = DEFAULT_ANNOUNCE_TITLE;

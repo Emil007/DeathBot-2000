@@ -45,9 +45,29 @@ test("buildSeasonEmbed conveys the participation steps", () => {
   assert.ok(desc.includes("2026"), "running year must be mentioned");
   assert.ok(/Direktnachricht|DM/i.test(desc), "DM step must be described");
   assert.ok(/fertig|done/i.test(desc), "fertig step must be described");
-  assert.ok(/nicht.*teil|nimmt nicht/i.test(desc), "non-member exclusion must be described");
+  assert.ok(/raus|ist drau/iu.test(desc), "non-member exclusion must be described");
   const noteField = embed.data && (embed.data.fields || []).find?.((f) => f.value?.includes("Werdet Teil!"));
   assert.ok((embed.data && embed.data.description) ? desc.includes("Werdet Teil!") : noteField);
+});
+
+test("buildSeasonEmbed renders the code-default Gregg text with placeholders", () => {
+  const embed = buildSeasonEmbed({
+    year: 2030,
+    startDate: "2030-01-01",
+    channelName: "wettbuero",
+    note: null,
+    runningYear: 2029,
+    maxPicks: 3,
+  });
+  const desc = embed.data.description;
+  assert.ok(desc.includes("Gregg"), "Gregg introduces himself");
+  assert.ok(desc.includes("2030"), "DB year rendered");
+  assert.ok(desc.includes("2029"), "running year rendered");
+  assert.ok(desc.includes("2030-01-01"), "DB start_date rendered");
+  assert.ok(desc.includes("3"), "maxPicks rendered from config");
+  assert.ok(!/\{[A-Z_]+\}/.test(desc), "no leftover placeholders");
+  const leftoverTitle = (embed.data.title || "").match(/\{[A-Z_]+\}/);
+  assert.ok(!leftoverTitle, "title has no leftover placeholders");
 });
 
 test("wipe is refused while a running season exists", () => {

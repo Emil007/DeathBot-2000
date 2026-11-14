@@ -41,7 +41,10 @@ const cmd = {
       preferDmUser: null,
       fallbackChannel: msg.channel,
     });
-    const label = effSeasonId && announced?.id === effSeasonId ? "2027-Anmeldung" : "laufender Pool";
+    const label =
+      effSeasonId && announced?.id === effSeasonId
+        ? `${announced.year}-Anmeldung`
+        : "laufender Pool";
     await msg.reply(
       `${n} offen (${label}). Nächste Karte` +
         (ctx.config.channelAdmin && target?.id === ctx.config.channelAdmin

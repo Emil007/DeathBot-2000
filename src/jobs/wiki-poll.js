@@ -511,9 +511,11 @@ async function runWikiPollInner(client, config, { mode = "live" } = {}) {
           source: "announced-prestart",
         }
       );
+      const announcedSeason = db.getAnnouncedSeason?.() || null;
+      const preYear = announcedSeason?.year ? `${announcedSeason.year}` : "Nächstes";
       await logEvent(client, config, {
         kind: "announced-death",
-        summary: `2027-Pick-Tod erkannt (Pre-Start): ${m.celeb.name}`,
+        summary: `${preYear}-Pick-Tod erkannt (Pre-Start): ${m.celeb.name}`,
         detail: `via ${m.entry?.text || "Liste"}`,
       }).catch(() => {});
     }
