@@ -13,6 +13,7 @@ const TYPE_MAP = {
   USER: ApplicationCommandOptionType.User,
   BOOLEAN: ApplicationCommandOptionType.Boolean,
   ATTACHMENT: ApplicationCommandOptionType.Attachment,
+  CHANNEL: ApplicationCommandOptionType.Channel,
 };
 
 function addOption(builder, opt) {
@@ -37,6 +38,8 @@ function addOption(builder, opt) {
     builder.addBooleanOption((o) => o.setName(name).setDescription(desc).setRequired(required));
   } else if (type === ApplicationCommandOptionType.Attachment) {
     builder.addAttachmentOption((o) => o.setName(name).setDescription(desc).setRequired(required));
+  } else if (type === ApplicationCommandOptionType.Channel) {
+    builder.addChannelOption((o) => o.setName(name).setDescription(desc).setRequired(required));
   }
 }
 

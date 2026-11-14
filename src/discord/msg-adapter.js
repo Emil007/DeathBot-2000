@@ -46,6 +46,15 @@ function fromInteraction(interaction) {
           }
         },
       },
+      channels: {
+        first() {
+          try {
+            return interaction.options.getChannel("announce_channel") || null;
+          } catch {
+            return null;
+          }
+        },
+      },
     },
     async reply(payload) {
       const data = typeof payload === "string" ? { content: payload } : { ...payload };
