@@ -1547,12 +1547,14 @@ function recentPhraseHashes(limit = 80) {
 
 function clearSeasonForNewYear(year, startDate) {
   const old = getActiveSeason();
-  db.prepare("UPDATE seasons SET active = 0 WHERE id = ?").run(old.id);
+  db.prepare("UPDATE seasons SET active = 0, live = 0, phase = 'archived' WHERE id = ?").run(
+    old.id
+  );
   const y = year || new Date().getFullYear();
   const start = startDate || `${y}-01-01`;
   const info = db
     .prepare(
-      `INSERT INTO seasons (year, active, start_date, live) VALUES (?, 1, ?, 0)`
+      `INSERT INTO seasons (year, active, start_date, live, phase) VALUES (?, 1, ?, 0, 'setup')`
     )
     .run(y, start);
   db.prepare("UPDATE players SET base_points = 0").run();

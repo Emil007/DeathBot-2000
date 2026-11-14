@@ -1,5 +1,6 @@
 const { scrapeEn } = require("../wiki/scraper-en");
 const { scrapeDe } = require("../wiki/scraper-de");
+const { resolveEnglishArticle } = require("../wiki/page-lookup");
 const { findPoolMatches, entryMatchesCeleb } = require("../wiki/match");
 const {
   findPoolDeathsByCategory,
@@ -12,6 +13,7 @@ const {
   announceRetraction,
 } = require("../discord/announce");
 const ops = require("../ops/status");
+const { logEvent, logError } = require("../discord/log");
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
@@ -223,7 +225,7 @@ async function runWikiPollInner(client, config, { mode = "live" } = {}) {
         // A DE→EN bridge from it would wrongly announce the band as the person.
       } else {
         try {
-          enUrl = await deData.resolveEnglish(d.url);
+          enUrl = await resolveEnglishArticle(config.userAgent, d.url);
         } catch (e) {
           enResolveError = e;
         }
@@ -280,6 +282,9 @@ async function runWikiPollInner(client, config, { mode = "live" } = {}) {
             url: enUrl.startsWith("http") ? enUrl : `https:${enUrl}`,
             lang: "en",
             fromDe: true,
+            // F19: liste mitführen, damit eine Nicht-Personen-Karte NICHT auf die
+            // Research-URL fällt, sondern auf die DE-Liste verlinkt.
+            ...(d.listUrl ? { listUrl: d.listUrl } : {}),
             // DE death date + Nekrolog-URL year, else the EN card shows the current year
             ...(d.day != null ? { day: d.day } : {}),
             ...(d.month != null ? { month: d.month } : {}),
@@ -413,13 +418,24 @@ async function runWikiPollInner(client, config, { mode = "live" } = {}) {
       if (b.loserId === b.winnerId) {
         // historisch bereits gepostet — nicht erneut posten, nur sicher stempeln
         db.markWikiAnnounced(b.loserId);
+        await logEvent(client, config, {
+          kind: "announce-suppress",
+          summary: `Karte unterdrückt (${b.reason || "?"}): ${b.loserId}`,
+          detail: b.loserId === b.winnerId ? "bereits in einer früheren Runde gepostet" : undefined,
+        }).catch(() => {});
         continue;
       }
       const winnerRow = db
         .getDb()
         .prepare("SELECT announced_at FROM wiki_seen WHERE entry_id = ?")
         .get(b.winnerId);
-      if (winnerRow?.announced_at) db.markWikiAnnounced(b.loserId);
+      if (winnerRow?.announced_at) {
+        db.markWikiAnnounced(b.loserId);
+        await logEvent(client, config, {
+          kind: "announce-suppress",
+          summary: `Karte unterdrückt (${b.reason || "?"}): ${b.loserId} → ${b.winnerId}`,
+        }).catch(() => {});
+      }
     }
     // DE-nur-Verlierer der EN-Brücke wie bisher (deferredDeEn) nachziehen.
     for (const t of deferredDeEn) {
@@ -470,6 +486,9 @@ async function runWikiPollInner(client, config, { mode = "live" } = {}) {
     } catch (err) {
       console.error("[poll] deathpool", err.message);
       ops.noteError(`deathpool ${m.celeb.name}: ${err.message}`);
+      await logError(client, config, err, { where: "deathpool " + m.celeb.name }).catch(
+        () => {}
+      );
     }
   }
 

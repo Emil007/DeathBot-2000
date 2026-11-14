@@ -73,7 +73,20 @@ test("two humans distinct QID with similar names (Mašín) -> both posted", () =
   assert.strictEqual(post.length, 2, "similar names w/ different QID must BOTH be posted");
 });
 
-test("non-person posting a person already in history -> bound, not posted", () => {
+test("F16: isHuman==null Nachname-Kollision wird gepostet, nicht verschluckt", () => {
+  // Wikidata-Fehler: isHuman bleibt null (kein Netzfehler, kein resolved.error).
+  // Ein Namensvetter im selben Lauf darf den echten Toten NICHT binden.
+  const human = entry("en:/wiki/John_X", { lang: "en", text: "John X, actor.", qid: "QA", isHuman: true });
+  const unknown = entry("de:/wiki/John_X", { lang: "de", text: "John X, deutscher Kameramann", qid: "QB", isHuman: null });
+  const { post, bind } = planAnnouncements([human, unknown], { qids: new Set(), humanNames: new Set() });
+  assert.strictEqual(post.length, 2, "isHuman==null eintrag muss gepostet werden");
+  assert.ok(post.some((p) => p.id === "de:/wiki/John_X"));
+  assert.strictEqual(bind.length, 0);
+});
+
+// Historische Namens-Suppression ist bewusst ABGESCHALTET (F16):
+// eine frühere Nicht-Personen-Karte darf keinen echten Toten unterdrücken.
+test("non-person history name -> now POSTED (F16 tradeoff)", () => {
   const band = entry("de:/wiki/The_Pack_(Band)", {
     lang: "de", text: "Young L, US-amerikanischer Rapper", redName: true, isHuman: false,
   });
@@ -81,8 +94,8 @@ test("non-person posting a person already in history -> bound, not posted", () =
     qids: new Set(),
     humanNames: new Set(["young l, american rapper (the pack)"]),
   });
-  assert.strictEqual(post.length, 0, "band-name match on recent human name must not post");
-  assert.ok(bind.length >= 1);
+  assert.strictEqual(post.length, 1, "history-Name unterdrückt nicht mehr (lieber doppelte Band als verschluckter Tod)");
+  assert.strictEqual(bind.length, 0);
 });
 
 test("historical qid already posted -> nothing posted, stamps", () => {

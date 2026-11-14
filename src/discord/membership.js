@@ -37,15 +37,17 @@ async function canParticipate(client, config, userId) {
       return { ok: false, reason: "not-member" };
     }
   } catch (e) {
-    // 10007 = Unknown Member
+    // 10007 = Unknown Member: echtes "kein Mitglied". Andere Fetch-Fehler
+    // (429/Timeout/Recht) sind KEINE Ablehnung — sonst lehnt eine kurze
+    // Discord-Störung jede Anmeldung ab (F27).
     if (e?.code === 10007 || e?.message?.includes("Unknown Member")) {
-      // Admin darf auch ohne Membership durch (Test-/Prüfflow vor echtem Teilnehmer)
       if (String(userId) === String(config.adminId)) return { ok: true, season };
       return { ok: false, reason: "not-member" };
     }
+    return { ok: false, reason: "unavailable" };
   }
 
-  // Admin-Fallback für sonstige Fetch-Edge-Fälle
+  // Admin-Fallback für sonstige Edge-Fälle (fetch lieferte keinen Member)
   if (String(userId) === String(config.adminId)) return { ok: true, season };
   return { ok: false, reason: "not-member" };
 }

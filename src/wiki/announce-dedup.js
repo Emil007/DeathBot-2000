@@ -28,8 +28,10 @@ function planAnnouncements(entries, history) {
   const post = [];
   const bind = [];
   const defer = [];
+  // Nur QID-Historie verwenden. Namen aus announced_deaths sind unzuverlässig
+  // (Bands/Org-Seiten stehen dort, sobald eine Nicht-Personen-Karte gepostet
+  // wurde) — ein Namensabgleich gegen sie würde echte Tote verschlucken (F16).
   const qids = new Set(history?.qids || []);
-  const historyNames = new Set([...(history?.humanNames || [])].map((n) => normName(n)));
   const postedHumanNames = new Map(); // normName -> winner entry
 
   // Auflösungs-Fehler sind KEIN "kein EN": sie werden vertagt (nicht gepostet,
@@ -50,7 +52,7 @@ function planAnnouncements(entries, history) {
   for (const [qid, group] of byQid) {
     if (qids.has(qid)) {
       // historisch schon gepostet — nichts posten; alle stempeln
-      for (const e of group) bind.push({ loserId: e.id, winnerId: e.id });
+      for (const e of group) bind.push({ loserId: e.id, winnerId: e.id, reason: "qid-history" });
       continue;
     }
     const rank = (e) => {
@@ -64,7 +66,7 @@ function planAnnouncements(entries, history) {
     const winner = group[0];
     post.push(winner);
     postedHumanNames.set(normName(deathBrief.personNameFromText(winner.text)), winner);
-    for (const e of group.slice(1)) bind.push({ loserId: e.id, winnerId: winner.id });
+    for (const e of group.slice(1)) bind.push({ loserId: e.id, winnerId: winner.id, reason: "qid" });
     qids.add(qid);
   }
 
@@ -85,12 +87,25 @@ function planAnnouncements(entries, history) {
     if (e.resolved?.error) continue; // schon in defer
     if (e.resolved?.qid && e.resolved?.isHuman === true) continue; // in Pass 1
     if (e.resolved?.isHuman === true) continue; // solo human in 1b
+    // Regel 4 gilt NUR für nachweislich Nicht-Menschen oder Rotlink-Kandidaten:
+    // bei isHuman == null (Wikidata-Fehler geschluckt) NICHT binden — ein echter
+    // Tod mit Namensvetter im selben Lauf darf nicht verschwinden (F16).
+    const rule4 =
+      e.resolved?.isHuman === false || (e.redName && e.resolved?.isHuman !== true);
+    if (!rule4) {
+      post.push(e);
+      continue;
+    }
     const nk = normName(deathBrief.personNameFromText(e.text));
     // Regel 4: Nicht-Mensch/redName nur posten, wenn der Name keinem Menschen
-    // aus diesem Batch und keinem recentHistory entspricht.
-    if (nk && (postedHumanNames.has(nk) || historyNames.has(nk))) {
+    // aus diesem Batch entspricht (kein history-Namensabgleich — siehe oben).
+    if (nk && postedHumanNames.has(nk)) {
       const winner = postedHumanNames.get(nk);
-      bind.push(winner ? { loserId: e.id, winnerId: winner.id } : { loserId: e.id, winnerId: e.id });
+      bind.push(
+        winner
+          ? { loserId: e.id, winnerId: winner.id, reason: "nonperson-name" }
+          : { loserId: e.id, winnerId: e.id, reason: "nonperson-name" }
+      );
       continue;
     }
     post.push(e);

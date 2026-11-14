@@ -382,11 +382,41 @@ async function lookupUrl(userAgent, url, seasonStartDate, sheetAge) {
   ]);
 }
 
+/**
+ * EN-Variante eines DE-Artikels über die MediaWiki langlinks-API (zuverlässiger
+ * als der HTML-Interlanguage-Scrape, F17). Liefert die en.wikipedia.org-URL
+ * ODER null, wenn die Seite kein EN-Sitelink hat. Netz-/HTTP-Fehler werfen —
+ * ein vorübergehender Hänger ist NICHT "kein EN" (dann vertagt der Poller).
+ */
+async function resolveEnglishArticle(userAgent, germanUrl) {
+  const client = createClient(userAgent);
+  const norm = normalizeWikiUrl(germanUrl);
+  if (!norm || norm.lang !== "de") throw new Error("resolveEnglish braucht de.wikipedia.org /wiki/ URL");
+  const api = "https://de.wikipedia.org/w/api.php";
+  const { data } = await client.get(api, {
+    params: {
+      action: "query",
+      prop: "langlinks",
+      lllang: "en",
+      redirects: 1,
+      titles: norm.title,
+      format: "json",
+      origin: "*",
+    },
+  });
+  const page = Object.values(data?.query?.pages || {})[0];
+  const enTitle = page?.langlinks?.[0]?.["*"];
+  if (!enTitle) return null;
+  const n = normalizeWikiUrl(`https://en.wikipedia.org/wiki/${encodeURIComponent(enTitle.replace(/ /g, "_"))}`);
+  return n ? n.url : null;
+}
+
 module.exports = {
   normalizeWikiUrl,
   ageAtDate,
   proposeWikiForName,
   lookupUrl,
+  resolveEnglishArticle,
   searchWikipedia,
   getPageMeta,
   titleLooksNonPerson,

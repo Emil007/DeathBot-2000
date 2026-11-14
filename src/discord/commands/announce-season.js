@@ -132,8 +132,14 @@ const cmd = {
         await msg.reply("Kein Kanal gespeichert. `announce_channel:#Kanal` mitgeben.");
         return;
       }
-      if (note && note !== announced.announce_note) {
-        db.setSeasonAnnounce(announced.id, { channelId: chanId, note });
+      // F23: auch ein geänderter Kanal wird gespeichert — vorher blieb
+      // announce_channel_id der alte, obwohl das Embed im neuen landete.
+      const chanChanged = chanId !== announced.announce_channel_id;
+      if (chanChanged || (note && note !== announced.announce_note)) {
+        db.setSeasonAnnounce(announced.id, {
+          channelId: chanId,
+          note: note ?? announced.announce_note,
+        });
       }
       const channel = await ctx.client.channels.fetch(chanId).catch(() => null);
       if (!channel?.send) {
@@ -141,18 +147,28 @@ const cmd = {
         return;
       }
       const running = db.getActiveSeason();
-      await channel.send({
-        embeds: [
-          buildSeasonEmbed({
-            year: announced.year,
-            startDate: announced.start_date,
-            channelName: channel.name,
-            note: announced.announce_note || note || null,
-            runningYear: running?.year,
-          }),
-        ],
-        allowedMentions: { parse: [] },
-      });
+      // F26: fehlgeschlagenes Embed darf NICHT als Erfolg gemeldet werden
+      try {
+        await channel.send({
+          embeds: [
+            buildSeasonEmbed({
+              year: announced.year,
+              startDate: announced.start_date,
+              channelName: channel.name,
+              note: announced.announce_note || note || null,
+              runningYear: running?.year,
+            }),
+          ],
+          allowedMentions: { parse: [] },
+        });
+      } catch (e) {
+        await logError(ctx.client, ctx.config, e, {
+          where: "announce-season repost",
+          userId: ctx.config.adminId,
+        });
+        await msg.reply(`Embed-Repost fehlgeschlagen: ${e.message}`);
+        return;
+      }
       await logEvent(ctx.client, ctx.config, {
         kind: "season-repost",
         summary: `Embed für ${announced.year} erneut gepostet in Kanal ${chanId}`,
@@ -189,9 +205,10 @@ const cmd = {
 
     const channel = await ctx.client.channels.fetch(channelId).catch(() => null);
     const running = db.getActiveSeason();
+    let embedSent = false;
     if (channel?.send) {
-      await channel
-        .send({
+      try {
+        await channel.send({
           embeds: [
             buildSeasonEmbed({
               year: season.year,
@@ -202,25 +219,27 @@ const cmd = {
             }),
           ],
           allowedMentions: { parse: [] },
-        })
-        .catch(async (e) => {
-          await logError(ctx.client, ctx.config, e, { where: "announce-season send" });
-          await msg.reply(`Embed-Posten fehlgeschlagen: ${e.message} — Saison ist angelegt, \`repost:true\` nutzen.`);
         });
+        embedSent = true;
+      } catch (e) {
+        await logError(ctx.client, ctx.config, e, { where: "announce-season send" });
+      }
     }
 
     await logEvent(ctx.client, ctx.config, {
       kind: "season-announce",
       summary: `Saison ${season.year} angekündigt (Start ${season.start_date}, Kanal ${channelId})`,
       userId: ctx.config.adminId,
-      detail: `season_id=${season.id} backup=${pkg?.name || "-"}`,
+      detail: `season_id=${season.id} backup=${pkg?.name || "-"} embed_sent=${embedSent}`,
     });
     await msg.reply(
       [
         `🆕 **Saison ${season.year} angekündigt** (id ${season.id})`,
         `• Start: **${season.start_date}** · live: **nein**`,
         `• Kanal: <#${channelId}>`,
-        "• 2026 läuft unverändert weiter (Punkte/Kills).",
+        embedSent
+          ? "• 2026 läuft unverändert weiter (Punkte/Kills)."
+          : "• ⚠️ Embed-Posten **fehlgeschlagen** — Saison ist trotzdem angelegt, `repost:true` nutzen.",
         "",
         `Anleitung zum Tippen steht im Embed. ${announced ? "Repost: `/announce-season repost:true`" : ""}`,
       ].join("\n")

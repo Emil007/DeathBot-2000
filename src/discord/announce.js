@@ -235,14 +235,18 @@ async function announceAllDeath(client, config, entry, { isDeOnly = false, brief
   // vorhanden). Band-/Org-/Sammelseiten und fehlende Artikel erscheinen dort
   // nie — stattdessen die Listen-URL oder ein Hinweis.
   let linkValue;
-  if (brief.isHuman === true && !brief.pageMissing) {
+  // F19: Personen-URL auch dann, wenn isHuman unklar (== null), solange die
+  // Seite existiert und kein Rotlink vorliegt. Nur bei eindeutig Nicht-Mensch
+  // oder fehlender Seite auf Liste/kein-Artikel zurückfallen.
+  const personLink =
+    (brief.isHuman === true || (brief.isHuman == null && !brief.pageMissing && !entry.redName)) &&
+    !brief.pageMissing;
+  if (personLink) {
     linkValue = `[Wikipedia](${brief.url || entry.url})`;
   } else if (entry.listUrl) {
     linkValue = `[Wikipedia-Liste](${entry.listUrl})`;
-  } else if (brief.pageMissing) {
-    linkValue = "Kein eigener Wikipedia-Artikel";
   } else {
-    linkValue = `[Wikipedia](${brief.url || entry.url})`;
+    linkValue = "Kein eigener Wikipedia-Artikel";
   }
   const embed = new EmbedBuilder()
     .setColor(isDeOnly ? 0x3d4f5c : 0x2b3a42)
