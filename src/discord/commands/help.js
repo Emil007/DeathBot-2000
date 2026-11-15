@@ -17,8 +17,9 @@ function groupOf(cmd) {
   return cmd.admin ? "season" : "everyone";
 }
 
-function buildOverviewPages(ctx, isAdmin) {
+function buildOverviewPages(ctx, isAdmin, isDm) {
   const p = ctx.config.prefix;
+  const inDm = Boolean(isDm);
   const all = uniqueCommands(ctx.commands);
   const sections = [];
 
@@ -31,7 +32,10 @@ function buildOverviewPages(ctx, isAdmin) {
     if (!cmds.length) continue;
     const lines = [`**${g.title}**`];
     for (const c of cmds) {
-      lines.push(`\`/${c.name}\` · \`${p}${c.name}\` — ${c.description || ""}`);
+      // In der DM gibt es keine Slash-Commands — nur den Prefix-Weg nennen.
+      lines.push(
+        inDm ? `\`${p}${c.name}\` — ${c.description || ""}` : `\`/${c.name}\` · \`${p}${c.name}\` — ${c.description || ""}`
+      );
     }
     sections.push(lines.join("\n"));
   }
@@ -45,13 +49,23 @@ function buildOverviewPages(ctx, isAdmin) {
     if (orphans.length) {
       const lines = ["**Admin · Sonstiges**"];
       for (const c of orphans) {
-        lines.push(`\`/${c.name}\` · \`${p}${c.name}\` — ${c.description || ""}`);
+        lines.push(
+          inDm ? `\`${p}${c.name}\` — ${c.description || ""}` : `\`/${c.name}\` · \`${p}${c.name}\` — ${c.description || ""}`
+        );
       }
       sections.push(lines.join("\n"));
     }
   }
 
-  const header = isAdmin
+  const header = inDm
+    ? [
+        "**DeathBot Hilfe** — Tipp deine Namen einfach so hin, ein pro Zeile. Für Befehle: `" +
+          ctx.config.prefix +
+          "hilfe`.",
+        `Detail: \`${p}help <befehl>\`.`,
+        "",
+      ].join("\n")
+    : isAdmin
     ? [
         "**DeathBot Hilfe** — Befehle als `/` (Slash, aus der Vorschlagsliste) oder mit dem Präfix `" +
           ctx.config.prefix +
@@ -63,8 +77,8 @@ function buildOverviewPages(ctx, isAdmin) {
     : [
         "**DeathBot Hilfe** — Tipp deine Namen einfach so hin, ein pro Zeile. Für Befehle: `" +
           ctx.config.prefix +
-          "hilfe` oder wähl in der Slash-Liste `/help`.",
-        `Detail: \`${p}help <befehl>\` oder in der Slash-Liste \`/help command:<name>\`.`,
+          "hilfe` oder wähl in der Guild-Slash-Liste `/help`.",
+        `Detail: \`${p}help <befehl>\` oder in der Guild-Slash-Liste \`/help command:<name>\`.`,
         "",
       ].join("\n");
 
@@ -83,14 +97,18 @@ function buildOverviewPages(ctx, isAdmin) {
   return pages;
 }
 
-function detailCard(cmd, config) {
+function detailCard(cmd, config, isDm) {
   const p = config.prefix;
+  const slash = !isDm;
+  const invoke = slash ? "/" + cmd.name : p + cmd.name;
   const lines = [
-    `**/${cmd.name}**${cmd.admin ? " _(Admin)_" : ""}`,
+    `**${invoke}**${cmd.admin ? " _(Admin)_" : ""}`,
     cmd.description || "",
     "",
     "**Aufruf**",
-    (cmd.usage || `\`/${cmd.name}\`\n\`${p}${cmd.name}\``).replaceAll("{prefix}", p),
+    slash
+      ? (cmd.usage || `\`/${cmd.name}\`\n\`${p}${cmd.name}\``).replaceAll("{prefix}", p)
+      : `\`${p}${cmd.name}\``,
   ];
   if (cmd.examples?.length) {
     lines.push("", "**Beispiele**");
@@ -139,8 +157,14 @@ function pageRow(page, total) {
   ];
 }
 
+function isDmContext(msg) {
+  // DM: keine Guild (msg.guildId fehlt/null). Auch bei einer Interaction ist
+  // msg.guild null, wenn kein Serverkontext (z.B. help:-Buttons haben aber immer Guild).
+  return msg?.guildId == null && !(msg?.guild);
+}
+
 async function sendOverview(ctx, msg, isAdmin, page = 0) {
-  const pages = buildOverviewPages(ctx, isAdmin);
+  const pages = buildOverviewPages(ctx, isAdmin, isDmContext(msg));
   const i = Math.max(0, Math.min(page, pages.length - 1));
   await msg.reply({
     content: pages[i],
@@ -171,6 +195,7 @@ module.exports = {
   },
   async run(ctx, args, msg) {
     const isAdmin = msg.author.id === ctx.config.adminId;
+    const inDm = isDmContext(msg);
     const target = (args[0] || "").toLowerCase();
 
     if (target) {
@@ -178,7 +203,9 @@ module.exports = {
       if (!cmd || (cmd.admin && !isAdmin)) {
         const suggestions = suggestCommands(target, ctx.commands, { admin: isAdmin });
         const hint = suggestions.length
-          ? `Meintest du: ${suggestions.map((s) => `\`/${s}\``).join(", ")}?`
+          ? `Meintest du: ${suggestions.map((s) => `\`${inDm ? ctx.config.prefix : "/"}${s}\``).join(", ")}?`
+          : inDm
+          ? `Schau unter \`${ctx.config.prefix}hilfe\`.`
           : "Schau unter `/help`.";
         await msg.reply({
           content: `Befehl \`${target}\` gibt es nicht. ${hint}`,
@@ -187,7 +214,7 @@ module.exports = {
         return;
       }
       await msg.reply({
-        content: detailCard(cmd, ctx.config),
+        content: detailCard(cmd, ctx.config, inDm),
         allowedMentions: { parse: [] },
       });
       return;
@@ -206,7 +233,7 @@ module.exports = {
     if (!m) return false;
     const page = parseInt(m[1], 10);
     const admin = interaction.user.id === ctx.config.adminId;
-    const pages = buildOverviewPages(ctx, admin);
+    const pages = buildOverviewPages(ctx, admin, isDmContext({ guildId: interaction.guildId, guild: interaction.guild }));
     const i = Math.max(0, Math.min(page, pages.length - 1));
     await interaction.update({
       content: pages[i],

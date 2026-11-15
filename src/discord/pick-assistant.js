@@ -36,7 +36,7 @@ const WIKI_URL_RE = /^(?:https?:\/\/)?(?:en|de)\.wikipedia\.org\/wiki\/[^\s]+$/i
 // er es konkret hin statt „mit dem Präfix“ zu sagen.
 function noNameSentence(prefix) {
   const p = prefix || "!";
-  return `Das habe ich nicht als Namen gelesen. Ein Name pro Zeile — für Hilfe: \`${p}hilfe\` oder \`/help\`.`;
+  return `Das habe ich nicht als Namen gelesen. Ein Name pro Zeile — für Hilfe: \`${p}hilfe\`.`;
 }
 function commaNameSentence(prefix) {
   const p = prefix || "!";
@@ -44,7 +44,7 @@ function commaNameSentence(prefix) {
 }
 function helpSentence(prefix) {
   const p = prefix || "!";
-  return `Für die Befehlsübersicht: \`${p}hilfe\` oder \`/help\`. Namen schreibst du einfach so — ein pro Zeile.`;
+  return `Für die Befehlsübersicht: \`${p}hilfe\`. Namen schreibst du einfach so — ein pro Zeile.`;
 }
 /** Reine Hilfewörter in der DM: aktiv die Übersicht zeigen statt sie als Name/Smalltalk zu verbuchen. */
 function isHelpWord(line) {
@@ -664,8 +664,9 @@ async function handlePickBody(ctx, msg, season) {
 
   // Slash-Befehle, die als Text getippt werden (z.B. `/celebs`): Discord sendet
   // die nur als echte Interaktion, wenn der User sie aus der Vorschlagliste
-  // wählt. Als reiner Text kommen sie hier an und sind KEINE Personen — nicht
-  // als Namen adden, sondern auf den Prefix-Äquivalent verweisen.
+  // wählt (und das nur in der Guild). Als reiner Text in der DM sind sie KEINE
+  // Personen — nicht adden, auf den Prefix-Äquivalent verweisen. Kein Slash-
+  // Rauschen in der DM: nur der Prefix-Weg wird genannt.
   const slash = /^\/([a-z][a-z0-9_-]*)(?:\s|$)/i.exec(body);
   if (slash) {
     const slashName = slash[1].toLowerCase();
@@ -673,8 +674,9 @@ async function handlePickBody(ctx, msg, season) {
     await reply(
       msg,
       known
-        ? `\`/${slashName}\` als Text geht so nicht (Slash braucht die Auswahl aus \`/\`-Vorschlagsliste). Tipp \`${prefix}${slashName}\` oder wähl den Befehl in der Liste.`
-        : `\`${body}\` ist weder ein Name noch ein bekannter Befehl. Für Hilfe: \`${prefix}hilfe\` oder aus der Slash-Liste \`/help\`.`
+        ? "\u201E`/`“ geht nur in der Guild aus der Vorschlagsliste — hier im DM geht der Befehl mit dem Präfix: `" +
+          `${prefix}${slashName}\`.`
+        : `\`${body}\` ist weder ein Name noch ein bekannter Befehl. Für Hilfe: \`${prefix}hilfe\`.`
     );
     return true;
   }
@@ -1062,7 +1064,7 @@ async function consumeDone(ctx, msg, season) {
       msg,
       [
         `✅ Liste für **${season.year}** liegt fest (${res.added} Tipps).`,
-        "Neue Wikipedia-Treffer prüft noch der Admin (`/review`). Bis dahin ist die Zuordnung vorläufig.",
+        "Neue Wikipedia-Treffer prüft noch der Admin (via Review). Bis dahin ist die Zuordnung vorläufig.",
         "Punkte: Alter am **" + (season.start_date || "Saisonstart") + "** (100 − Alter, unbekanntes Alter = 0).",
       ].join("\n")
     );

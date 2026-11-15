@@ -146,6 +146,7 @@ test("Hilfe: Überschrift, Prefix, Aufruf, unbekannter Befehl", async () => {
   const replies = [];
   const msg = {
     author: { id: "1" },
+    guildId: "guild-test", // Guild-Kontext: Slash existiert
     reply: async (payload) => replies.push(payload),
   };
 
@@ -175,8 +176,7 @@ test("Hilfe: Überschrift, Prefix, Aufruf, unbekannter Befehl", async () => {
   assert.deepStrictEqual(replies[2].allowedMentions, { parse: [] });
 });
 
-test("Hilfe: Nicht-Admin sieht keine Admin-Sektionen und den einfachen Kopf", async () => {
-  const { loadCommands } = require("../src/discord/commands");
+test("Hilfe: Nicht-Admin sieht keine Admin-Sektionen und den einfachen Kopf (Guild)", async () => {
   const commands = new Map();
   const mk = (name, admin, group, desc) =>
     commands.set(name, { name, description: desc || name, admin, group: group || "everyone", usage: `{prefix}${name}` });
@@ -191,6 +191,7 @@ test("Hilfe: Nicht-Admin sieht keine Admin-Sektionen und den einfachen Kopf", as
   const replies = [];
   const nonAdmin = {
     author: { id: "123" },
+    guildId: "guild-test", // Guild: Slash existiert
     reply: async (payload) => replies.push(payload),
   };
 
@@ -203,7 +204,46 @@ test("Hilfe: Nicht-Admin sieht keine Admin-Sektionen und den einfachen Kopf", as
   assert.equal(overview.includes("`go`") || overview.includes("/go"), false);
   assert.equal(overview.includes("`import`") || overview.includes("/import"), false);
   assert.ok(overview.includes("`liste`") || overview.includes("/liste"), "normale Befehle sichtbar");
-  assert.ok(overview.includes("/help"), "verweist auf /help");
+  // Guild: Slash-Weg darf erwähnt werden
+  assert.ok(overview.includes("/help"), "in der Guild verweist die Hilfe auf /help");
+  assert.ok(overview.includes("/liste"), "in der Guild sieht man den Slash-Befehl /liste");
+});
+
+test("Hilfe: In der DM keine Slash-Referenzen, nur Prefix-Befehle", async () => {
+  const commands = new Map();
+  const mk = (name, admin, group, desc) =>
+    commands.set(name, { name, description: desc || name, admin, group: group || "everyone", usage: `{prefix}${name}` });
+  mk("liste", false, "everyone", "Zeigt deine Liste");
+  mk("scores", false, "everyone", "Punkte");
+  mk("celeb", false, "everyone", "Person");
+  mk("kill", true, "match", "Todesfall");
+  mk("help", false, "everyone", "Hilfe");
+
+  const ctx = { config: { prefix: "!", adminId: "999" }, commands };
+  const replies = [];
+  const dmUser = {
+    author: { id: "123" },
+    guildId: null, // DM: kein Slash verfügbar
+    reply: async (payload) => replies.push(payload),
+  };
+
+  await help.run(ctx, [], dmUser);
+  const overview = contentOf(replies[0]);
+  // Keine einzige Slash-Referenz
+  assert.equal(overview.includes("/liste"), false, "kein /liste im DM");
+  assert.equal(overview.includes("/help"), false, "kein /help im DM");
+  assert.equal(overview.includes("/scores"), false, "kein /scores im DM");
+  assert.equal(overview.includes("/kill"), false, "kein /kill im DM");
+  // Nur-Prefix-Angaben
+  assert.ok(overview.includes("`!liste`"), "Prefix-Form von liste sichtbar");
+  assert.ok(overview.includes("!hilfe"), "verweist im DM auf !hilfe");
+
+  // Detail-Karte im DM: auch da kein Slash
+  replies.length = 0;
+  await help.run(ctx, ["liste"], dmUser);
+  const detail = contentOf(replies[0]);
+  assert.equal(detail.includes("/liste"), false, "Detail-Karte DM: kein /liste");
+  assert.ok(detail.includes("`!liste`"), "Detail-Karte DM: nur !liste");
 });
 
 test("Tagesbericht hängt an config.tz", () => {
