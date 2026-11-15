@@ -63,6 +63,16 @@ function acceptedWikiUrl(url) {
   }
 }
 
+/**
+ * Wiki-URL preview-frei als Text: `<https://…>` (Dispatch mit spitzen Klammern)
+ * bleibt klickbar, baut aber KEINEN Discord-Link-Preview auf. Reine URLs
+ * würden in Text-Nachrichten (Chunks) automatisch zu Rich-Preview-Einbetungen.
+ */
+function hideLinkPreview(url) {
+  if (!url) return "";
+  return `<${acceptedWikiUrl(url)}>`;
+}
+
 function is429(err) {
   if (err == null) return false;
   if (typeof err !== "object") return /\b429\b/.test(String(err));
@@ -211,12 +221,47 @@ function draftSentence(playerId) {
   return `Für ${announced.year} liegt ein Entwurf, mit \`fertig\` eingefroren.`;
 }
 
+/**
+ * Block für den announced-Saison-Entwurf (z.B. 2027): Wenn ein Draft existiert,
+ * wird er als eigener Abschnitt über der laufenden Liste angezeigt, damit man
+ * „meine 2027-Liste“ vs. „meine 2026-Liste“ direkt sieht. Preview-frei wie die
+ * laufende Liste.
+ */
+function draftBlock(playerId) {
+  const announced = db.getAnnouncedSeason();
+  if (!announced) return null;
+  const draft = db.getDraftForPlayer(playerId, announced.id);
+  if (!draft) return null;
+  const entries = db.listDraftEntries(draft.id);
+  const statusWord =
+    draft.status === "finalized" ? "🔒 eingefroren" : draft.status === "draft" ? "noch offen" : draft.status;
+  const lines = entries.length
+    ? entries.map((e, i) => {
+        const name = sanitizeDisplayName(e.resolved_name || e.raw_name);
+        let link = "";
+        if (e.link_status === "pending") link = " · _suche noch…_";
+        else if (e.link_status === "unlinked") link = " · _kein Artikel_";
+        else {
+          const href = hideLinkPreview(e.wiki_url);
+          if (href) link = ` · ${href}`;
+          else link = " · _kein Artikel_";
+        }
+        const age = e.proposed_age != null ? ` (${e.proposed_age})` : "";
+        return `${i + 1}. **${name}**${age}${link}`;
+      })
+    : ["_(noch keine Namen)_"];
+  return {
+    title: `**📋 Dein ${announced.year}-Entwurf** (Start ${announced.start_date || "?"} — ${statusWord})`,
+    body: lines.join("\n"),
+  };
+}
+
 function pickLine(c) {
   const flag = c.is_alive ? "🟢" : "💀";
   const name = sanitizeDisplayName(c.name);
   const age = c.age_at_pick != null ? ` (${c.age_at_pick})` : "";
   const desc = c.description && oneLine(c.description) ? ` — ${oneLine(c.description)}` : "";
-  const url = acceptedWikiUrl(c.wiki_url);
+  const url = hideLinkPreview(c.wiki_url);
   return `${flag} **${name}**${age}${desc}${url ? ` ${url}` : ""}`;
 }
 
@@ -301,7 +346,14 @@ const cmd = {
     bits.push(`${whose} — ${data.picks.length} Namen | Punkte **${data.total}**`);
     const header = `${bits.join("\n")}\n`;
     const lines = data.picks.map(pickLine);
-    await sendChunks(msg, chunkLines(header, lines));
+    const body = chunkLines(header, lines);
+
+    // Eigene DM-Liste: 2027-Entwurf über der laufenden 2026-Liste zeigen.
+    const upcoming = self && !msg.guildId && !msg.guild ? draftBlock(data.player.id) : null;
+    const payload = [];
+    if (upcoming) payload.push(`${upcoming.title}\n${upcoming.body}`);
+    payload.push(...(Array.isArray(body) ? body : [body]));
+    await sendChunks(msg, payload);
   },
 };
 
@@ -312,8 +364,10 @@ module.exports.replyText = replyText;
 module.exports.sanitizeDisplayName = sanitizeDisplayName;
 module.exports.mentionOpts = mentionOpts;
 module.exports.acceptedWikiUrl = acceptedWikiUrl;
+module.exports.hideLinkPreview = hideLinkPreview;
 module.exports.resolveSnowflakePoints = resolveSnowflakePoints;
 module.exports.installSnowflakePlayerQuery = installSnowflakePlayerQuery;
+module.exports.draftBlock = draftBlock;
 module.exports.RETRY_DELAY_MS = RETRY_DELAY_MS;
 module.exports.NOT_REGISTERED = NOT_REGISTERED;
 module.exports.DM_FOREIGN_LIST = DM_FOREIGN_LIST;

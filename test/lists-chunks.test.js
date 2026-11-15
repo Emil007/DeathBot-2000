@@ -282,6 +282,9 @@ describe("M15 lists and chunks", { concurrency: false }, () => {
     assert.doesNotMatch(ownText, /<@1>/);
     assert.doesNotMatch(ownText, /evil\.example/);
     assert.match(ownText, /wikipedia\.org\/wiki\/David_Bowie/);
+    // Preview-frei: URL in spitzen Klammern statt roher Autolink
+    assert.match(ownText, /<https:\/\/en\.wikipedia\.org\/wiki\/David_Bowie>/);
+    assert.doesNotMatch(ownText, /(^|\s)https:\/\/en\.wikipedia\.org/);
     assert.match(ownText, /Note Zwei/);
     assert.doesNotMatch(ownText, /Note\nZwei/);
     assertMentions(own.payloads);
@@ -310,6 +313,9 @@ describe("M15 lists and chunks", { concurrency: false }, () => {
     const draftView = capture(AUTHOR);
     await liste.run(ctx, [], draftView.msg);
     assert.match(draftView.text(), /noch nicht mit `fertig` eingefroren/);
+    // DM: der announced-Entwurf (2027) erscheint als eigener Block über der Liste
+    assert.match(draftView.text(), new RegExp(`Dein ${announcedYear}-Entwurf`));
+    assert.doesNotMatch(draftView.text(), new RegExp(`Dein ${year}-Entwurf`));
 
     db.getDb()
       .prepare("UPDATE pick_drafts SET status = 'finalized' WHERE player_id = ? AND season_id = ?")
@@ -425,7 +431,10 @@ describe("M15 lists and chunks", { concurrency: false }, () => {
     await celebs.run(ctx, [], all.msg);
     assert.match(all.text(), /ZqxvCeleb everyone/);
     assert.doesNotMatch(all.text(), /evil\.example/);
+    // Preview-frei: URL in spitzen Klammern
+    assert.match(all.text(), /<https:\/\/en\.wikipedia\.org\/wiki\/ZqxvWiki>/);
     assert.match(all.text(), /wikipedia\.org\/wiki\/ZqxvWiki/);
+    assert.doesNotMatch(all.text(), /(^|\s)https:\/\/en\.wikipedia\.org/);
     assertMentions(all.payloads);
   });
 

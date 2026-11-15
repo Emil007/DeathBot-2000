@@ -1,5 +1,5 @@
 const db = require("../../db");
-const { sendChunks, chunkLines, sanitizeDisplayName, acceptedWikiUrl } = require("./liste");
+const { sendChunks, chunkLines, sanitizeDisplayName, hideLinkPreview } = require("./liste");
 
 const cmd = {
   name: "celebs",
@@ -27,7 +27,7 @@ const cmd = {
       const age = c.age_at_pick != null ? ` · ${c.age_at_pick}` : "";
       const picks = c.pick_count ? ` · ${c.pick_count}×` : " · 0×";
       const wiki = c.wiki_confirmed ? (c.manual_only ? " · manual" : "") : " · ⏳";
-      const url = acceptedWikiUrl(c.wiki_url);
+      const url = hideLinkPreview(c.wiki_url);
       return `${flag} **${sanitizeDisplayName(c.name)}**${age}${picks}${wiki}${url ? ` ${url}` : ""}`;
     });
 

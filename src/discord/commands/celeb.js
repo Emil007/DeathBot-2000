@@ -1,6 +1,6 @@
 const { usageReply } = require("../usage");
 const db = require("../../db");
-const { sendChunks, chunkLines, sanitizeDisplayName, acceptedWikiUrl } = require("./liste");
+const { sendChunks, chunkLines, sanitizeDisplayName, hideLinkPreview } = require("./liste");
 
 function oneLine(raw) {
   return String(raw ?? "")
@@ -42,7 +42,7 @@ const cmd = {
     const season = db.getActiveSeason();
     const blocks = found.map((c) => {
       const winners = season ? db.getWinnersForCeleb(c.id, season.id) : [];
-      const url = acceptedWikiUrl(c.wiki_url);
+      const url = hideLinkPreview(c.wiki_url);
       const akas = db.getAkas(c.id).map((a) => sanitizeDisplayName(a)).filter(Boolean);
       const blocked = db.getBlacklist(c.id).map((a) => sanitizeDisplayName(a)).filter(Boolean);
       const note = c.description ? oneLine(c.description) : "";
