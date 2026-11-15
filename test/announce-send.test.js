@@ -39,6 +39,8 @@ before(() => {
   db.setSeasonLive(true);
   db.getDb().prepare("UPDATE seasons SET phase = 'running' WHERE active = 1").run();
   db.setSeasonDeathpoolChannel(db.getActiveSeason().id, "pool-1");
+  // Der Tagesbericht landet im All-Deaths-Kanal, nicht im Deathpool-Kanal.
+  config.channelAllDeaths = "all-deaths-1";
 });
 
 after(() => {
@@ -426,7 +428,7 @@ test("unavailable guild is not reported as a missing channel", async () => {
     () => announceDailySummary(client, config),
     (err) => {
       assert.strictEqual(err.unavailable, true);
-      assert.strictEqual(err.channelId, "pool-1");
+      assert.strictEqual(err.channelId, "all-deaths-1");
       assert.doesNotMatch(String(err.message), /Kanal fehlt/);
       return true;
     }

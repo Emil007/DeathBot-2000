@@ -633,7 +633,10 @@ async function announceAllDeath(client, config, entry, { isDeOnly = false, brief
 async function announceDailySummary(client, config) {
   if (!db.isLive()) return;
 
-  const channelId = db.resolveDeathpoolChannel(config);
+  // Der Tagesbericht ist ein sachlicher Überblick über ALLE neuen Todesfälle
+  // („Nicht jeder davon stand auf einer Tippliste.“) → gehört in den
+  // All-Deaths-Kanal, NICHT in den Deathpool-Kanal.
+  const channelId = config.channelAllDeaths;
   const channel = await requireTextChannel(client, channelId, config, "announceDailySummary");
 
   const rows = db.deathsSinceHours(26);

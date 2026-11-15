@@ -732,11 +732,13 @@ test("F15: create failure triggers logError and confirmation text („Wechsel oh
 
 // ---- F06: announce.js + Tagesbericht nutzen den gespeicherten Kanal ----
 
-test("F06: announceDailySummary sends to the stored deathpool channel, not the env fallback", async () => {
+test("F06: announceDailySummary sends to the all-deaths channel, not the stored deathpool channel", async () => {
   const { announceDailySummary } = require("../src/discord/announce");
   const running = db.getActiveSeason();
   db.setSeasonLive(true);
   db.setSeasonDeathpoolChannel(running.id, "stored-summary-1");
+
+  const configAll = { ...config, channelAllDeaths: "all-deaths-1", channelDeathpool: "env-deathpool-1" };
 
   const fetched = [];
   const sent = [];
@@ -748,9 +750,10 @@ test("F06: announceDailySummary sends to the stored deathpool channel, not the e
       },
     },
   };
-  await announceDailySummary(client, config);
-  assert.ok(fetched.includes("stored-summary-1"), "daily summary targets stored channel id");
-  assert.ok(!fetched.includes(config.channelDeathpool), "env deathpool must NOT be used while stored id exists");
+  await announceDailySummary(client, configAll);
+  assert.ok(fetched.includes("all-deaths-1"), "daily summary targets the all-deaths channel");
+  assert.ok(!fetched.includes("stored-summary-1"), "stored deathpool channel must NOT be used");
+  assert.ok(!fetched.includes("env-deathpool-1"), "env deathpool must NOT be used");
   assert.strictEqual(sent.length, 1, "summary message posted");
 
   db.setSeasonDeathpoolChannel(running.id, null);
