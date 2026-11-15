@@ -65,6 +65,8 @@ const rerunUsers = new Set();
 /** R2-4: User-Interventionen (URL/link/falsch/Menü) stoppen den laufenden
  * Auto-Resolver, damit er die manuelle Auswahl nicht überschreibt. */
 const interruptUsers = new Set();
+/** In-Memory-Ack für „wenige Namen trotzdem locken“ (erste Warnung, zweites fertig löst aus). */
+const fewUsers = new Set();
 
 /** Ack für „erster fertig bei unlinked“, solange die Spalte noch nicht da ist. */
 const memoryUnlinkedAck = new Set();
@@ -1037,15 +1039,31 @@ async function consumeDone(ctx, msg, season) {
     return true;
   }
 
+  // F26: Wenige Namen vor dem Lock warnen (einfach bestätigen = zweites `fertig`).
+  const cap = ctx.config?.maxPicksPerPlayer || 50;
+  const minPicks = ctx.config?.minPicksPerPlayer ?? 3;
+  if (entries.length < minPicks && !fewUsers.has(msg.author.id)) {
+    fewUsers.add(msg.author.id);
+    await reply(
+      msg,
+      `⚠️ Nur **${entries.length} von ${minPicks}** Namen auf der Liste${cap ? ` (max ${cap})` : ""}. \nNochmal \`fertig\` und ich friere sie trotzdem ein.`
+    );
+    return true;
+  }
+
   const res = db.finalizeDraft(player.id, season.id);
   if (res.locked) {
+    fewUsers.delete(msg.author.id);
     await reply(msg, "Deine Liste ist bereits eingefroren.");
   } else if (res.reason === "empty") {
+    fewUsers.delete(msg.author.id);
     await reply(msg, "Du hast noch keine Namen geschickt — tipp erst Personen ein, dann `fertig`.");
   } else if (res.blocked === "unlinked") {
+    fewUsers.delete(msg.author.id);
     const fresh = db.listDraftEntries(draft.id);
     await reply(msg, unlinkedLines(fresh, res.names));
   } else if (res.blocked) {
+    fewUsers.delete(msg.author.id);
     const fresh = db.listDraftEntries(draft.id);
     if (res.blocked === "pending" || fresh.some((e) => e.link_status === "pending")) {
       await reply(msg, PENDING_FERTIG_SENTENCE);
@@ -1055,6 +1073,7 @@ async function consumeDone(ctx, msg, season) {
   } else {
     if (hasAckColumn()) setDraftAck(draft.id, false);
     else memoryUnlinkedAck.delete(draft.id);
+    fewUsers.delete(msg.author.id);
     await logEvent(ctx.client, ctx.config, {
       kind: "pick-finalize",
       summary: `Draft finalisiert (${res.added} Tipps, Saison ${season.year})`,
@@ -1064,7 +1083,7 @@ async function consumeDone(ctx, msg, season) {
       msg,
       [
         `✅ Liste für **${season.year}** liegt fest (${res.added} Tipps).`,
-        "Neue Wikipedia-Treffer prüft noch der Admin (via Review). Bis dahin ist die Zuordnung vorläufig.",
+        "Deine Namen sind bereits zugeordnet. Noch nicht freigeschaltete Celebs bestätigt der Admin kurz (danach zählen sie offiziell).",
         "Punkte: Alter am **" + (season.start_date || "Saisonstart") + "** (100 − Alter, unbekanntes Alter = 0).",
       ].join("\n")
     );

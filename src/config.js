@@ -87,6 +87,9 @@ function loadConfig() {
     // Maximale Namen/Karten pro Spieler-Einreichung — der Tipp-Assistent kappt
     // darüber (per Paste). Global über die compose/env steuerbar (Default 50).
     maxPicksPerPlayer: intEnv("MAX_PICKS_PER_PLAYER", 50),
+    // Warnung beim Lock, wenn deutlich weniger Namen als erwartet auf der Liste
+    // sind (z.B. 3 statt 50). Nur Warnung + Bestätigung, kein harter Block.
+    minPicksPerPlayer: intEnv("MIN_PICKS_PER_PLAYER", 3),
     deathConfirmDays: intEnv("DEATH_CONFIRM_DAYS", 7),
     nightlyFullScrapeHour: intEnv("NIGHTLY_FULL_SCRAPE_HOUR", 3),
     userAgent: optional(

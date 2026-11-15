@@ -354,6 +354,7 @@ function fakeCtx(authorId, displayName, opts = {}) {
     config: {
       ...loadConfig(),
       maxPicksPerPlayer: opts.maxPicksPerPlayer ?? 50,
+      minPicksPerPlayer: opts.minPicksPerPlayer ?? loadConfig().minPicksPerPlayer ?? 3,
       channelLog: "",
     },
   };
@@ -1014,7 +1015,8 @@ test("öffnen alone does not change a finalized draft", async () => {
 test("first fertig with unlinked names the person and does not freeze; second fertig does", async () => {
   const season = db.getAnnouncedSeason();
   const active = db.getActiveSeason();
-  const { ctx, msg } = fakeCtx("unlink-m12", "Unlink");
+  // minPicks=1, damit der unlinked-Flow im Vordergrund bleibt (F26-Warnung ist eigener Test).
+  const { ctx, msg } = fakeCtx("unlink-m12", "Unlink", { minPicksPerPlayer: 1 });
   const pid = db
     .getDb()
     .prepare("INSERT INTO players (display_name, discord_user_id, base_points) VALUES ('Unlink','unlink-m12','0')")
@@ -1053,6 +1055,39 @@ test("first fertig with unlinked names the person and does not freeze; second fe
   const second = await sendPick(ctx, msg, "fertig");
   assert.strictEqual(second, true);
   assert.strictEqual(db.getDraftForPlayer(pid, season.id).status, "finalized");
+});
+
+test("fertig with too few names warns once, second fertig confirms", async () => {
+  const season = db.getAnnouncedSeason();
+  // minPicks=3: genau die Warnung, die der User mit 3 statt 50 erwartet.
+  const { ctx, msg } = fakeCtx("few-m13", "Few", { minPicksPerPlayer: 3 });
+  const pid = db
+    .getDb()
+    .prepare("INSERT INTO players (display_name, discord_user_id, base_points) VALUES ('Few','few-m13','0')")
+    .run().lastInsertRowid;
+  const draft = db.getOrCreateDraft(pid, season.id);
+  db.addDraftNames(draft.id, ["Michael Douglas"]);
+  const entry = db.listDraftEntries(draft.id)[0];
+  db.setDraftEntryLinked(entry.id, {
+    linkStatus: "linked",
+    qid: "QM",
+    wikiNorm: "en:michael_douglas",
+    wikiUrl: "https://en.wikipedia.org/wiki/Michael_Douglas",
+    resolvedName: "Michael Douglas",
+  });
+  db.getDb().prepare("UPDATE celebs SET wiki_confirmed = 0 WHERE id = ?").run(entry.celeb_id);
+
+  const first = await sendPick(ctx, msg, "fertig");
+  assert.strictEqual(first, true);
+  const warn = lastReply(msg.channel.replies);
+  assert.match(warn, /Nur \*\*1 von 3\*\*/);
+  assert.match(warn, /Nochmal `fertig`/);
+  assert.strictEqual(db.getDraftForPlayer(pid, season.id).status, "draft", "not frozen after warning");
+
+  msg.channel.replies.length = 0;
+  const second = await sendPick(ctx, msg, "fertig");
+  assert.strictEqual(second, true);
+  assert.strictEqual(db.getDraftForPlayer(pid, season.id).status, "finalized", "second fertig confirms");
 });
 
 test("worst case: foreign draft rowid and select index 9 do not write", async () => {

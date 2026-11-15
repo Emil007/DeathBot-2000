@@ -82,9 +82,19 @@ function buildOverviewPages(ctx, isAdmin, isDm) {
         "",
       ].join("\n");
 
+  // Reine DM-Wörter des Tipp-Assistenten — keine Command-Objekte, daher hier
+  // als eigene Sektion der Übersicht. Auch in der Guild sinnvoll zu wissen.
+  const dmAssist = [
+    "**Tipp-Assistent (im DM)**",
+    "`fertig` friert deine Liste ein — bei ganz wenigen Namen fragt er nochmal nach.",
+    "`unlock` öffnet eine eingefrorene Liste wieder; danach erneut `fertig`.",
+    "`entfernen 3` · `ändern 3 Neuer Name` · `falsch 3` · `link 3 <URL>`",
+  ].join("\n");
+
   const pages = [];
   let current = header;
-  for (const section of sections) {
+  const sectionsWithAssist = [dmAssist, ...sections];
+  for (const section of sectionsWithAssist) {
     if ((current + "\n\n" + section).length > 1800) {
       pages.push(current.trim());
       current = section;
