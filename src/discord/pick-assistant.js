@@ -1046,7 +1046,7 @@ async function consumeDone(ctx, msg, season) {
     fewUsers.add(msg.author.id);
     await reply(
       msg,
-      `⚠️ Nur **${entries.length} von ${minPicks}** Namen auf der Liste${cap ? ` (max ${cap})` : ""}. \nNochmal \`fertig\` und ich friere sie trotzdem ein.`
+      `⚠️ Nur **${entries.length} von ${cap}** Namen auf der Liste. \nNochmal \`fertig\` und ich friere sie trotzdem ein.`
     );
     return true;
   }

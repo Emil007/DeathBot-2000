@@ -1080,7 +1080,7 @@ test("fertig with too few names warns once, second fertig confirms", async () =>
   const first = await sendPick(ctx, msg, "fertig");
   assert.strictEqual(first, true);
   const warn = lastReply(msg.channel.replies);
-  assert.match(warn, /Nur \*\*1 von 3\*\*/);
+  assert.match(warn, /Nur \*\*1 von 50\*\*/);
   assert.match(warn, /Nochmal `fertig`/);
   assert.strictEqual(db.getDraftForPlayer(pid, season.id).status, "draft", "not frozen after warning");
 
