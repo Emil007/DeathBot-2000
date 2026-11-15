@@ -883,6 +883,16 @@ function isSetupAdmin(interaction, config) {
 async function replyEphemeral(interaction, content) {
   const payload = { content, ephemeral: true, ...mentionOpts() };
   try {
+    // Nach einem evtl. vorherigen deferReply ist reply() nicht mehr gültig —
+    // dann editReply mit ephemeral:true nutzen.
+    if (typeof interaction?.editReply === "function") {
+      try {
+        await interaction.editReply(payload);
+        return;
+      } catch {
+        /* fallback auf reply */
+      }
+    }
     if (typeof interaction?.reply === "function") await interaction.reply(payload);
   } catch (e) {
     console.error("[channel-setup] ephemeral reply failed:", e.message);
@@ -977,6 +987,19 @@ async function handleChannelSetupInner(interaction, client, config) {
   if (!isSetupAdmin(interaction, config)) {
     await replyEphemeral(interaction, "Nur der Admin darf das.");
     return true;
+  }
+
+  // Discord-Interactions müssen innerhalb von 3s geackt werden, sonst meldet
+  // Discord „hat nicht rechtzeitig reagiert". Der Klick auf „#kanal nehmen"
+  // darf nicht erst nach resolveGuild/channels.fetch/linkChannel (mehrere
+  // awaits) geackt werden — sofort defernen, danach editReply nutzen.
+  try {
+    if (typeof interaction?.deferReply === "function") {
+      await interaction.deferReply();
+    }
+  } catch (e) {
+    console.error("[channel-setup] deferReply failed:", e.message);
+    // Weiter, falls die Interaktion schon anderweitig geackt wurde.
   }
 
   const { active, seasonId, entry } = currentOpen();
