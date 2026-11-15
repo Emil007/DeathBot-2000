@@ -32,10 +32,24 @@ const LINK_URL_RE = /^link\s+(\d+)\s+(\S+\.wikipedia\.org\/wiki\/\S+)$/i;
 const WRONG_RE = /^(?:falsch|nein|wrong|nicht richtig|falsche)\s*(?:\s*(\d+))?$/i;
 const WIKI_URL_RE = /^(?:https?:\/\/)?(?:en|de)\.wikipedia\.org\/wiki\/[^\s]+$/i;
 
-const NO_NAME_SENTENCE =
-  "Das habe ich nicht als Namen gelesen. Ein Name pro Zeile, oder `hilfe` mit dem Prefix.";
-const COMMA_NAME_SENTENCE =
-  "Das habe ich nicht als Namen gelesen. Ein Name pro Zeile, oder `hilfe` mit dem Prefix. Bei `Merkel, Angela`: das Komma klebt zu einem Namen — schick `Angela Merkel`, oder zwei Zeilen.";
+// Hinweise für No-Name-DM-Noûts. Das Präfix ist dem Bot bekannt, also schreibt
+// er es konkret hin statt „mit dem Präfix“ zu sagen.
+function noNameSentence(prefix) {
+  const p = prefix || "!";
+  return `Das habe ich nicht als Namen gelesen. Ein Name pro Zeile — für Hilfe: \`${p}hilfe\` oder \`/help\`.`;
+}
+function commaNameSentence(prefix) {
+  const p = prefix || "!";
+  return `${noNameSentence(p)} Bei \`Merkel, Angela\`: das Komma klebt zu einem Namen — schick \`Angela Merkel\`, oder zwei Zeilen.`;
+}
+function helpSentence(prefix) {
+  const p = prefix || "!";
+  return `Für die Befehlsübersicht: \`${p}hilfe\` oder \`/help\`. Namen schreibst du einfach so — ein pro Zeile.`;
+}
+/** Reine Hilfewörter in der DM: aktiv die Übersicht zeigen statt sie als Name/Smalltalk zu verbuchen. */
+function isHelpWord(line) {
+  return /^(hilfe|help|help me|commands|befehle)(\s|$)/i.test(String(line || "").trim());
+}
 const BUSY_SENTENCE =
   "Ich ordne noch die letzte Liste zu. Wart, bis die Nachricht `Zuordnung fertig` da ist.";
 const QUOTA_SENTENCE =
@@ -641,9 +655,21 @@ async function tryConsumePickMessage(ctx, msg) {
 
 async function handlePickBody(ctx, msg, season) {
   const body = String(msg.content || "").trim();
+  const prefix = (ctx.config && ctx.config.prefix) || "!";
+
+  // Prefix-Nachrichten (z.B. `!hilfe`) in der DM sind BEFEHLE, keine Namen:
+  // nicht hier schlucken, damit sie bis zum Prefix-Dispatcher durchlaufen.
+  // (Der passt den Namen selbst an und zeigt eine vernünftige Antwort.)
+  if (body.startsWith(prefix)) return false;
+
+  if (isHelpWord(body)) {
+    // Reine Hilfewörter aktiv beantworten, statt sie als Namen/Smalltalk zu verbuchen.
+    await reply(msg, helpSentence(prefix));
+    return true;
+  }
 
   if (isSmallTalkLine(body)) {
-    await reply(msg, NO_NAME_SENTENCE);
+    await reply(msg, noNameSentence(prefix));
     return true;
   }
 
@@ -677,7 +703,7 @@ async function handlePickBody(ctx, msg, season) {
 
   const rawLines = body.split(/\n/);
   if (rawLines.some((line) => line.includes(",") && !isCommandLine(line))) {
-    await reply(msg, COMMA_NAME_SENTENCE);
+    await reply(msg, commaNameSentence(prefix));
     return true;
   }
 
@@ -690,7 +716,7 @@ async function handlePickBody(ctx, msg, season) {
   const cmdLines = (parsed.names || []).filter((n) => UNKNOWN_CMD_RE.test(n.trim()));
 
   if (!parsed.names || !parsed.names.length) {
-    await reply(msg, NO_NAME_SENTENCE);
+    await reply(msg, noNameSentence(prefix));
     return true;
   }
   if (!cleanNames.length) {

@@ -1218,3 +1218,25 @@ test("linked draft entry with redirect resolves to canonical celeb name on final
   db.getDb().prepare("DELETE FROM pick_drafts WHERE player_id = ? AND season_id = ?").run(pid, season.id);
   db.getDb().prepare("DELETE FROM players WHERE id = ?").run(pid);
 });
+
+test("DM: `!hilfe` ist kein Name — fällt auf den Prefix-Befehl durch", async () => {
+  const { ctx, msg } = fakeCtx("hilfe-prefix", "HilfeTester");
+  msg.content = "!hilfe";
+  const res = await assistant.tryConsumePickMessage(ctx, msg);
+  assert.strictEqual(res, false, "Prefix-Nachricht wird nicht als Pick konsumiert");
+  assert.strictEqual(playerId("hilfe-prefix"), null, "kein Spieler angelegt");
+});
+
+test("DM: `hilfe`/`help` bekommt eine Hilf-Antwort statt Smalltalk-Platzhalter", async () => {
+  const { ctx, msg } = fakeCtx("hilfe-word", "HilfeWord");
+  for (const word of ["hilfe", "help", "Hilfe"]) {
+    msg.content = word;
+    msg.channel.replies.length = 0;
+    const res = await assistant.tryConsumePickMessage(ctx, msg);
+    assert.strictEqual(res, true, `${word} wird konsumiert und beantwortet`);
+    const text = replyText(msg);
+    assert.match(text, /hilfe|help/i, `${word} verweist auf Hilfe`);
+    assert.ok(!/mit dem Prä/.test(text), `${word} sagt nicht mehr \`mit dem Präfix\``);
+    assert.strictEqual(playerId("hilfe-word"), null, `kein Spieler durch ${word}`);
+  }
+});
