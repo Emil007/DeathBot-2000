@@ -901,6 +901,15 @@ async function replyEphemeral(interaction, content) {
 
 async function updateMessage(interaction, payload) {
   const body = { ...payload, ...mentionOpts() };
+  // Nach deferReply ist update() ungültig (Discord: „reply has already been
+  // sent or deferred“) — dann nur editReply. Deferred-Status ist an der
+  // Interaction als deferred-Flag gesetzt.
+  if (interaction?.deferred) {
+    if (typeof interaction?.editReply === "function") {
+      await interaction.editReply(body);
+      return;
+    }
+  }
   if (typeof interaction?.update === "function") {
     await interaction.update(body);
     return;
