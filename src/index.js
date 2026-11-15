@@ -32,7 +32,9 @@ const ADMIN_ONLY_TEXT = "Nur der Admin darf das.";
 const DATA_DM_TEXT = "Datenbefehle nur in der Guild.";
 
 // Nicht-Admin-Befehle, die Punkte oder Listen zeigen. In der DM aus — auch für den Admin.
-const DM_DATA_COMMANDS = new Set(["liste", "scores", "players", "celeb", "celebs"]);
+// liste ist bewusst NICHT dabei: Die EIGENE Liste gehört zum DM-Self-Service-Workflow
+// (Namen schicken → Liste prüfen). Fremde Listen sperrt liste.run selbst über den DM-Guard.
+const DM_DATA_COMMANDS = new Set(["scores", "players", "celeb", "celebs"]);
 
 // F18d: Präfix-Argumente sollen „note:Zwei Worte“ erhalten können. Der naive
 // whitespace-Split lieferte nur „note:Zwei“. Bekannte Schlüssel/Flags markieren
@@ -121,7 +123,13 @@ function guildGateDecision(interaction, config) {
   const guildId = interaction?.guildId ?? null;
   const noGuild = guildId == null || guildId === "";
   const customId = String(interaction?.customId || "");
-  const dmSpecial = noGuild && (customId.startsWith("pka:") || customId.startsWith("crev:"));
+  // Die Hilfe-Seiten-Buttons ("Zurück"/"Weiter") kommen auch im DM an (guildId null),
+  // wenn der User die Hilfe per Präfix aufgerufen hat. Ohne dmSpecial würde Discord
+  // die Button-Interaktion nie beantworten → "Gregg hat nicht reagiert". Wie pka:/crev:
+  // werden sie als DM-Sonderfall behandelt; allowGuildDm prüft die Mitgliedschaft.
+  const dmHelp = noGuild && (customId.startsWith("help:page:") || customId === "help:noop");
+  const dmSpecial =
+    noGuild && (customId.startsWith("pka:") || customId.startsWith("crev:") || dmHelp);
   // Das Kanal-Setup stellt die Frage als DM an den Admin — der Klick auf
   // "dp:setup:*" in der DM ist unser Pflichtkanal, der darf NICHT vom
   // Guild-Gate verschluckt werden. isSetupAdmin prüft die Berechtigung im
@@ -292,7 +300,8 @@ async function main() {
       const gate = guildGateDecision(interaction, config);
       if (!gate.ours) {
         if (gate.dmSpecial) {
-          // pka:/crev: nur für Mitglieder dieser Guild (oder adminId). Sonst keine Daten.
+          // pka:/crev:/help:page:/dp:setup: nur für Mitglieder dieser Guild (oder adminId).
+          // Sonst keine Daten.
           const allowed = await allowGuildDm(client, config, interaction.user?.id);
           if (!allowed) return;
         } else {

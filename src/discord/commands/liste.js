@@ -5,8 +5,10 @@ const RETRY_DELAY_MS = 2000;
 const SNOWFLAKE = /^\d{16,20}$/;
 const UNNAMED = "„Unbenannt“";
 
+const DM_FOREIGN_LIST = "Fremde Listen nur in der Guild — schreib `!liste @User` dort.";
+
 const NOT_REGISTERED =
-  "Du bist noch nicht angemeldet. Schreib mir die Namen per DM, oder `/picks`. Ein Admin-Import ist dafür nicht nötig.";
+  "Du bist noch nicht angemeldet. Schreib mir die Namen per DM, oder in der Guild `/picks`. Ein Admin-Import ist dafür nicht nötig.";
 const NEED_MENTION = "Nenn die Person als Mention.";
 
 /**
@@ -251,9 +253,15 @@ const cmd = {
     const authorId = String(msg.author.id);
     const mention = msg.mentions?.users?.first?.() || null;
     let discordId = authorId;
+    const inDm = msg.guildId == null && !(msg.guild);
 
     if (mention) {
       discordId = String(mention.id);
+      if (inDm && discordId !== authorId) {
+        // Fremde Liste per Mention in der DM: bleibt Guild-Domain.
+        await replyText(msg, DM_FOREIGN_LIST);
+        return;
+      }
       if (discordId !== authorId && !db.findPlayerByQuery(discordId)) {
         await replyText(msg, NEED_MENTION);
         return;
@@ -267,6 +275,11 @@ const cmd = {
       const player = db.findPlayerByQuery(q);
       if (!player) {
         await replyText(msg, NEED_MENTION);
+        return;
+      }
+      if (inDm && String(player.discord_user_id) !== authorId) {
+        // Fremde Liste per Snowflake in der DM: bleibt Guild-Domain.
+        await replyText(msg, DM_FOREIGN_LIST);
         return;
       }
       discordId = String(player.discord_user_id);
@@ -303,4 +316,5 @@ module.exports.resolveSnowflakePoints = resolveSnowflakePoints;
 module.exports.installSnowflakePlayerQuery = installSnowflakePlayerQuery;
 module.exports.RETRY_DELAY_MS = RETRY_DELAY_MS;
 module.exports.NOT_REGISTERED = NOT_REGISTERED;
+module.exports.DM_FOREIGN_LIST = DM_FOREIGN_LIST;
 module.exports.NEED_MENTION = NEED_MENTION;

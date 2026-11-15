@@ -294,7 +294,8 @@ describe("M15 lists and chunks", { concurrency: false }, () => {
     await liste.run(ctx, ["%"], byWild.msg);
     assert.strictEqual(byWild.text(), liste.NEED_MENTION);
 
-    const bySnow = capture("100000000000000088");
+    const bySnow = capture("100000000000000088", null);
+    bySnow.msg.guildId = "guild-test"; // Guild-Kontext: fremde Snowflake-Liste erlaubt
     await liste.run(ctx, [AUTHOR], bySnow.msg);
     assert.match(bySnow.text(), /Liste \*\*Ada here\*\*/);
     assert.match(bySnow.text(), /Namen \| Punkte/);
@@ -432,6 +433,33 @@ describe("M15 lists and chunks", { concurrency: false }, () => {
     assert.strictEqual(scores.description, "Rangliste: wer richtig gelegen hat");
     assert.strictEqual(liste.description, "Namenliste, deine oder die eines anderen");
     assert.strictEqual(players.description, "Alle Spieler und ihre Punkte");
+  });
+
+  test("liste: eigene Liste im DM erlaubt, fremde Liste im DM blockt", async () => {
+    clearPlayers();
+    const year = db.getActiveSeason().year;
+    const player = db.upsertPlayer({ displayName: "Ada", discordUserId: AUTHOR });
+    const good = db.findOrCreateCeleb({ name: "Bowie", description: "Note" });
+    const season = db.getActiveSeason();
+    db.setPick(player.id, good.celeb.id, season.id);
+
+    // DM: eigene Liste ohne Angabe → läuft durch und zeigt die Liste
+    const ownDm = capture(AUTHOR);
+    await liste.run(ctx, [], ownDm.msg);
+    assert.match(ownDm.text(), new RegExp(`Deine Liste ${year}`));
+    assert.match(ownDm.text(), /Bowie/);
+    assert.doesNotMatch(ownDm.text(), /Fremde Listen/);
+
+    // DM: fremde Liste per Mention → blockt mit DM_FOREIGN_LIST
+    const foreignMention = capture("100000000000000077", AUTHOR);
+    await liste.run(ctx, [], foreignMention.msg);
+    assert.strictEqual(foreignMention.text(), liste.DM_FOREIGN_LIST);
+
+    // DM: fremde Liste per Snowflake → blockt mit DM_FOREIGN_LIST
+    const other = capture("100000000000000077");
+    db.upsertPlayer({ displayName: "Betty", discordUserId: "100000000000000077", basePoints: 10 });
+    await liste.run(ctx, [AUTHOR], other.msg);
+    assert.strictEqual(other.text(), liste.DM_FOREIGN_LIST);
   });
 
   test("sanitizeDisplayName strips markdown and mentions onto one line", () => {

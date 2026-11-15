@@ -103,8 +103,13 @@ test("null guildId and custom id pka:pick:1 is the DM special case, not a guild 
   assert.strictEqual(crev.guildDataCommand, false);
 
   const otherDm = guildGateDecision({ guildId: null, customId: "help:page:1" }, config);
-  assert.strictEqual(otherDm.dmSpecial, false);
+  // Die Hilfeseiten-Buttons sind auch im DM erlaubt (kein Guild-Datenbefehl).
+  assert.strictEqual(otherDm.dmSpecial, true);
   assert.strictEqual(otherDm.guildDataCommand, false);
+
+  const helpNoop = guildGateDecision({ guildId: null, customId: "help:noop" }, config);
+  assert.strictEqual(helpNoop.dmSpecial, true);
+  assert.strictEqual(helpNoop.guildDataCommand, false);
 });
 
 test("our guild is accepted", () => {
@@ -175,9 +180,10 @@ test("admin is adminId everywhere; admin role only inside a guild", () => {
   assert.strictEqual(isAdminActor({ author: { id: "9" }, guildId: "guild-test" }, config), false);
 });
 
-test("DM data commands are liste, scores, players, celeb, celebs including aliases", () => {
-  assert.strictEqual(isDmDataCommand({ name: "liste" }), true);
-  assert.strictEqual(isDmDataCommand({ name: "list", _aliasOf: "liste" }), true);
+test("DM data commands are scores, players, celeb, celebs including aliases (liste is DM-open)", () => {
+  // liste ist bewusst NICHT blockiert: die EIGENE Liste gehört zum DM-Self-Service.
+  assert.strictEqual(isDmDataCommand({ name: "liste" }), false);
+  assert.strictEqual(isDmDataCommand({ name: "list", _aliasOf: "liste" }), false);
   assert.strictEqual(isDmDataCommand({ name: "score", _aliasOf: "scores" }), true);
   assert.strictEqual(isDmDataCommand({ name: "celebliste", _aliasOf: "celebs" }), true);
   assert.strictEqual(isDmDataCommand({ name: "players" }), true);
