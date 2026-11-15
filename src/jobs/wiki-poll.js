@@ -492,8 +492,8 @@ function categoryEntry(celeb, result) {
     url,
     lang: result.lang || (url && /de\.wikipedia/i.test(url) ? "de" : "en"),
     year: year ?? null,
-    month: year != null ? 11 : null,
-    day: year != null ? 31 : null,
+    month: year != null ? 0 : null,
+    day: year != null ? 1 : null,
   };
 }
 

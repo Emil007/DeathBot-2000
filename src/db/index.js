@@ -110,9 +110,9 @@ function ensureM3Schema() {
   }
   db.exec(`
     CREATE TABLE IF NOT EXISTS pending_pastes (
-      user_id TEXT PRIMARY KEY,
+      discord_user_id TEXT PRIMARY KEY,
       body TEXT NOT NULL,
-      updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+      created_at TEXT NOT NULL DEFAULT (datetime('now'))
     );
   `);
 }
@@ -1371,8 +1371,11 @@ function applyDeath(celebId, opts = {}) {
     const celeb = db.prepare("SELECT * FROM celebs WHERE id = ?").get(cid);
     if (!celeb) return { celeb: null, awards: [], score: 0, skipped: true, reason: "missing" };
 
-    // Harte Sperre, auch für /kill. Unbestätigt oder exclude_from_auto:
-    // kein is_alive, kein Award, keine Punkte. Wer werten will, bestätigt vorher.
+    // Harte Sperre, auch für /kill und announced-prestart. Unbestätigt oder
+    // exclude_from_auto: kein is_alive, kein Award, keine Punkte. Wer werten
+    // will, bestätigt vorher über /review. MASTERPLAN Z.864: Announced-Treffer
+    // mit exclude_from_auto=1 buchen NIE — nur die bestehende Pre-Start-Warnung
+    // nutzt bereits vorhandene died_at-Zeilen.
     if (celeb.wiki_confirmed !== 1 || celeb.exclude_from_auto === 1) {
       return {
         skipped: true,
@@ -2176,16 +2179,16 @@ function markRetractionAnnounced(celebId) {
 
 function savePendingPaste(userId, body) {
   db.prepare(
-    `INSERT INTO pending_pastes (user_id, body, updated_at) VALUES (?, ?, datetime('now'))
-     ON CONFLICT(user_id) DO UPDATE SET body = excluded.body, updated_at = datetime('now')`
+    `INSERT INTO pending_pastes (discord_user_id, body, created_at) VALUES (?, ?, datetime('now'))
+     ON CONFLICT(discord_user_id) DO UPDATE SET body = excluded.body, created_at = excluded.created_at`
   ).run(String(userId), body == null ? "" : String(body));
 }
 
 function takePendingPaste(userId) {
   return db.transaction(() => {
-    const row = db.prepare(`SELECT body FROM pending_pastes WHERE user_id = ?`).get(String(userId));
+    const row = db.prepare(`SELECT body FROM pending_pastes WHERE discord_user_id = ?`).get(String(userId));
     if (!row) return null;
-    db.prepare(`DELETE FROM pending_pastes WHERE user_id = ?`).run(String(userId));
+    db.prepare(`DELETE FROM pending_pastes WHERE discord_user_id = ?`).run(String(userId));
     return row.body;
   })();
 }

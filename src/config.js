@@ -63,7 +63,7 @@ function loadConfig() {
     token: required("TOKEN"),
     prefix: optional("PREFIX", "!"),
     adminId: required("ADMIN_ID"),
-    discordGuildId: optional("DISCORD_GUILD_ID", ""),
+    discordGuildId: required("DISCORD_GUILD_ID"),
     // Seit dem interaktiven Kanal-Setup (src/jobs/channel-setup.js) ist
     // CHANNEL_DEATHPOOL OPTIONAL: Der Deathpool-Kanal wird beim Start
     // automatisch gefunden/angelegt oder per Admin-Frage gewählt. Leer =

@@ -232,11 +232,14 @@ function parseDayId(id) {
 }
 
 async function scrapeUrl(client, url, lang = "en") {
+  // 429/5xx/Timeout ist „unavailable", nie „nicht auf der Todesliste".
+  // HTTP-/Netzwerk-Fehler propagieren (scrapeLangRetry retried + loggt);
+  // nur echte Parse-Probleme liefern hier eine leere Liste.
+  const response = await client.get(url);
   try {
-    const response = await client.get(url);
     return extractEntriesFromHtml(response.data, lang, url);
   } catch (e) {
-    console.error("[wiki-en]", url, e.message);
+    console.error("[wiki-en] parse", url, e.message);
     return [];
   }
 }

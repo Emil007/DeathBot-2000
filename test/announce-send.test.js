@@ -214,7 +214,9 @@ test("unknown age says Alter unbekannt and omits the formula", async () => {
   );
   const details = detailsOf(sent[0]);
   assert.match(details, /Alter unbekannt/);
-  assert.match(details, /Alter unbekannt → 0 Punkte\./);
+  // F27 (neuere Spec): unbekanntes Alter zeigt KEINEN irreführenden „0 Punkte"-
+  // Zusatz, da der echte Wert aus der Buchung kommt (age_at_pick), nicht fix 0 ist.
+  assert.doesNotMatch(details, /0 Punkte\./);
   assert.doesNotMatch(details, FORMULA);
   assert.match(fieldOf(sent[0], "Deathpool"), /Keiner hatte diesen Namen/);
 });

@@ -229,8 +229,11 @@ function applyUrlDateFlags(entries, url) {
 }
 
 async function scrapeUrl(client, url) {
+  // 429/5xx/Timeout ist „unavailable", nie „nicht auf der Todesliste".
+  // HTTP-/Netzwerk-Fehler propagieren (scrapeLangRetry retried + loggt);
+  // nur echte Parse-Probleme liefern hier eine leere Liste.
+  const response = await client.get(url);
   try {
-    const response = await client.get(url);
     const $ = cheerio.load(response.data);
     const fromTables = extractFromTables($, "de", url);
     const fromLists = extractFromLists($, "de", url);
@@ -239,7 +242,7 @@ async function scrapeUrl(client, url) {
     for (const e of [...fromLists, ...fromTables]) merged.set(e.id, e);
     return applyUrlDateFlags([...merged.values()], url);
   } catch (e) {
-    console.error("[wiki-de]", url, e.message);
+    console.error("[wiki-de] parse", url, e.message);
     return [];
   }
 }

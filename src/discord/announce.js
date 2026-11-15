@@ -260,7 +260,10 @@ function isBeforeSeason(diedAt, startDate) {
 /** Drei Null-Fälle. Die Formel (=100−Alter) steht nur im dritten. */
 function pointsLine(age, score, diedAt, startDate) {
   if (age == null || age === "" || (typeof age === "number" && Number.isNaN(age))) {
-    return "Alter unbekannt → 0 Punkte.";
+    // F27: unbekanntes Alter ist NICHT automatisch 0 Punkte — der echte Wert
+    // kommt aus der Buchung (age_at_pick). Ein fester „0 Punkte"-Hinweis wäre
+    // irreführend, wenn die DB doch einen Wert vergibt.
+    return "Alter unbekannt.";
   }
   if (isBeforeSeason(diedAt, startDate)) return "Vor dem Saisonstart → 0 Punkte.";
   return `Alter (Pool-Start): **${age}** → Punkte **${score}** (=100−Alter). Jünger war profitabler.`;

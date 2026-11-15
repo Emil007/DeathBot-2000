@@ -8,6 +8,7 @@ const axios = require("axios");
 const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "deathbot-test-prestart-cat-"));
 process.env.TOKEN = "x";
 process.env.ADMIN_ID = "1";
+process.env.DISCORD_GUILD_ID = process.env.DISCORD_GUILD_ID || "guild-test";
 process.env.CHANNEL_DEATHPOOL = "1";
 process.env.DATA_DIR = tmp;
 
@@ -130,19 +131,22 @@ test("F14c: category hit without a death-list entry marks announced celeb dead �
     { celeb: mine.celeb, entry: mine.entry, wikiAge: mine.age },
     { announce: false, confirmed: false, source: "announced-prestart" }
   );
-  assert.strictEqual(result.celeb.is_alive, 0, "category death must set is_alive=0");
-  // Der Pick liegt in der ANNOUNCED-Saison, applyDeath bedient die AKTIVE Saison –
-  // daher keine activen Winner → keine Awards, keine Punkte (R2-8-Semantik).
-  assert.strictEqual(result.awards.length, 0, "2027-only pick must award nothing active");
-  assert.strictEqual(result.score, 0);
+  // Spec MASTERPLAN Z.864: Announced-Treffer mit exclude_from_auto=1 buchen
+  // NIE — applyDeath ist eine harte Sperre für alle Quellen. Der Sweep findet
+  // den Celeb, aber processDeathpoolHit lässt ihn UNGEBUCHT (is_alive bleibt 1,
+  // kein Award, keine Punkte). Die Pre-Start-Warnung läuft ausschließlich über
+  // bereits vorhandene died_at-Zeilen (bestätigte Celebs), nicht über diesen Pfad.
+  assert.strictEqual(result.celeb.is_alive, 1, "exclude_from_auto=1 announced hit must NOT book");
+  assert.strictEqual(result.awards.length, 0, "exclude hit awards nothing");
+  assert.strictEqual(result.score, 0, "exclude hit scores nothing");
 
-  // The picker should now be warnable: died_at was stored as the detection day
-  // here (no scraped date on a category synthetic entry) and the announced
-  // season detects pre-start via died_at < start OR detection < start.
+  // Kontrolle: der Celeb bleibt für die bestehende Pre-Start-Warnung verfügbar,
+  // wenn er auf anderem Wege (bestätigt, exclude=0) eine died_at-Zeile bekäme.
+  // Hier ist er nicht gebucht → keine Warnzeile aus diesem Pfad.
   const rows = db.getAnnouncedPreStartDeathsUnwarned(season.id);
   assert.ok(
-    rows.some((r) => r.celeb_id === cid),
-    "category-marked dead must be warnable via pick_death_warnings"
+    !rows.some((r) => r.celeb_id === cid),
+    "unbooked exclude celeb must not be warnable via pick_death_warnings"
   );
 });
 
@@ -330,7 +334,7 @@ test("F27: unknown age on a real hit prints 'Alter unbekannt' (no misleading 0-P
       `INSERT INTO celebs (name, name_key, wiki_url, wikidata_id, is_alive,
          wiki_confirmed, exclude_from_auto, manual_only)
        VALUES ('NoAgeCeleb','noageceleb','https://en.wikipedia.org/wiki/NoAgeCeleb','QNoAge',1,
-         1, 1, 0)`
+         1, 0, 0)`
     )
     .run().lastInsertRowid;
   const ann = db.getAnnouncedSeason();
@@ -378,7 +382,7 @@ test("untagged category year is stored as YYYY-01-01 and sits before start_date 
       `INSERT INTO celebs (name, name_key, wiki_url, wikidata_id, is_alive,
          wiki_confirmed, exclude_from_auto, manual_only)
        VALUES ('Untagged Twentyseven','untagged27','https://en.wikipedia.org/wiki/Untagged_Twentyseven','QUntag',1,
-         1, 1, 0)`
+         1, 0, 0)`
     )
     .run().lastInsertRowid;
   db.getDb()

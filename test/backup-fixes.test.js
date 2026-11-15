@@ -9,6 +9,7 @@ const AdmZip = require("adm-zip");
 const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "deathbot-test-backup-"));
 process.env.TOKEN = "x";
 process.env.ADMIN_ID = "1";
+process.env.DISCORD_GUILD_ID = process.env.DISCORD_GUILD_ID || "guild-test";
 process.env.CHANNEL_DEATHPOOL = "1";
 process.env.DATA_DIR = tmp;
 
