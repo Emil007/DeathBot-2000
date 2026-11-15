@@ -289,19 +289,32 @@ function mockDeathCategoriesByYear(celebId, url, year) {
     async get(requestUrl, { params } = {}) {
       if (params?.action === "query" && params?.prop === "categories") {
         const titles = String(params.titles || "");
-        const isTarget = titles.includes(
-          String(url).split("/wiki/")[1].replace(/_/g, " ")
-        );
+        // Realistische MediaWiki-Antwort: pro angefragtem Titel eine eigene
+        // Page. NUR die Zielseite trägt die Todes-Kategorie — damit findet
+        // pageForTitle den Celeb direkt, ohne den (nur für Einzeltitel gültigen)
+        // Single-Page-Fallback zu brauchen.
+        const want = String(url).split("/wiki/")[1].replace(/_/g, " ").toLowerCase();
+        const asked = titles
+          .split("|")
+          .map((t) => t.trim())
+          .filter(Boolean)
+          .map((t) => decodeURIComponent(t).replace(/_/g, " ").toLowerCase());
+        const pages = {};
+        asked.forEach((t, i) => {
+          const isTarget = t === want || t.startsWith(want);
+          pages[String(i + 1)] = {
+            // Reale MediaWiki-Pages tragen den angefragten Titel (pageForTitle
+            // findet sie nur so). Nur die Kategorie unterscheidet Target/Other.
+            title: t.replace(/^./, (c) => c.toUpperCase()),
+            categories: [
+              { title: isTarget ? `Category:${year} deaths` : "Category:2026 births" },
+            ],
+          };
+        });
         return {
           status: 200,
           data: {
-            query: {
-              pages: {
-                1: isTarget
-                  ? { title: "Old Corpse", categories: [{ title: `Category:${year} deaths` }] }
-                  : { title: "Other", categories: [{ title: "Category:2026 births" }] },
-              },
-            },
+            query: { pages },
           },
         };
       }

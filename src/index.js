@@ -122,11 +122,16 @@ function guildGateDecision(interaction, config) {
   const noGuild = guildId == null || guildId === "";
   const customId = String(interaction?.customId || "");
   const dmSpecial = noGuild && (customId.startsWith("pka:") || customId.startsWith("crev:"));
-  const ours = !noGuild && String(guildId) === String(config?.discordGuildId || "");
+  // Das Kanal-Setup stellt die Frage als DM an den Admin — der Klick auf
+  // "dp:setup:*" in der DM ist unser Pflichtkanal, der darf NICHT vom
+  // Guild-Gate verschluckt werden. isSetupAdmin prüft die Berechtigung im
+  // Handler selbst; dmSpecial/allowGuildDm passt hier nicht.
+  const dmSetup = noGuild && customId.startsWith("dp:setup:");
+  const ours = dmSetup || (!noGuild && String(guildId) === String(config?.discordGuildId || ""));
   return {
     ours,
     dm: noGuild,
-    dmSpecial,
+    dmSpecial: dmSpecial || dmSetup,
     guildDataCommand: ours,
     foreign: !noGuild && !ours,
   };

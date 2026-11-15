@@ -1,9 +1,11 @@
 const axios = require("axios");
 
 /** Same idea as the proven deathlist_checker.py */
-// Beide Schreibweisen akzeptieren: "_" (MediaWiki-Kanonisch) und Leerzeichen
-// (wie es mehrere Test-Mocks und manche Seitendarstellungen nutzen).
-const DEATH_REGEX = /(Category[_: ]\d{4}[ _]+deaths|Kategorie\s*:\s*Gestorben[ _]*\d{4})/i;
+// Nur die kanonischen Todes-Jahreskategorien: exakt 4 Ziffern + exakt
+// "deaths"/"_deaths" bzw. "Gestorben 2026"/"Gestorben_2026", verankert am
+// Ende ($). Keine Unterkategorien ("Category:2026 deaths in France"), keine
+// anderen Suffixe ("Category:January 2026 deaths"), kein [_: ]-Fressen.
+const DEATH_REGEX = /(Category:(?:\d{4})_deaths$|Category:(?:\d{4}) deaths$|Kategorie:Gestorben_\d{4}$|Kategorie:Gestorben \d{4}$)/i;
 
 const BATCH_SIZE = 50;
 
@@ -470,13 +472,13 @@ async function findDeathsByCategory(userAgent, celebs, opts = {}) {
       const index = buildPageIndex(res.data);
       for (const job of targets) {
         let page = pageForTitle(index, job.title);
-        // Ein angefragter Titel und eine gelieferte Seite: Einzel-URL-Mocks
-        // (und seltene API-Antworten), die Kategorien liefern, auch wenn der
-        // zurückgegebene Titel vom angefragten abweicht. Gilt auch bei
-        // Mehrfach-Titel-Requests, wenn nur EINE Seite kam (F27/untagged) —
-        // aber NUR, wenn diese eine Seite eine echte Todes-Kategorie trägt,
-        // damit Nicht-Targets nicht kollateral als tot markiert werden.
-        if (!page && index.pages.length === 1) {
+        // Einzelseiten-Fallback NUR für EINZEL-URL-Requests (Einzelseiten-Mocks
+        // und seltene API-Antworten, die eine Kategorie liefern, obwohl der
+        // zurückgegebene Titel vom angefragten abweicht).
+        // NIEMALS bei Mehrfach-Titel-Batches anwenden: dort würde eine einzige
+        // echte Todes-Seite ALLE angefragten Personen kollateral als tot
+        // markieren (verursachte den 3-Sekunden-Falsch-Positiv-Dump).
+        if (!page && index.pages.length === 1 && group.length === 1) {
           const only = index.pages[0];
           const cats = (only.categories || []).map((c) => c.title || "").join(" ");
           if (DEATH_REGEX.test(cats)) page = only;
