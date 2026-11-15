@@ -151,12 +151,14 @@ test("Hilfe: Überschrift, Prefix, Aufruf, unbekannter Befehl", async () => {
 
   await help.run(ctx, [], msg);
   const overview = contentOf(replies[0]);
-  assert.ok(overview.includes("**DeathBot Hilfe** — Slash ist der ordentliche Weg, der Prefix der Notausgang."));
+  assert.ok(
+    overview.includes("**DeathBot Hilfe** — Befehle als `/` (Slash, aus der Vorschlagsliste) oder mit dem Präfix `?` in der DM.")
+  );
   assert.ok(overview.includes("?help import"));
   assert.equal(overview.includes("!help"), false);
   assert.ok(
     overview.includes(
-      "Noch nicht live: `/import` → `/review` → `/go`. Nächstes Jahr: `/announce-season`, am Start `/new-year activate:true`. Prefix `?` geht auch."
+      "Noch nicht live: `/import` → `/review` → `/go`. Nächstes Jahr: `/announce-season`, am Start `/new-year activate:true`."
     )
   );
   assert.deepStrictEqual(replies[0].allowedMentions, { parse: [] });
@@ -171,6 +173,37 @@ test("Hilfe: Überschrift, Prefix, Aufruf, unbekannter Befehl", async () => {
   const unknown = contentOf(replies[2]);
   assert.ok(unknown.startsWith("Befehl `zzzqqq` gibt es nicht."));
   assert.deepStrictEqual(replies[2].allowedMentions, { parse: [] });
+});
+
+test("Hilfe: Nicht-Admin sieht keine Admin-Sektionen und den einfachen Kopf", async () => {
+  const { loadCommands } = require("../src/discord/commands");
+  const commands = new Map();
+  const mk = (name, admin, group, desc) =>
+    commands.set(name, { name, description: desc || name, admin, group: group || "everyone", usage: `{prefix}${name}` });
+  mk("liste", false, "everyone", "Zeigt deine Liste");
+  mk("scores", false, "everyone", "Punkte");
+  mk("celeb", false, "everyone", "Person");
+  mk("kill", true, "match", "Todesfall");
+  mk("go", true, "season", "Saison starten");
+  mk("import", true, "season", "Import");
+
+  const ctx = { config: { prefix: "!", adminId: "999" }, commands };
+  const replies = [];
+  const nonAdmin = {
+    author: { id: "123" },
+    reply: async (payload) => replies.push(payload),
+  };
+
+  await help.run(ctx, [], nonAdmin);
+  const overview = contentOf(replies[0]);
+  // kein Admin-Kopf, keine Admin-Überschriften, keine Admin-Befehle
+  assert.ok(overview.includes("**DeathBot Hilfe** — Tipp deine Namen"));
+  assert.equal(overview.includes("Admin ·"), false, "keine Admin-Sektion");
+  assert.equal(overview.includes("`kill`"), false);
+  assert.equal(overview.includes("`go`") || overview.includes("/go"), false);
+  assert.equal(overview.includes("`import`") || overview.includes("/import"), false);
+  assert.ok(overview.includes("`liste`") || overview.includes("/liste"), "normale Befehle sichtbar");
+  assert.ok(overview.includes("/help"), "verweist auf /help");
 });
 
 test("Tagesbericht hängt an config.tz", () => {

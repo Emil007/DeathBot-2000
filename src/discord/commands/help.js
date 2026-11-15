@@ -51,14 +51,22 @@ function buildOverviewPages(ctx, isAdmin) {
     }
   }
 
-  const header = [
-    "**DeathBot Hilfe** — Slash ist der ordentliche Weg, der Prefix der Notausgang.",
-    `Detail: \`/help command:import\` oder \`${p}help import\``,
-    `Noch nicht live: \`/import\` → \`/review\` → \`/go\`. Nächstes Jahr: \`/announce-season\`, am Start \`/new-year activate:true\`. Prefix \`${ctx.config.prefix}\` geht auch.`,
-    "",
-  ]
-    .filter((x) => x != null && x !== "")
-    .join("\n");
+  const header = isAdmin
+    ? [
+        "**DeathBot Hilfe** — Befehle als `/` (Slash, aus der Vorschlagsliste) oder mit dem Präfix `" +
+          ctx.config.prefix +
+          "` in der DM.",
+        `Detail: \`/help command:import\` oder \`${p}help import\`.`,
+        `Noch nicht live: \`/import\` → \`/review\` → \`/go\`. Nächstes Jahr: \`/announce-season\`, am Start \`/new-year activate:true\`.`,
+        "",
+      ].join("\n")
+    : [
+        "**DeathBot Hilfe** — Tipp deine Namen einfach so hin, ein pro Zeile. Für Befehle: `" +
+          ctx.config.prefix +
+          "hilfe` oder wähl in der Slash-Liste `/help`.",
+        `Detail: \`${p}help <befehl>\` oder in der Slash-Liste \`/help command:<name>\`.`,
+        "",
+      ].join("\n");
 
   const pages = [];
   let current = header;

@@ -1240,3 +1240,21 @@ test("DM: `hilfe`/`help` bekommt eine Hilf-Antwort statt Smalltalk-Platzhalter",
     assert.strictEqual(playerId("hilfe-word"), null, `kein Spieler durch ${word}`);
   }
 });
+
+test("DM: `/celebs` als Text (nicht ausgewählt) ist kein Name — wird nicht geaddet", async () => {
+  const { ctx, msg } = fakeCtx("slash-text", "SlashText");
+  ctx.commands = new Map([["celebs", { name: "celebs" }]]);
+  msg.content = "/celebs";
+  const res = await assistant.tryConsumePickMessage(ctx, msg);
+  assert.strictEqual(res, true, "wird konsumiert und beantwortet");
+  const text = replyText(msg);
+  assert.match(text, /Slash|Vorschlagsliste|Prefix/i);
+  assert.strictEqual(playerId("slash-text"), null, "kein Spieler durch /celebs");
+  // bekannte Commands werden mit Prefix-Hinweis beantwortet, unbekannte mit Hilfe-Hinweis
+  msg.content = "/gibtesnicht123";
+  ctx.commands = new Map();
+  msg.channel.replies.length = 0;
+  const res2 = await assistant.tryConsumePickMessage(ctx, msg);
+  assert.strictEqual(res2, true);
+  assert.match(replyText(msg), /kein bekannter Befehl|hilfe/i);
+});

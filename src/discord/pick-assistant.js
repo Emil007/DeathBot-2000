@@ -662,6 +662,23 @@ async function handlePickBody(ctx, msg, season) {
   // (Der passt den Namen selbst an und zeigt eine vernünftige Antwort.)
   if (body.startsWith(prefix)) return false;
 
+  // Slash-Befehle, die als Text getippt werden (z.B. `/celebs`): Discord sendet
+  // die nur als echte Interaktion, wenn der User sie aus der Vorschlagliste
+  // wählt. Als reiner Text kommen sie hier an und sind KEINE Personen — nicht
+  // als Namen adden, sondern auf den Prefix-Äquivalent verweisen.
+  const slash = /^\/([a-z][a-z0-9_-]*)(?:\s|$)/i.exec(body);
+  if (slash) {
+    const slashName = slash[1].toLowerCase();
+    const known = Boolean(ctx.commands?.get(slashName));
+    await reply(
+      msg,
+      known
+        ? `\`/${slashName}\` als Text geht so nicht (Slash braucht die Auswahl aus \`/\`-Vorschlagsliste). Tipp \`${prefix}${slashName}\` oder wähl den Befehl in der Liste.`
+        : `\`${body}\` ist weder ein Name noch ein bekannter Befehl. Für Hilfe: \`${prefix}hilfe\` oder aus der Slash-Liste \`/help\`.`
+    );
+    return true;
+  }
+
   if (isHelpWord(body)) {
     // Reine Hilfewörter aktiv beantworten, statt sie als Namen/Smalltalk zu verbuchen.
     await reply(msg, helpSentence(prefix));
