@@ -102,6 +102,13 @@ function fallbackSanitize(raw) {
   return s || "\u201EUnbenannt\u201C";
 }
 
+function entryDisplayName(e) {
+  // Präferiert den kanonischen Wikipedia-Titel (resolved_name), z.B. “R-Truth”
+  // aus raw_name “Ron killings”; sonst den Rohstring.
+  if (e && e.resolved_name && String(e.resolved_name).trim()) return e.resolved_name;
+  return e && e.raw_name ? e.raw_name : "";
+}
+
 function showName(raw) {
   return sanitizeDisplayName(raw);
 }
@@ -298,7 +305,7 @@ function draftEmbed(entries, season, draftStatus = "draft") {
         const age = e.proposed_age != null ? ` · Alter ${e.proposed_age}` : "";
         const dead = e.is_alive === 0 ? " · ☠️ vor Start gestorben" : "";
         const amb = e.link_status === "ambiguous" ? " ⚠️" : "";
-        return `${i + 1}. **${showName(e.raw_name)}** — ${link}${age}${amb}${dead}`;
+        return `${i + 1}. **${showName(entryDisplayName(e))}** — ${link}${age}${amb}${dead}`;
       })
     : ["_(noch keine Namen)_"];
   const stateWord = draftStatus === "finalized" ? "eingefroren" : "noch offen";
@@ -436,6 +443,9 @@ function listDraftEntriesForFinalized(playerId, seasonId) {
     is_alive: p.is_alive,
     link_status: "linked",
     position: p.id,
+    // Nach dem Finalize steht der kanonische Name auf dem Celeb selbst;
+    // resolved_name ist dort bereits angewandt.
+    resolved_name: null,
   }));
 }
 
@@ -463,6 +473,9 @@ function loadOwnedEntry(entryId) {
 }
 
 function chosenTitle(row) {
+  if (row && row.resolved_name && String(row.resolved_name).trim()) {
+    return showName(row.resolved_name);
+  }
   let candidates = [];
   try {
     candidates = JSON.parse(row.candidates_json || "[]");
@@ -539,6 +552,7 @@ async function handlePickInteraction(ctx, interaction) {
     qid: chosen.qid,
     proposedAge: chosen.proposedAge,
     linkStatus: "linked",
+    resolvedName: chosen.title || null,
   });
   await logEvent(ctx.client, ctx.config, {
     kind: "pick-link",
@@ -786,6 +800,7 @@ async function consumeBareUrl(ctx, msg, season, body) {
       qid: proposal.qid,
       proposedAge: proposal.proposedAge,
       linkStatus: "linked",
+      resolvedName: proposal.title || null,
     });
     await reply(msg, `🔗 ${showName(target.raw_name)} → **${showName(proposal.title || stored)}**`);
     await logEvent(ctx.client, ctx.config, {
@@ -887,6 +902,7 @@ async function consumeLinkCommand(ctx, msg, season, body) {
       qid: proposal.qid,
       proposedAge: proposal.proposedAge,
       linkStatus: "linked",
+      resolvedName: proposal.title || null,
     });
     await reply(msg, `🔗 ${showName(target.raw_name)} → **${showName(proposal.title || stored)}**`);
   } catch (err) {
@@ -1145,6 +1161,7 @@ async function resolvePendingSynchronous(ctx, channel, userId, season, draftId, 
               proposedAge: proposal.proposedAge,
               candidatesJson: JSON.stringify(proposal.candidates || []),
               linkStatus,
+              resolvedName: proposal.title || null,
             });
           } else {
             setLinked(e.id, {

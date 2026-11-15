@@ -163,6 +163,7 @@ CREATE TABLE IF NOT EXISTS pick_draft_entries (
   proposed_age INTEGER,
   candidates_json TEXT,
   link_status TEXT NOT NULL DEFAULT 'pending',
+  resolved_name TEXT,
   FOREIGN KEY (draft_id) REFERENCES pick_drafts(id) ON DELETE CASCADE
 );
 
@@ -579,6 +580,7 @@ function applyUpgrades(db) {
         proposed_age INTEGER,
         candidates_json TEXT,
         link_status TEXT NOT NULL DEFAULT 'pending',
+        resolved_name TEXT,
         FOREIGN KEY (draft_id) REFERENCES pick_drafts(id) ON DELETE CASCADE
       );
 

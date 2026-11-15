@@ -1173,3 +1173,48 @@ test("unavailable keeps the line and replays it once participation works", async
     assistant.interruptUsers.delete("replay-m12");
   }
 });
+
+test("linked draft entry with redirect resolves to canonical celeb name on finalize", () => {
+  // Simuliert den echten Fall: raw_name "Ron killings", die Wiki-Suche löst
+  // den Redirect auf R-Truth (proposal.title). resolved_name wird gespeichert.
+  const season = db.getAnnouncedSeason();
+  const pid = db
+    .getDb()
+    .prepare("INSERT INTO players (display_name, discord_user_id, base_points) VALUES ('NormTest','8991','0')")
+    .run().lastInsertRowid;
+  const draft = db.getOrCreateDraft(pid, season.id);
+  db.addDraftNames(draft.id, ["Ron killings"]);
+
+  const entry = db.listDraftEntries(draft.id)[0];
+  db.setDraftEntryLinked(entry.id, {
+    wikiUrl: "https://en.wikipedia.org/wiki/R-Truth",
+    wikiNorm: "en:r-truth",
+    qid: "Q310690",
+    proposedAge: 54,
+    linkStatus: "linked",
+    resolvedName: "R-Truth",
+  });
+
+  // Der Draft-Eintrag führt den kanonischen Namen.
+  const linked = db.listDraftEntries(draft.id)[0];
+  assert.strictEqual(linked.resolved_name, "R-Truth");
+
+  const fin = db.finalizeDraft(pid, season.id);
+  assert.strictEqual(fin.error, undefined);
+  assert.ok(fin.added === 1);
+
+  const picks = db.getAnnouncedSeasonPicksForPlayer(pid, season.id);
+  assert.strictEqual(picks.length, 1);
+  // Der Celeb heißt R-Truth, NICHT "Ron killings".
+  assert.strictEqual(picks[0].celeb_name, "R-Truth");
+  const celeb = db.getDb().prepare("SELECT * FROM celebs WHERE id = ?").get(picks[0].celeb_id);
+  assert.strictEqual(celeb.name_key, "r truth");
+  // Wiki-Identität (wiki_url_norm/qid) wird beim Admin-Confirm angehängt —
+  // hier zählt nur, dass der kanonische Name sofort stimmt.
+  assert.ok(celeb.wiki_confirmed === 0);
+
+  // Aufräumen: Draft/Picks löschen, damit andere Tests nicht stören.
+  db.getDb().prepare("DELETE FROM picks WHERE player_id = ? AND season_id = ?").run(pid, season.id);
+  db.getDb().prepare("DELETE FROM pick_drafts WHERE player_id = ? AND season_id = ?").run(pid, season.id);
+  db.getDb().prepare("DELETE FROM players WHERE id = ?").run(pid);
+});

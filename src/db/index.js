@@ -94,6 +94,21 @@ function openDb(config) {
 
 // Spalten/Tabellen, die dieser DB-Kern schreibt. Idempotent, damit ein späteres
 // Schema-Migrate dieselben Namen nicht doppelt anlegen muss.
+/** Titel aus einer normalisierten Wikipedia-URL ableiten, z.B.
+ * https://en.wikipedia.org/wiki/R-Truth -> "R-Truth". null bei ungültig. */
+function titleFromWikiUrl(url) {
+  if (!url) return null;
+  try {
+    const u = new URL(String(url).trim().replace(/^\/\//, "https://"));
+    if (!/\.wikipedia\.org$/i.test(u.hostname)) return null;
+    const m = /^\/wiki\/(.+)$/.exec(u.pathname);
+    if (!m) return null;
+    return decodeURIComponent(m[1]).replace(/_/g, " ").trim() || null;
+  } catch {
+    return null;
+  }
+}
+
 function ensureM3Schema() {
   const cols = (table) =>
     new Set(db.prepare(`PRAGMA table_info(${table})`).all().map((c) => c.name));
@@ -107,6 +122,34 @@ function ensureM3Schema() {
   const draftCols = cols("pick_drafts");
   if (draftCols.size && !draftCols.has("unlinked_ack")) {
     db.exec("ALTER TABLE pick_drafts ADD COLUMN unlinked_ack INTEGER NOT NULL DEFAULT 0");
+  }
+  // M-Normalisierung: kanonischer Wikipedia-Titel eines verknüpften Draft-
+  // Eintrags (z.B. raw_name "Ron killings" -> resolved_name "R-Truth",
+  // nachverfolgte Redirects). Leer bei unverknüpft. Anzeige + Finalize nutzen
+  // ihn, damit ALLE Spieler denselben kanonischen Namen sehen/nehmen.
+  if (draftCols.size) {
+    const entryCols = cols("pick_draft_entries");
+    if (entryCols.size && !entryCols.has("resolved_name")) {
+      db.exec("ALTER TABLE pick_draft_entries ADD COLUMN resolved_name TEXT");
+    }
+    // Backfill: Bei bereits verknüpften Einträgen steht der kanonische Titel
+    // schon in der (Post-Redirect) wiki_url — daraus den Anzeigenamen ableiten.
+    if (entryCols.size) {
+      const needBackfill = db
+        .prepare(
+          `SELECT id, wiki_url FROM pick_draft_entries
+           WHERE link_status = 'linked' AND wiki_url IS NOT NULL AND wiki_url != ''
+             AND (resolved_name IS NULL OR resolved_name = '')`
+        )
+        .all();
+      const upd = db.prepare(
+        "UPDATE pick_draft_entries SET resolved_name = ? WHERE id = ?"
+      );
+      for (const row of needBackfill) {
+        const title = titleFromWikiUrl(row.wiki_url);
+        if (title) upd.run(title, row.id);
+      }
+    }
   }
   db.exec(`
     CREATE TABLE IF NOT EXISTS pending_pastes (
@@ -1099,7 +1142,8 @@ function replaceDraftEntryName(entryId, rawName) {
   const info = db
     .prepare(
       `UPDATE pick_draft_entries SET raw_name = ?, link_status = 'pending', wiki_url = NULL,
-       wiki_norm = NULL, qid = NULL, proposed_age = NULL, candidates_json = NULL, position = position
+       wiki_norm = NULL, qid = NULL, proposed_age = NULL, candidates_json = NULL,
+       resolved_name = NULL, position = position
        WHERE id = ?`
     )
     .run(rawName, entryId);
@@ -1108,7 +1152,7 @@ function replaceDraftEntryName(entryId, rawName) {
 }
 
 function setDraftEntryLinked(entryId, opts = {}, clearIdentity = false) {
-  const { wikiUrl, wikiNorm, qid, proposedAge, linkStatus, candidatesJson } = opts;
+  const { wikiUrl, wikiNorm, qid, proposedAge, linkStatus, candidatesJson, resolvedName } = opts;
   // candidates_json NICHT via COALESCE: ein neuer eindeutiger Kandidat muss einen
   // alten mehrdeutigen Satz ersetzen, sonst waehlt der User aus veralteten Daten (F7).
   // qid NICHT coalescen (R2-2): wenn der Aufrufer explizit ein qid mitgibt
@@ -1118,6 +1162,7 @@ function setDraftEntryLinked(entryId, opts = {}, clearIdentity = false) {
   // clearIdentity erzwingt NULL auf qid und wiki_norm, nicht COALESCE.
   const wipe = clearIdentity === true || opts.clearIdentity === true;
   const hasQid = qid !== undefined; // undefined = nicht Teil des Updates
+  const hasResolved = resolvedName !== undefined; // undefined = nicht Teil des Updates
   const info = db.prepare(
     `UPDATE pick_draft_entries SET
        wiki_url = COALESCE(?, wiki_url),
@@ -1125,7 +1170,8 @@ function setDraftEntryLinked(entryId, opts = {}, clearIdentity = false) {
        qid = CASE WHEN ? = 1 THEN NULL WHEN ? = 1 THEN ? ELSE qid END,
        proposed_age = COALESCE(?, proposed_age),
        candidates_json = ?,
-       link_status = COALESCE(?, link_status)
+       link_status = COALESCE(?, link_status),
+       resolved_name = CASE WHEN ? = 1 THEN NULL WHEN ? = 1 THEN ? ELSE resolved_name END
      WHERE id = ?`
   ).run(
     wikiUrl ?? null,
@@ -1137,6 +1183,9 @@ function setDraftEntryLinked(entryId, opts = {}, clearIdentity = false) {
     proposedAge ?? null,
     candidatesJson ?? null,
     linkStatus ?? null,
+    wipe ? 1 : 0,
+    hasResolved ? 1 : 0,
+    resolvedName ?? null,
     entryId
   );
   if (info.changes > 0) {
@@ -1209,8 +1258,12 @@ function finalizeDraft(playerId, seasonId) {
     for (const e of entries) {
       // unlinked verknüpft nur den Roh-Namen. qid und wiki_norm bleiben draußen.
       const ignoreIdentity = e.link_status === "unlinked";
+      // Normalisierung: Der kanonische Wikipedia-Titel (resolved_name) gewinnt
+      // über den Rohstring — so bekommen ALLE Spieler denselben Namen, egal ob
+      // sie "Ron killings" oder "R-Truth" eintippen.
+      const displayName = e.resolved_name && e.resolved_name.trim() ? e.resolved_name.trim() : e.raw_name;
       const { celeb } = linkCelebForAnnouncedSeason({
-        name: e.raw_name,
+        name: displayName,
         age: e.proposed_age ?? null,
         qid: ignoreIdentity ? null : e.qid || null,
         wikiNorm: ignoreIdentity ? null : e.wiki_norm || null,
