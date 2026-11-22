@@ -32,6 +32,55 @@ const LINK_URL_RE = /^link\s+(\d+)\s+(\S+\.wikipedia\.org\/wiki\/\S+)$/i;
 const WRONG_RE = /^(?:falsch|nein|wrong|nicht richtig|falsche)\s*(?:\s*(\d+))?$/i;
 const WIKI_URL_RE = /^(?:https?:\/\/)?(?:en|de)\.wikipedia\.org\/wiki\/[^\s]+$/i;
 
+/**
+ * Erkennt, ob eine Guild-Nachricht im Anmeldekanal ein Tipp-Versuch ist, der
+ * auf die Teilnahme-Ankündigung antwortet (Reply auf das Ankündigungs-Embed).
+ *
+ * Der Ankündigungs-Thread des Deathpool winkt Namen ab, die direkt im Kanal
+ * landen: „Namen nur per DM“. Aber nur, wenn die Nachricht WIRKLICH auf die
+ * Ankündigung antwortet — normale Kanalgespräche sollen nicht angemault werden.
+ *
+ * @param {object} msg Discord-Message
+ * @param {object} announced announced-Saison-Zeile (aus getAnnouncedSeason)
+ * @param {object} client Discord-Client (für den Fallback-Fetch)
+ * @returns {Promise<boolean>} true = Abweiser-Pfad aktiv
+ */
+async function isAnnounceReply(msg, announced, client) {
+  const announceMsgId = announced?.announce_message_id;
+
+  // Präferiert: die Reply auf unser Ankündigungs-Embed. messageReference ohne
+  // guildId (wenn der Reference aus dem Cache stammt) wird über die ID geprüft.
+  const refId = msg.reference?.messageId;
+  if (refId) {
+    if (announceMsgId) return String(refId) === String(announceMsgId);
+    // Alte Saison ohne gespeicherte Embed-ID: prüfen, ob die referenzierte
+    // Nachricht wirklich das Teilnahme-Embed ist (Fallback-Fetch).
+    try {
+      const ref = await (client?.channels?.fetch ? client.channels.fetch(msg.channelId) : null);
+      const refMsg = ref?.messages?.fetch ? await ref.messages.fetch(refId) : null;
+      if (!refMsg) return false;
+      return Boolean(refMsg.embeds?.some((e) => (e.title || "").includes("Ich weiß, wer stirbt")));
+    } catch {
+      return false;
+    }
+  }
+
+  // Legacy-Fallback ohne Reply: nur warnen, wenn die Nachricht selbst das
+  // Ankündigungs-Embed (Title) enthält — z.B. ein Paste mit dem Embed-Text.
+  if (!announceMsgId && !refId) {
+    try {
+      return Boolean(
+        (msg.embeds || []).some((e) => (e.title || "").includes("Ich weiß, wer stirbt")) ||
+          String(msg.content || "").includes("Ich weiß, wer stirbt.")
+      );
+    } catch {
+      return false;
+    }
+  }
+
+  return false;
+}
+
 // Hinweise für No-Name-DM-Noûts. Das Präfix ist dem Bot bekannt, also schreibt
 // er es konkret hin statt „mit dem Präfix“ zu sagen.
 function noNameSentence(prefix) {
@@ -613,7 +662,8 @@ async function denyParticipation(ctx, msg, part) {
 
 /**
  * Eine DM des Spielers verarbeiten. Liefert true, wenn sie konsumiert wurde.
- * Guild-Nachrichten: nur der Anmeldekanal bekommt einen Hinweis, sonst false.
+ * Guild-Nachrichten: nur ein Reply auf die Ankündigung im Anmeldekanal wird
+ * abgewiesen („Namen nur per DM“), normale Kanaltexte NICHT.
  */
 async function tryConsumePickMessage(ctx, msg) {
   if (msg.guildId) {
@@ -625,7 +675,10 @@ async function tryConsumePickMessage(ctx, msg) {
       announced &&
       announced.announce_channel_id &&
       String(channelId) === String(announced.announce_channel_id) &&
-      !text.startsWith(prefix)
+      !text.startsWith(prefix) &&
+      // M4b: nur echte Antworten auf das Ankündigungs-Embed abweisen, nicht
+      // jede normale Nachricht im Anmeldekanal.
+      (await isAnnounceReply(msg, announced, ctx.client))
     ) {
       try {
         await reply(msg, "Namen nur per DM an mich. Hier zählen sie nicht — schreib mir direkt.");

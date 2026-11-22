@@ -1159,26 +1159,87 @@ test("worst case: foreign draft rowid and select index 9 do not write", async ()
   assert.match(String(again.notes[0]?.content || ""), /Schon gewählt: Kandidat A/);
 });
 
-test("announce channel tells the user to use DM and stores nothing", async () => {
+test("announce channel warns only on a REPLY to the announcement, ignores normal chat", async () => {
   const season = db.getAnnouncedSeason();
+  const msgId = "m-announce-2027";
+  db.setSeasonAnnounceMessage(season.id, msgId);
+
+  // Fall 1: normale Kanalnachricht (kein Reply auf die Ankündigung) → KEIN Hinweis.
   const { ctx, msg } = fakeCtx("chan-m12", "Chan");
   msg.guildId = "guild-test";
   msg.channelId = season.announce_channel_id;
-  const res = await sendPick(ctx, msg, "Angela Merkel");
-  assert.strictEqual(res, true);
+  msg.reference = undefined;
+  const normal = await sendPick(ctx, msg, "Angela Merkel");
+  assert.strictEqual(normal, false, "normal chat in announce channel is NOT claimed");
+  assert.strictEqual(msg.channel.replies.length, 0, "no DM hint for normal chat");
+  assert.strictEqual(playerId("chan-m12"), null);
+
+  // Fall 2: Reply auf das Ankündigungs-Embed → Hinweis „Namen nur per DM“.
+  msg.channel.replies.length = 0;
+  msg.reference = { messageId: msgId };
+  const replyRes = await sendPick(ctx, msg, "Angela Merkel");
+  assert.strictEqual(replyRes, true, "reply to announcement is claimed");
   assert.match(replyText(msg), /Namen nur per DM/);
   assert.strictEqual(playerId("chan-m12"), null);
 
+  // Fall 3: Reply auf eine ANDERE Nachricht → kein Hinweis.
+  msg.channel.replies.length = 0;
+  msg.reference = { messageId: "m-some-other" };
+  const foreign = await sendPick(ctx, msg, "Angela Merkel");
+  assert.strictEqual(foreign, false, "reply to another message is not claimed");
+  assert.strictEqual(msg.channel.replies.length, 0);
+
+  // Fall 4: anderer Kanal → immer false.
   msg.channel.replies.length = 0;
   msg.channelId = "some-other-channel";
+  msg.reference = { messageId: msgId };
   const other = await sendPick(ctx, msg, "Angela Merkel");
   assert.strictEqual(other, false);
   assert.strictEqual(msg.channel.replies.length, 0);
 
+  // Fall 5: Präfix-Nachricht im Anmeldekanal → false (Befehl, kein Tipp).
   msg.channelId = season.announce_channel_id;
   msg.content = "!picks";
+  msg.reference = { messageId: msgId };
   const prefixed = await assistant.tryConsumePickMessage(ctx, msg);
   assert.strictEqual(prefixed, false);
+});
+
+test("announce channel legacy: reply to announce embed warns even without stored message id", async () => {
+  const season = db.getAnnouncedSeason();
+  db.setSeasonAnnounceMessage(season.id, null); // Altsystem: keine Embed-ID gespeichert
+
+  // Reply auf das Ankündigungs-Embed: der Fallback-Fetch erkennt es am Titel.
+  const announceCtx = fakeCtx("legacy-reply", "LegacyReply");
+  announceCtx.ctx.client.channels.fetch = async () => ({
+    messages: {
+      fetch: async () => ({ embeds: [{ title: "Ich weiß, wer stirbt. Du tippst." }] }),
+    },
+  });
+  const msg = announceCtx.msg;
+  msg.guildId = "guild-test";
+  msg.channelId = season.announce_channel_id;
+  msg.reference = { messageId: "m-legacy-announce" };
+  const warned = await sendPick(announceCtx.ctx, msg, "Angela Merkel");
+  assert.strictEqual(warned, true, "legacy reply to announce embed must warn");
+  assert.match(replyText(msg), /Namen nur per DM/);
+  assert.strictEqual(playerId("legacy-reply"), null);
+
+  // Reply auf eine fremde Nachricht OHNE gespeicherte Embed-ID: der Fetch zeigt
+  // ein Nicht-Embed → kein Hinweis.
+  const plainCtx = fakeCtx("legacy-plain", "LegacyPlain");
+  plainCtx.ctx.client.channels.fetch = async () => ({
+    messages: {
+      fetch: async () => ({ embeds: [] }),
+    },
+  });
+  const m2 = plainCtx.msg;
+  m2.guildId = "guild-test";
+  m2.channelId = season.announce_channel_id;
+  m2.reference = { messageId: "m-some-other-msg" };
+  const notWarned = await sendPick(plainCtx.ctx, m2, "Angela Merkel");
+  assert.strictEqual(notWarned, false, "reply to non-announce message must not warn");
+  assert.strictEqual(m2.channel.replies.length, 0);
 });
 
 test("unavailable keeps the line and replays it once participation works", async () => {

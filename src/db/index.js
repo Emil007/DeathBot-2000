@@ -245,7 +245,7 @@ function getAnnouncedSeason() {
     .get() || null;
 }
 
-function openAnnouncedSeason({ year, startDate, channelId, note }) {
+function openAnnouncedSeason({ year, startDate, channelId, note, messageId }) {
   const run = db.transaction(() => {
     const announced = getAnnouncedSeason();
     if (announced) {
@@ -253,6 +253,9 @@ function openAnnouncedSeason({ year, startDate, channelId, note }) {
         db.prepare(
           `UPDATE seasons SET announce_channel_id = ?, announce_note = ?, start_date = ? WHERE id = ?`
         ).run(channelId, note || null, startDate || `${year}-01-01`, announced.id);
+        if (messageId) {
+          setSeasonAnnounceMessage(announced.id, messageId);
+        }
         return { season: getAnnouncedSeason(), created: false };
       }
       throw new Error("Es existiert bereits eine angekündigte Saison (anderes Jahr).");
@@ -263,10 +266,10 @@ function openAnnouncedSeason({ year, startDate, channelId, note }) {
     if (clash) throw new Error(`Jahr ${year} ist bereits belegt (phase läuft/archiviert).`);
     const info = db
       .prepare(
-        `INSERT INTO seasons (year, active, start_date, live, phase, announce_channel_id, announce_note)
-         VALUES (?, 0, ?, 0, 'announced', ?, ?)`
+        `INSERT INTO seasons (year, active, start_date, live, phase, announce_channel_id, announce_message_id, announce_note)
+         VALUES (?, 0, ?, 0, 'announced', ?, ?, ?)`
       )
-      .run(year, startDate || `${year}-01-01`, channelId || null, note || null);
+      .run(year, startDate || `${year}-01-01`, channelId || null, messageId || null, note || null);
     return {
       season: db.prepare("SELECT * FROM seasons WHERE id = ?").get(info.lastInsertRowid),
       created: true,
@@ -283,6 +286,19 @@ function setSeasonAnnounce(seasonId, { channelId, note }) {
     note ?? row.announce_note,
     seasonId
   );
+  return db.prepare("SELECT * FROM seasons WHERE id = ?").get(seasonId);
+}
+
+/** M4b: Nach dem Posten des Teilnahme-Embeds dessen Message-ID merken, damit
+ *  der Tipp-Assistent nur Tipp-Versuche erkennt, die auf DIESE Ankündigung
+ *  antworten — nicht jede normale Nachricht im Anmeldekanal. Ein leerer Wert
+ *  löst die Merk mal (Altstandard ohne gespeicherte Embed-ID). */
+function setSeasonAnnounceMessage(seasonId, messageId) {
+  if (messageId == null || messageId === "") {
+    db.prepare("UPDATE seasons SET announce_message_id = NULL WHERE id = ?").run(seasonId);
+  } else {
+    db.prepare("UPDATE seasons SET announce_message_id = ? WHERE id = ?").run(String(messageId), seasonId);
+  }
   return db.prepare("SELECT * FROM seasons WHERE id = ?").get(seasonId);
 }
 
@@ -2260,6 +2276,7 @@ module.exports = {
   getAnnouncedSeason,
   openAnnouncedSeason,
   setSeasonAnnounce,
+  setSeasonAnnounceMessage,
   setSeasonDeathpoolChannel,
   resolveDeathpoolChannel,
   archiveRunningSeason,

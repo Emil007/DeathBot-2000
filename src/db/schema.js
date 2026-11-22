@@ -12,6 +12,7 @@ CREATE TABLE IF NOT EXISTS seasons (
   live INTEGER NOT NULL DEFAULT 0,
   phase TEXT,
   announce_channel_id TEXT,
+  announce_message_id TEXT,
   announce_note TEXT,
   deathpool_channel_id TEXT,
   created_at TEXT NOT NULL DEFAULT (datetime('now'))
@@ -490,6 +491,11 @@ function applyUpgrades(db) {
       }
       if (!seasonBefore.has("announce_channel_id")) {
         db.exec(`ALTER TABLE seasons ADD COLUMN announce_channel_id TEXT`);
+      }
+      // M4b: ID des geposteten Teilnahme-Embeds. Ohne sie kann der Tipp-Assistent
+      // nur den KANAL statt der ANKÜNDIGUNG als Tipp-Versuch erkennen (Over-Warn).
+      if (!seasonBefore.has("announce_message_id")) {
+        db.exec(`ALTER TABLE seasons ADD COLUMN announce_message_id TEXT`);
       }
       // F06: Deathpool-Versandkanal (nach dem 01.01. der neue deathpool-{YEAR}-Kanal),
       // getrennt vom Anmeldungskanal (announce_channel_id).

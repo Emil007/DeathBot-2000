@@ -296,7 +296,10 @@ const cmd = {
           runningYear: running?.year,
           maxPicks: ctx.config.maxPicksPerPlayer,
         });
-        await channel.send({ embeds: [embed], ...mentionOpts() });
+        const sent = await channel.send({ embeds: [embed], ...mentionOpts() });
+        // M4b: Message-ID des Embeds merken — der Tipp-Assistent warnt damit nur
+        // noch bei echten Antworten auf die Ankündigung, nicht bei jedem Kanaltext.
+        db.setSeasonAnnounceMessage(fresh.id, sent?.id || null);
         const noteWasTruncated = embed.data.description?.includes(TRUNCATION_HINT);
         await logEvent(ctx.client, ctx.config, {
           kind: "season-repost",
@@ -363,9 +366,11 @@ const cmd = {
           runningYear: running?.year,
           maxPicks: ctx.config.maxPicksPerPlayer,
         });
-        await channel.send({ embeds: [embed], ...mentionOpts() });
+        const sent = await channel.send({ embeds: [embed], ...mentionOpts() });
         embedSent = true;
         embedTruncated = Boolean(embed.data.description?.includes(TRUNCATION_HINT));
+        // M4b: Message-ID des Teilnahme-Embeds speichern (für die Antwort-Erkennung).
+        db.setSeasonAnnounceMessage(season.id, sent?.id || null);
       } catch (e) {
         await logError(ctx.client, ctx.config, e, { where: "announce-season send" });
       }
